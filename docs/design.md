@@ -275,86 +275,108 @@ Step 4: Inversion propagates to Rb
 
 ### Tree Size Verification
 
-A node's `tree_size` is self-reported and could be inflated by a malicious node to win merge decisions. To limit the damage:
+A node's `tree_size` is self-reported and could be inflated by a malicious node to win merge decisions. This section describes how to detect such fraud.
 
-**Verify observable subtree:** Before accepting a neighbor as parent, check their claimed `subtree_size` against their children's reported sizes. Track failures per node — three strikes and they're distrusted:
+#### The Problem
+
+When two trees meet, the smaller tree joins the larger (based on `tree_size`). An attacker can claim an inflated `tree_size` to "steal" nodes from honest trees.
+
+**Why naive verification fails:** We cannot verify `tree_size` by checking our neighbor's `subtree_size` against their observable children. An attacker can honestly report a small `subtree_size` while claiming a huge `tree_size` — they simply claim the inflation is elsewhere in the tree, beyond our observation.
+
+#### The Insight: PUBLISH Traffic Reveals True Tree Size
+
+Every node publishes its location to `K_REPLICAS=3` keyspace positions every 8 hours. My keyspace fraction equals `my_subtree_size / tree_size`. Therefore:
+
+```
+Expected PUBLISH per 8 hours = tree_size × 3 × (my_subtree_size / tree_size)
+                             = 3 × my_subtree_size
+```
+
+**The tree_size cancels out.** I should always receive `3S` PUBLISH messages per 8 hours, where `S` is my subtree size. If I receive significantly fewer, the tree is smaller than claimed.
+
+#### Statistical Model
+
+PUBLISH arrivals follow a Poisson distribution with expected value `λ`:
+
+```
+λ = 3 × S × (T / 8h)
+```
+
+Where `S` = my subtree size, `T` = observation time.
+
+If the tree is fraudulent (actual size < claimed), I receive fewer PUBLISH than expected. We measure how unlikely the observed count is under an honest tree:
+
+```
+Z = (λ - P) / √λ
+```
+
+Where `P` = observed PUBLISH count. The Z-score tells us how many standard deviations below expected we are.
+
+| Z-score | Confidence that tree is fraudulent |
+|---------|-----------------------------------|
+| 1.65 | 95% |
+| 2.33 | 99% |
+| 3.00 | 99.9% |
+
+#### Example
+
+My subtree size `S = 10`. After 8 hours, I expect `λ = 3 × 10 = 30` PUBLISH messages.
+
+| Scenario | Actual nodes | PUBLISH received | Z-score | Confidence |
+|----------|--------------|------------------|---------|------------|
+| Honest (1000 nodes) | 1000 | ~30 | ~0 | — |
+| 10× fraud (claim 1000, have 100) | 100 | ~3 | 4.9 | >99.99% |
+| 100× fraud (claim 10000, have 100) | 100 | ~0.3 | 5.4 | >99.99% |
+
+Large fraud is detectable within one refresh period (8 hours). For faster detection with smaller `S`, wait longer to accumulate samples.
+
+#### Implementation
 
 ```rust
-const VERIFICATION_STRIKES: u8 = 3;
-const FRAUD_CHECK_DELAY: Duration = Duration::from_secs(300);  // 5 minutes
-const DISTRUST_TTL: Duration = Duration::from_secs(24 * 3600); // 24 hours
+const FRAUD_CONFIDENCE: f64 = 0.99;  // 99% confidence before acting
+const FRAUD_Z_THRESHOLD: f64 = 2.33; // Z-score for 99% confidence
+const MIN_EXPECTED: f64 = 5.0;       // need λ ≥ 5 for valid Poisson approximation
+const DISTRUST_TTL: Duration = Duration::from_secs(24 * 3600);
 const MAX_DISTRUSTED: usize = 64;
-const MAX_STRIKE_ENTRIES: usize = 128;
 
 struct Node {
     join_context: Option<JoinContext>,
-    distrusted: HashMap<NodeId, Instant>,  // node -> when distrusted
-    verification_strikes: HashMap<NodeId, u8>,  // bounded by MAX_STRIKE_ENTRIES
+    distrusted: HashMap<NodeId, Instant>,
+    publish_count: u32,
     // ...
 }
 
 struct JoinContext {
-    parent_at_join: NodeId,  // who to blame if defrauded (not current parent)
-    claimed_size: u32,
+    parent_at_join: NodeId,
     join_time: Instant,
 }
 
-fn on_pulse_from_potential_parent(&mut self, pulse: &Pulse) {
-    if self.is_distrusted(&pulse.node_id) {
-        return;
+fn on_publish_received(&mut self, msg: &Routed) {
+    if self.is_storage_node_for(msg) {
+        self.publish_count += 1;
     }
-
-    if !self.verify_subtree_claim(&pulse.node_id, pulse.subtree_size) {
-        // Track strikes - cap entries to prevent memory exhaustion
-        if self.verification_strikes.len() >= MAX_STRIKE_ENTRIES
-            && !self.verification_strikes.contains_key(&pulse.node_id) {
-            return;  // At capacity, skip tracking new nodes
-        }
-
-        let strikes = self.verification_strikes
-            .entry(pulse.node_id)
-            .or_insert(0);
-        *strikes += 1;
-
-        if *strikes >= VERIFICATION_STRIKES {
-            self.add_distrust(pulse.node_id);
-            self.verification_strikes.remove(&pulse.node_id);
-        }
-        return;
-    }
-
-    // Passed verification - clear any strikes
-    self.verification_strikes.remove(&pulse.node_id);
-    // ... proceed with merge decision
 }
 
-fn verify_subtree_claim(&self, neighbor: &NodeId, claimed: u32) -> bool {
-    let children_sum: u32 = self.observed_children(neighbor)
-        .map(|c| c.subtree_size)
-        .sum();
-
-    // Allow 2x margin for children we haven't heard from yet
-    // Use saturating arithmetic to avoid overflow
-    claimed <= children_sum.saturating_add(1).saturating_mul(2)
-}
-```
-
-**Leave if defrauded:** Periodically check if the tree is much smaller than claimed. Wait 5 minutes after joining to let tree restructuring settle:
-
-```rust
-fn check_tree_size(&mut self) {
+fn check_tree_size_fraud(&mut self) {
     let ctx = match &self.join_context {
         Some(c) => c,
         None => return,
     };
 
-    // Wait for tree to stabilize after join
-    if ctx.join_time.elapsed() < FRAUD_CHECK_DELAY {
+    let t_hours = ctx.join_time.elapsed().as_secs_f64() / 3600.0;
+    let expected = 3.0 * self.subtree_size as f64 * t_hours / 8.0;
+
+    // Wait until we have enough expected samples for valid statistics
+    if expected < MIN_EXPECTED {
         return;
     }
 
-    if self.tree_size < ctx.claimed_size / 2 {
-        // Tree is much smaller than claimed - blame who told us
+    let observed = self.publish_count as f64;
+    let z = (expected - observed) / expected.sqrt();
+
+    if z > FRAUD_Z_THRESHOLD {
+        // We received significantly fewer PUBLISH than expected.
+        // With 99% confidence, the tree is smaller than claimed.
         self.add_distrust(ctx.parent_at_join);
         self.leave_and_rejoin();
     }
@@ -362,18 +384,17 @@ fn check_tree_size(&mut self) {
 
 fn leave_and_rejoin(&mut self) {
     self.join_context = None;
+    self.publish_count = 0;
     self.parent = None;
     self.root_id = self.node_id;
     self.tree_size = self.subtree_size;
-    // Will naturally rejoin a neighbor's tree on next Pulse exchange
 }
 ```
 
-**Distrust management:** Entries expire after 24 hours and are capped at 64 to bound memory:
+#### Distrust Management
 
 ```rust
 fn add_distrust(&mut self, node: NodeId) {
-    // Enforce memory limit - remove oldest if full
     while self.distrusted.len() >= MAX_DISTRUSTED {
         if let Some(oldest) = self.distrusted.iter()
             .min_by_key(|(_, time)| *time)
@@ -393,29 +414,21 @@ fn is_distrusted(&self, node: &NodeId) -> bool {
         None => false,
     }
 }
+
+fn on_pulse_from_potential_parent(&mut self, pulse: &Pulse) {
+    if self.is_distrusted(&pulse.node_id) {
+        return;
+    }
+    // ... proceed with merge decision
+}
 ```
 
-**When a node becomes distrusted:**
+#### Limitations
 
-1. **Tree size fraud:** We joined based on a `tree_size` claim, waited 5 minutes for the tree to stabilize, and observed `tree_size` drop below 50% of the claimed value. We blame `parent_at_join` (who made the claim), not our current parent (tree may have restructured).
-
-2. **Repeated subtree claim failures:** A node failed `verify_subtree_claim` three times. This catches nodes consistently lying about their subtree size.
-
-**Why these parameters:**
-- **5-minute delay:** Lets legitimate tree restructuring settle before checking
-- **50% threshold:** Generous to avoid false positives from normal churn
-- **3 strikes:** Gives nodes a chance if we just hadn't heard from their children yet
-- **24-hour expiry:** Long enough to matter, short enough to recover from false positives
-- **64 distrusted cap:** Bounds memory (~1.5KB) while catching recent attackers
-- **128 strikes cap:** Prevents memory exhaustion from attackers cycling NodeIds
-- **2x verification margin:** Accounts for children we haven't observed yet
-
-**Limitations:**
-- **Sybil with 64+ nodes:** An attacker with many identities can fill the distrust list, causing FIFO eviction of their oldest Sybils which can then attack again. Mitigated by the 24-hour expiry and the cost of generating valid keypairs.
-- **Colluding nodes:** Multiple attackers can maintain consistent lies about tree size.
-- **2x margin allows ~1.9x inflation:** Combined with 50% threshold, attackers can inflate tree_size by up to ~1.9x without triggering fraud detection.
-- **Distrust is local:** Each node must independently discover attackers (no gossip to avoid false-accusation amplification).
-- **Timer assumptions:** Requires monotonic timer that doesn't pause during sleep. Distrust state is ephemeral (lost on reboot).
+- **Small subtrees need more time:** A leaf node (`S=1`) needs ~14 hours to reach `λ=5` (minimum for reliable statistics).
+- **Spoofing is possible but costly:** Attacker can generate fake PUBLISH, but must grind ~`tree_size/(3×S)` keypairs per fake message to hit the victim's keyspace range.
+- **Distrust is local:** Each node detects fraud independently. No gossip (to avoid false-accusation attacks).
+- **Timer required:** Needs monotonic timer. Distrust state is lost on reboot.
 
 ### Partition and Reconnection
 
