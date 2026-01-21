@@ -91,11 +91,15 @@ A Pulse serves multiple purposes:
 | Leaf (no pubkey) | ~122 bytes |
 | Leaf (with pubkey) | ~154 bytes |
 | 8 children + pubkey | ~194 bytes |
+| 16 children (max) + pubkey | ~218 bytes |
+
+The protocol limits nodes to `MAX_CHILDREN = 16` to ensure Pulse messages fit within transport MTU limits.
 
 ### Node State
 
 ```rust
 // Memory bounds for embedded systems
+const MAX_CHILDREN: usize = 16;        // limits Pulse size to fit MTU
 const MAX_NEIGHBORS: usize = 128;      // for congested environments; ~5KB
 const MAX_PUBKEY_CACHE: usize = 128;   // LRU eviction
 const MAX_LOCATION_STORE: usize = 256; // bounded by keyspace fraction
@@ -179,6 +183,19 @@ N is root of its own single-node tree.
 ### Joining an Existing Tree
 
 When node N boots and discovers neighbor P (in a tree with 500 nodes):
+
+**Parent selection:** N evaluates all neighbors as potential parents. A neighbor is skipped if:
+- It has `children.len() >= MAX_CHILDREN` (parent is full)
+- It is in the distrusted set
+- Its tree_size is smaller than N's current tree
+
+**Implicit rejection:** When a node claims a parent (by setting `parent_id` in its Pulse), the parent decides whether to accept by including the child in its `children` list. A parent silently ignores a child if:
+- It already has `MAX_CHILDREN` children
+- Adding the child would cause the Pulse to exceed the transport MTU
+
+If a joining node doesn't see itself in the parent's `children` list after 3 Pulses, it assumes rejection and tries another neighbor.
+
+This ensures Pulse messages always fit within transport MTU limits (LoRa: 255 bytes, BLE: 252 bytes). With `MAX_CHILDREN = 16` and ~4 bytes per child entry, the children list typically uses ~64 bytes, keeping total Pulse size under 220 bytes. The MTU check handles rare edge cases (unlucky prefix collisions in large trees) without penalizing the common case.
 
 ```
 N → Pulse{node_id: N, parent_id: None, root_id: N, tree_size: 1, ...}
