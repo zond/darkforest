@@ -154,6 +154,59 @@ Even though UDP supports unicast and BLE GATT requires connections, the protocol
 
 The transport just needs to get bytes on the air. Routing is handled at protocol layer.
 
+### RX/TX Queue Architecture
+
+Transports should use queues to decouple interrupt handlers from protocol logic:
+
+```rust
+use embassy_sync::channel::Channel;
+use heapless::Vec as HVec;
+
+const RX_QUEUE_SIZE: usize = 4;
+const TX_QUEUE_SIZE: usize = 4;
+const MAX_PACKET_SIZE: usize = 255;
+
+type Packet = HVec<u8, MAX_PACKET_SIZE>;
+
+/// RX queue: ISR pushes received packets, protocol pops them
+/// Tuple: (packet_data, rssi)
+type RxQueue = Channel<CriticalSectionRawMutex, (Packet, Option<i16>), RX_QUEUE_SIZE>;
+
+/// TX queue: Protocol pushes packets to send, TX task pops and transmits
+type TxQueue = Channel<CriticalSectionRawMutex, Packet, TX_QUEUE_SIZE>;
+```
+
+**Why queues matter:**
+
+1. **RX queue**: LoRa radios have single-packet FIFOs. If a second packet arrives before the first is processed, it's lost. The ISR should immediately copy the packet to the RX queue.
+
+2. **TX queue**: Decouples "I want to send" from "radio is ready to send". Protocol logic can queue multiple messages; the transport drains them respecting duty cycle and half-duplex constraints.
+
+**ISR pattern (LoRa):**
+```rust
+#[interrupt]
+fn RADIO_IRQ() {
+    // SAFETY: We're in interrupt context, using critical section for shared state
+    critical_section::with(|_cs| {
+        let status = unsafe { RADIO.as_mut().unwrap() }.read_irq_flags();
+
+        if status.rx_done() {
+            let mut buf = HVec::new();
+            let len = unsafe { RADIO.as_mut().unwrap() }.read_packet_to_slice(&mut buf);
+            let rssi = unsafe { RADIO.as_mut().unwrap() }.get_rssi();
+            unsafe { RADIO.as_mut().unwrap() }.clear_irq_flags();
+
+            // Non-blocking send - drops packet if queue full (acceptable)
+            let _ = RX_QUEUE.try_send((buf, Some(rssi)));
+        }
+
+        if status.tx_done() {
+            TX_DONE_SIGNAL.signal(());
+        }
+    });
+}
+```
+
 ### Transport Implementation Sketches
 
 **LoRa (SX127x):**
@@ -170,9 +223,10 @@ struct Sx127xTransport {
     // Duty cycle tracking
     window_start: Instant,
     airtime_used_ms: u32,
-    // Async signaling (set by IRQ handler)
-    tx_done_signal: Signal<CriticalSectionRawMutex, ()>,
-    rx_ready_signal: Signal<CriticalSectionRawMutex, ()>,
+    // Queues (shared with ISR)
+    rx_queue: &'static RxQueue,
+    tx_queue: &'static TxQueue,
+    tx_done_signal: &'static Signal<CriticalSectionRawMutex, ()>,
 }
 
 const DUTY_CYCLE_WINDOW_MS: u64 = 60_000;
@@ -214,19 +268,34 @@ impl Transport for Sx127xTransport {
         self.airtime_used_ms += (airtime_us / 1000) as u32;
 
         // Start TX and await completion via interrupt
-        let mut buf = [0u8; 255];
-        buf[..data.len()].copy_from_slice(data);
-        self.radio.start_transmit(&buf[..data.len()])?;
-        self.tx_done_signal.wait().await;  // Embassy signal from IRQ
+        self.radio.start_transmit(data)?;
+        self.tx_done_signal.wait().await;
+
+        // Re-enter RX mode after TX (half-duplex)
+        self.radio.start_receive()?;
         Ok(())
     }
 
-    async fn rx(&mut self) -> (Vec<u8>, Option<i16>) {
-        // Wait for RX interrupt
-        self.rx_ready_signal.wait().await;  // Embassy signal from IRQ
-        let packet = self.radio.read_packet().unwrap();
-        let rssi = self.radio.get_packet_rssi().ok().map(|r| r as i16);
-        (packet.to_vec(), rssi)
+    async fn rx(&mut self) -> Result<(Packet, Option<i16>), Self::Error> {
+        // Receive from queue (ISR populates this)
+        let (packet, rssi) = self.rx_queue.receive().await;
+        Ok((packet, rssi))
+    }
+}
+
+/// Background task that drains TX queue respecting duty cycle
+async fn tx_task(transport: &mut Sx127xTransport) {
+    loop {
+        // Wait for something to send
+        let packet = transport.tx_queue.receive().await;
+
+        // Wait for duty cycle budget
+        while transport.tx_backoff() > 0 {
+            Timer::after(Duration::from_millis(transport.tx_backoff() as u64)).await;
+        }
+
+        // Transmit
+        let _ = transport.tx(&packet).await;
     }
 }
 ```
@@ -538,17 +607,118 @@ Binary serialization for embedded efficiency:
 - Length-prefixed vectors
 - Optional fields encoded with presence byte
 
+### Cursor-Based Decoding
+
+Use a cursor (reader) that tracks position and returns references into the original buffer where possible. This avoids allocations for borrowed data.
+
 ```rust
-pub trait Encode {
-    fn encode(&self, buf: &mut Vec<u8>);
+#[derive(Debug)]
+pub enum DecodeError {
+    UnexpectedEof,
+    InvalidVarint,
+    InvalidLength,
+    InvalidSignature,
 }
 
-pub trait Decode: Sized {
-    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError>;
+/// Zero-copy reader over a byte slice
+pub struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
+    pub fn read_u8(&mut self) -> Result<u8, DecodeError> {
+        if self.pos >= self.buf.len() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        let v = self.buf[self.pos];
+        self.pos += 1;
+        Ok(v)
+    }
+
+    pub fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
+        if self.pos + len > self.buf.len() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        let slice = &self.buf[self.pos..self.pos + len];
+        self.pos += len;
+        Ok(slice)
+    }
+
+    pub fn read_varint(&mut self) -> Result<u32, DecodeError> {
+        // Standard varint decoding (1-5 bytes for u32)
+        let mut result: u32 = 0;
+        let mut shift = 0;
+        loop {
+            let byte = self.read_u8()?;
+            result |= ((byte & 0x7F) as u32) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(result);
+            }
+            shift += 7;
+            if shift >= 35 {
+                return Err(DecodeError::InvalidVarint);
+            }
+        }
+    }
+
+    /// Read length-prefixed bytes (returns reference, no allocation)
+    pub fn read_len_prefixed(&mut self) -> Result<&'a [u8], DecodeError> {
+        let len = self.read_varint()? as usize;
+        self.read_bytes(len)
+    }
+}
+
+/// Writer for encoding
+pub struct Writer {
+    #[cfg(feature = "alloc")]
+    buf: alloc::vec::Vec<u8>,
+    #[cfg(not(feature = "alloc"))]
+    buf: heapless::Vec<u8, MAX_PACKET_SIZE>,
+}
+
+impl Writer {
+    pub fn new() -> Self {
+        Self { buf: Default::default() }
+    }
+
+    pub fn write_u8(&mut self, v: u8) { self.buf.push(v).ok(); }
+    pub fn write_bytes(&mut self, v: &[u8]) { self.buf.extend_from_slice(v).ok(); }
+    pub fn write_varint(&mut self, mut v: u32) {
+        while v >= 0x80 {
+            self.buf.push((v as u8) | 0x80).ok();
+            v >>= 7;
+        }
+        self.buf.push(v as u8).ok();
+    }
+    pub fn write_len_prefixed(&mut self, v: &[u8]) {
+        self.write_varint(v.len() as u32);
+        self.write_bytes(v);
+    }
+
+    pub fn finish(self) -> impl AsRef<[u8]> { self.buf }
+}
+
+pub trait Encode {
+    fn encode(&self, w: &mut Writer);
+}
+
+pub trait Decode<'a>: Sized {
+    fn decode(r: &mut Reader<'a>) -> Result<Self, DecodeError>;
 }
 
 // Implement for Pulse, Routed, LocationEntry, etc.
 ```
+
+**Note:** Decoded types that borrow from the buffer (like `&[u8]` for tree_addr) have a lifetime. For types that need to outlive the buffer, implement both a borrowed and an owned variant, or copy on decode.
 
 ## Implementation Order
 
@@ -592,15 +762,45 @@ Optional feature flags:
 [features]
 default = []
 std = ["heapless/std"]
+alloc = []                 # Enable alloc-based collections (Vec, HashMap)
 default-crypto = ["ed25519-dalek", "sha2"]
 ```
 
 **Note:** Embassy-time works on both embedded (HAL backends) and std (using tokio).
 
-## Memory Bounds (from spec)
+## Allocation Strategy
+
+The library supports two allocation modes via feature flags:
+
+**Default (no features): Static allocation with `heapless`**
+- All collections use fixed-capacity `heapless` types
+- Works on bare-metal with no allocator
+- Maximum portability (Cortex-M0+, 16KB+ RAM)
+
+**With `alloc` feature: Dynamic allocation**
+- Uses `Vec`, `HashMap` from `alloc` crate
+- More flexible sizing, simpler APIs
+- Requires global allocator (fine for nRF52840, ESP32, STM32F4+)
 
 ```rust
-const MAX_CHILDREN: usize = 16;        // limits Pulse size to fit MTU (~218 bytes max)
+// In types.rs
+#[cfg(not(feature = "alloc"))]
+pub type TreeAddr = heapless::Vec<u8, MAX_TREE_DEPTH>;
+
+#[cfg(feature = "alloc")]
+pub type TreeAddr = alloc::vec::Vec<u8>;
+
+#[cfg(not(feature = "alloc"))]
+pub type ChildMap = heapless::FnvIndexMap<NodeId, u32, MAX_CHILDREN>;
+
+#[cfg(feature = "alloc")]
+pub type ChildMap = alloc::collections::BTreeMap<NodeId, u32>;
+```
+
+**Memory bounds (heapless mode):**
+```rust
+const MAX_TREE_DEPTH: usize = 32;      // Supports trees up to 16^32 nodes
+const MAX_CHILDREN: usize = 16;        // Per design spec
 const MAX_NEIGHBORS: usize = 128;
 const MAX_PUBKEY_CACHE: usize = 128;
 const MAX_LOCATION_STORE: usize = 256;
@@ -608,8 +808,6 @@ const MAX_LOCATION_CACHE: usize = 64;
 const MAX_PENDING_LOOKUPS: usize = 16;
 const MAX_DISTRUSTED: usize = 64;
 ```
-
-The `MAX_CHILDREN` limit ensures Pulse messages always fit within transport MTU (LoRa: 255 bytes, BLE: 252 bytes). When a node has reached its child limit, joining nodes will select a different neighbor as parent, naturally balancing the tree.
 
 ## Testing Strategy
 
