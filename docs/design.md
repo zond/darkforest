@@ -64,7 +64,7 @@ struct Pulse {
     pubkey: Option<PublicKey>,          // 0 or 32 bytes
     child_prefix_len: u8,               // 1 byte
     children: Vec<(prefix, varint)>,    // variable
-    signature: Signature,               // 64 bytes
+    signature: Signature,               // 65 bytes (1 algorithm + 64 sig)
 }
 
 // Signature covers ALL fields (domain-separated):
@@ -78,7 +78,11 @@ A Pulse serves multiple purposes:
 - **Children list** for tree address computation
 - **Pubkey exchange** for signature verification
 
-**Replay consideration:** Pulses have no sequence number. An attacker replaying an old Pulse causes brief confusion (~25s) until the legitimate node's next Pulse corrects it. This is low-impact since Pulses are frequent and self-correcting.
+**Replay consideration:** Pulses have no sequence number. This is a deliberate tradeoff:
+
+- **Attack:** Replaying an old Pulse causes ~25s confusion until the legitimate node's next Pulse corrects it. Extending the attack requires jamming the legitimate Pulses.
+- **Why no seq:** Adding seq (4 bytes) would require recovery after reboot. Since neighbors track `last_seen_seq`, a rebooted node's Pulses would be rejected until neighbors timeout (~75-90s). This recovery delay costs more than the 25s confusion it prevents.
+- **Conclusion:** Pulses are frequent and self-correcting. The brief confusion window is acceptable given the recovery complexity seq would introduce.
 
 **Typical sizes:**
 
@@ -91,6 +95,13 @@ A Pulse serves multiple purposes:
 ### Node State
 
 ```rust
+// Memory bounds for embedded systems
+const MAX_NEIGHBORS: usize = 128;      // for congested environments; ~5KB
+const MAX_PUBKEY_CACHE: usize = 128;   // LRU eviction
+const MAX_LOCATION_STORE: usize = 256; // bounded by keyspace fraction
+const MAX_LOCATION_CACHE: usize = 64;  // LRU eviction
+const MAX_PENDING_LOOKUPS: usize = 16; // oldest eviction
+
 struct Node {
     // Identity
     node_id: NodeId,
@@ -104,10 +115,12 @@ struct Node {
     subtree_size: u32,
     tree_addr: Vec<u8>,
 
-    // Neighbors
+    // Neighbors (bounded by MAX_NEIGHBORS)
     children: HashMap<NodeId, u32>,         // child -> subtree_size
     shortcuts: HashSet<NodeId>,
     neighbor_times: HashMap<NodeId, (Timestamp, Option<Timestamp>)>,
+
+    // Caches (bounded with LRU/oldest eviction)
     pubkey_cache: HashMap<NodeId, PublicKey>,
     need_pubkey: HashSet<NodeId>,
 }
@@ -342,7 +355,7 @@ const MAX_DISTRUSTED: usize = 64;
 struct Node {
     join_context: Option<JoinContext>,
     distrusted: HashMap<NodeId, Instant>,
-    publish_count: u32,
+    fraud_detection: FraudDetection,
     // ...
 }
 
@@ -351,9 +364,28 @@ struct JoinContext {
     join_time: Instant,
 }
 
+struct FraudDetection {
+    publish_count: u32,
+    count_start: Instant,
+    subtree_size_at_start: u32,
+}
+
 fn on_publish_received(&mut self, msg: &Routed) {
     if self.is_storage_node_for(msg) {
-        self.publish_count += 1;
+        self.fraud_detection.publish_count += 1;
+    }
+}
+
+fn on_subtree_size_changed(&mut self) {
+    // Reset fraud detection if subtree_size changed significantly (2x either way)
+    let old = self.fraud_detection.subtree_size_at_start;
+    let new = self.subtree_size;
+    if new > old * 2 || new < old / 2 {
+        self.fraud_detection = FraudDetection {
+            publish_count: 0,
+            count_start: Instant::now(),
+            subtree_size_at_start: new,
+        };
     }
 }
 
@@ -363,15 +395,16 @@ fn check_tree_size_fraud(&mut self) {
         None => return,
     };
 
-    let t_hours = ctx.join_time.elapsed().as_secs_f64() / 3600.0;
-    let expected = 3.0 * self.subtree_size as f64 * t_hours / 8.0;
+    let fd = &self.fraud_detection;
+    let t_hours = fd.count_start.elapsed().as_secs_f64() / 3600.0;
+    let expected = 3.0 * fd.subtree_size_at_start as f64 * t_hours / 8.0;
 
     // Wait until we have enough expected samples for valid statistics
     if expected < MIN_EXPECTED {
         return;
     }
 
-    let observed = self.publish_count as f64;
+    let observed = fd.publish_count as f64;
     let z = (expected - observed) / expected.sqrt();
 
     if z > FRAUD_Z_THRESHOLD {
@@ -384,7 +417,11 @@ fn check_tree_size_fraud(&mut self) {
 
 fn leave_and_rejoin(&mut self) {
     self.join_context = None;
-    self.publish_count = 0;
+    self.fraud_detection = FraudDetection {
+        publish_count: 0,
+        count_start: Instant::now(),
+        subtree_size_at_start: self.subtree_size,
+    };
     self.parent = None;
     self.root_id = self.node_id;
     self.tree_size = self.subtree_size;
@@ -425,10 +462,19 @@ fn on_pulse_from_potential_parent(&mut self, pulse: &Pulse) {
 
 #### Limitations
 
-- **Small subtrees need more time:** A leaf node (`S=1`) needs ~14 hours to reach `λ=5` (minimum for reliable statistics).
-- **Spoofing is possible but costly:** Attacker can generate fake PUBLISH, but must grind ~`tree_size/(3×S)` keypairs per fake message to hit the victim's keyspace range.
-- **Distrust is local:** Each node detects fraud independently. No gossip (to avoid false-accusation attacks).
+**Detection limits:**
+- **Small subtrees need more time:** A leaf node (`S=1`) needs ~14 hours to reach `λ=5` for reliable statistics.
+- **Slow ramp attack:** An attacker claiming ~1.3× actual size stays below detection threshold indefinitely. Only large fraud (>2×) is reliably detected.
+- **Subtree size resets:** When subtree_size changes significantly (2× either way), counters reset, delaying detection.
+
+**Sybil attacks:**
+- **PUBLISH spoofing:** Attacker can generate fake PUBLISH by grinding keypairs until `hash(node_id || replica)` lands in victim's keyspace. Cost: ~`tree_size/(3×S)` keypairs per fake message. For S=10 in 1000-node tree: ~33 keypairs per fake PUBLISH. Sustaining fraud indefinitely requires ongoing computation.
+- **Identity rotation:** After being distrusted, attacker generates new keypair and rejoins. The distrust mechanism provides temporary relief only. Possible mitigation: progressive backoff (after N frauds in time T, become more conservative about joining any tree).
+
+**Fundamental limits:**
+- **Distrust is local:** Each node detects fraud independently. No gossip (to avoid false-accusation amplification attacks).
 - **Timer required:** Needs monotonic timer. Distrust state is lost on reboot.
+- **No prevention, only detection:** We cannot prevent fraud, only detect it after joining. The attacker "wins" temporarily until detected.
 
 ### Partition and Reconnection
 
