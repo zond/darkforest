@@ -160,6 +160,7 @@ pub struct Node<T, Cr, R, Clk> {
     last_pulse_size: usize,
     next_publish: Option<Timestamp>,
     location_seq: u32,
+    proactive_pulse_pending: Option<Timestamp>,
 
     // Metrics
     metrics: TransportMetrics,
@@ -234,6 +235,7 @@ where
             last_pulse_size: 0,
             next_publish: None,
             location_seq: 0,
+            proactive_pulse_pending: None,
 
             metrics: TransportMetrics::new(),
         }
@@ -299,6 +301,26 @@ where
     /// Get the transport reference.
     pub fn transport(&self) -> &T {
         &self.transport
+    }
+
+    /// Calculate tau: the bandwidth-aware time unit.
+    /// tau = MTU / bandwidth (with MIN_TAU_MS floor)
+    pub fn tau(&self) -> Duration {
+        use crate::types::MIN_TAU_MS;
+        match self.transport.bw() {
+            Some(bw) if bw > 0 => {
+                let ms = (self.transport.mtu() as u64 * 1000) / bw as u64;
+                Duration::from_millis(ms.max(MIN_TAU_MS))
+            }
+            _ => Duration::from_millis(MIN_TAU_MS),
+        }
+    }
+
+    /// Lookup timeout: 32τ per replica
+    /// For LoRa (τ=6.7s): ~3.5 minutes
+    /// For UDP (τ=0.1s): ~3 seconds
+    pub fn lookup_timeout(&self) -> Duration {
+        self.tau() * 32
     }
 
     /// Get the crypto reference.
@@ -370,6 +392,7 @@ where
     ///
     /// Returns None if no pulse has been sent yet (send immediately).
     /// With bandwidth limits, interval is extended to keep pulse within budget.
+    /// Returns the earlier of regular scheduled pulse or proactive pulse.
     fn next_pulse_time(&self) -> Option<Timestamp> {
         use crate::types::PULSE_BW_DIVISOR;
 
@@ -386,7 +409,13 @@ where
             _ => MIN_PULSE_INTERVAL,
         };
 
-        Some(last + interval)
+        let regular_time = last + interval;
+
+        // Return earlier of regular pulse or proactive pulse
+        match self.proactive_pulse_pending {
+            Some(proactive) => Some(regular_time.min(proactive)),
+            None => Some(regular_time),
+        }
     }
 
     /// Calculate next timeout time (lookups, neighbors, locations).
@@ -683,6 +712,14 @@ where
 
     pub(crate) fn set_last_pulse_size(&mut self, size: usize) {
         self.last_pulse_size = size;
+    }
+
+    pub(crate) fn proactive_pulse_pending(&self) -> Option<Timestamp> {
+        self.proactive_pulse_pending
+    }
+
+    pub(crate) fn set_proactive_pulse_pending(&mut self, time: Option<Timestamp>) {
+        self.proactive_pulse_pending = time;
     }
 
     pub(crate) fn secret(&self) -> &SecretKey {

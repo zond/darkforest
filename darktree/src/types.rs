@@ -25,17 +25,18 @@ pub const DEFAULT_TTL: u8 = 255; // Max hops
 
 // Timing constants as Durations
 pub const MIN_PULSE_INTERVAL: Duration = Duration::from_secs(10);
-pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(240); // 4 min per replica
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(240); // 4 min for request-response
 pub const MAX_RETRIES: u8 = 3;
 pub const LOCATION_REFRESH: Duration = Duration::from_hours(8);
 pub const LOCATION_TTL: Duration = Duration::from_hours(12);
 pub const DISTRUST_TTL: Duration = Duration::from_hours(24);
-pub const REPUBLISH_JITTER: Duration = Duration::from_millis(5000);
 
 // Bandwidth budget: Pulse traffic should use at most 1/PULSE_BW_DIVISOR of available bandwidth.
 // With divisor=5, pulse is limited to 20% of bandwidth, leaving 80% for application data.
 pub const PULSE_BW_DIVISOR: u32 = 5;
+
+/// Minimum tau value in milliseconds (floor for high-bandwidth transports).
+/// tau = max(MTU/bandwidth, MIN_TAU_MS).
+pub const MIN_TAU_MS: u64 = 100;
 
 // Message types (0-3 valid; 4-255 dropped silently)
 pub const MSG_PUBLISH: u8 = 0;

@@ -78,34 +78,40 @@ impl Timestamp {
 impl Add<Duration> for Timestamp {
     type Output = Timestamp;
 
+    /// Saturating addition to prevent overflow on embedded systems.
     #[inline]
     fn add(self, rhs: Duration) -> Timestamp {
-        Timestamp(self.0 + rhs.0)
+        Timestamp(self.0.saturating_add(rhs.0))
     }
 }
 
 impl AddAssign<Duration> for Timestamp {
+    /// Saturating addition to prevent overflow on embedded systems.
     #[inline]
     fn add_assign(&mut self, rhs: Duration) {
-        self.0 += rhs.0;
+        self.0 = self.0.saturating_add(rhs.0);
     }
 }
 
 impl Sub for Timestamp {
     type Output = Duration;
 
+    /// Saturating subtraction to prevent underflow on embedded systems.
+    /// Returns Duration::ZERO if rhs > self.
     #[inline]
     fn sub(self, rhs: Timestamp) -> Duration {
-        Duration(self.0 - rhs.0)
+        Duration(self.0.saturating_sub(rhs.0))
     }
 }
 
 impl Sub<Duration> for Timestamp {
     type Output = Timestamp;
 
+    /// Saturating subtraction to prevent underflow on embedded systems.
+    /// Returns Timestamp::ZERO if rhs > self.
     #[inline]
     fn sub(self, rhs: Duration) -> Timestamp {
-        Timestamp(self.0 - rhs.0)
+        Timestamp(self.0.saturating_sub(rhs.0))
     }
 }
 
@@ -192,41 +198,47 @@ impl Duration {
 impl Add for Duration {
     type Output = Duration;
 
+    /// Saturating addition to prevent overflow on embedded systems.
     #[inline]
     fn add(self, rhs: Duration) -> Duration {
-        Duration(self.0 + rhs.0)
+        Duration(self.0.saturating_add(rhs.0))
     }
 }
 
 impl AddAssign for Duration {
+    /// Saturating addition to prevent overflow on embedded systems.
     #[inline]
     fn add_assign(&mut self, rhs: Duration) {
-        self.0 += rhs.0;
+        self.0 = self.0.saturating_add(rhs.0);
     }
 }
 
 impl Sub for Duration {
     type Output = Duration;
 
+    /// Saturating subtraction to prevent underflow on embedded systems.
+    /// Returns Duration::ZERO if rhs > self.
     #[inline]
     fn sub(self, rhs: Duration) -> Duration {
-        Duration(self.0 - rhs.0)
+        Duration(self.0.saturating_sub(rhs.0))
     }
 }
 
 impl SubAssign for Duration {
+    /// Saturating subtraction to prevent underflow on embedded systems.
     #[inline]
     fn sub_assign(&mut self, rhs: Duration) {
-        self.0 -= rhs.0;
+        self.0 = self.0.saturating_sub(rhs.0);
     }
 }
 
 impl Mul<u64> for Duration {
     type Output = Duration;
 
+    /// Saturating multiplication to prevent overflow on embedded systems.
     #[inline]
     fn mul(self, rhs: u64) -> Duration {
-        Duration(self.0 * rhs)
+        Duration(self.0.saturating_mul(rhs))
     }
 }
 
@@ -289,6 +301,34 @@ mod tests {
         let t1 = Timestamp::from_secs(5);
         let t2 = Timestamp::from_secs(10);
         assert_eq!(t1.saturating_sub(t2), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_operator_overflow_safety() {
+        // Addition overflow -> saturates to MAX
+        let t = Timestamp::MAX;
+        let d = Duration::from_secs(1);
+        assert_eq!(t + d, Timestamp::MAX);
+
+        let d_max = Duration::MAX;
+        assert_eq!(d_max + Duration::from_secs(1), Duration::MAX);
+
+        // Subtraction underflow -> saturates to ZERO
+        let t1 = Timestamp::from_secs(5);
+        let t2 = Timestamp::from_secs(10);
+        assert_eq!(t1 - t2, Duration::ZERO); // Timestamp - Timestamp
+
+        let t3 = Timestamp::from_secs(5);
+        let d_big = Duration::from_secs(10);
+        assert_eq!(t3 - d_big, Timestamp::ZERO); // Timestamp - Duration
+
+        let d1 = Duration::from_secs(3);
+        let d2 = Duration::from_secs(10);
+        assert_eq!(d1 - d2, Duration::ZERO); // Duration - Duration
+
+        // Multiplication overflow -> saturates to MAX
+        let d = Duration::from_millis(u64::MAX / 2);
+        assert_eq!(d * 3, Duration::MAX);
     }
 
     #[test]

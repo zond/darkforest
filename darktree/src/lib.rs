@@ -131,4 +131,62 @@ mod tests {
         assert_eq!(pulse.parent_id, decoded.parent_id);
         assert_eq!(pulse.tree_size, decoded.tree_size);
     }
+
+    #[test]
+    fn test_tau_lora_bandwidth() {
+        // LoRa: 38 bytes/sec, 255 byte MTU
+        // tau = 255 / 38 * 1000 = 6710 ms
+        let transport = MockTransport::with_mtu_and_bw(255, Some(38));
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+
+        let node = Node::new(transport, crypto, random, clock);
+        let tau = node.tau();
+
+        assert_eq!(tau.as_millis(), 6710);
+    }
+
+    #[test]
+    fn test_tau_no_bandwidth() {
+        // No bandwidth limit: should use MIN_TAU_MS (100ms)
+        let transport = MockTransport::new(); // bw = None
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+
+        let node = Node::new(transport, crypto, random, clock);
+        let tau = node.tau();
+
+        assert_eq!(tau.as_millis(), 100);
+    }
+
+    #[test]
+    fn test_tau_high_bandwidth() {
+        // High bandwidth (e.g., UDP): MTU / bw would be < MIN_TAU_MS
+        // 512 byte MTU, 100000 bytes/sec -> 5.12ms, should floor to 100ms
+        let transport = MockTransport::with_mtu_and_bw(512, Some(100_000));
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+
+        let node = Node::new(transport, crypto, random, clock);
+        let tau = node.tau();
+
+        assert_eq!(tau.as_millis(), 100);
+    }
+
+    #[test]
+    fn test_lookup_timeout() {
+        // LoRa: tau = 6710ms, lookup_timeout = 32 * tau = 214720ms (~3.6 min)
+        let transport = MockTransport::with_mtu_and_bw(255, Some(38));
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+
+        let node = Node::new(transport, crypto, random, clock);
+        let timeout = node.lookup_timeout();
+
+        assert_eq!(timeout.as_millis(), 6710 * 32);
+    }
 }

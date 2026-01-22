@@ -11,15 +11,12 @@ use crate::time::{Duration, Timestamp};
 use crate::traits::{Clock, Crypto, Random, Transport};
 use crate::types::{
     ChildPrefix, ChildrenList, Event, Pulse, Signature, DISTRUST_TTL, K_REPLICAS, LOCATION_TTL,
-    LOOKUP_TIMEOUT, MAX_CHILDREN, MIN_PULSE_INTERVAL, MSG_PUBLISH, REPUBLISH_JITTER,
+    MAX_CHILDREN, MIN_PULSE_INTERVAL, MSG_PUBLISH,
 };
 use crate::wire::{pulse_sign_data, Encode, Message};
 
 /// Number of missed pulses before timeout.
-const MISSED_PULSES_TIMEOUT: u64 = 3;
-
-/// Default pulse interval for timeout calculation.
-const DEFAULT_OBSERVED_INTERVAL: Duration = Duration::from_secs(30);
+const MISSED_PULSES_TIMEOUT: u64 = 8;
 
 /// Number of pulses to wait for parent acknowledgment.
 const PARENT_ACK_PULSES: u8 = 3;
@@ -50,7 +47,11 @@ where
 
         // Track if neighbor needs pubkeys (so we include ours in next pulse)
         if pulse.need_pubkey {
-            self.neighbors_need_pubkey_mut().insert(pulse.node_id);
+            // If neighbor newly needs our pubkey, schedule proactive pulse
+            let was_not_tracked = self.neighbors_need_pubkey_mut().insert(pulse.node_id);
+            if was_not_tracked {
+                self.schedule_proactive_pulse(now);
+            }
         } else {
             self.neighbors_need_pubkey_mut().remove(&pulse.node_id);
         }
@@ -79,6 +80,7 @@ where
             .neighbor_times()
             .get(&pulse.node_id)
             .map(|t| t.last_seen);
+        let is_new_neighbor = prev.is_none();
         let timing = NeighborTiming {
             last_seen: now,
             prev_seen: prev,
@@ -86,13 +88,18 @@ where
         };
         self.insert_neighbor_time(pulse.node_id, timing);
 
+        // If new neighbor, schedule proactive pulse to introduce ourselves
+        if is_new_neighbor {
+            self.schedule_proactive_pulse(now);
+        }
+
         // Check if this pulse is from our parent
         if Some(pulse.node_id) == self.parent() {
             self.handle_parent_pulse(&pulse, now);
         }
         // Check if this pulse claims us as parent
         else if pulse.parent_id == Some(*self.node_id()) {
-            self.handle_child_pulse(&pulse);
+            self.handle_child_pulse(&pulse, now);
         }
         // Check for pending parent acknowledgment
         else if let Some((pending, _)) = self.pending_parent() {
@@ -155,10 +162,14 @@ where
 
             // If address changed, schedule republish and rebalance keyspace
             if addr_changed {
-                let jitter_ms = self.random_mut().gen_range(0, REPUBLISH_JITTER.as_millis());
+                // Jitter: 0-1τ
+                let tau_ms = self.tau().as_millis();
+                let jitter_ms = self.random_mut().gen_range(0, tau_ms);
                 self.set_next_publish(Some(now + Duration::from_millis(jitter_ms)));
                 // Move DHT entries that we no longer own to their new owners
                 self.rebalance_keyspace(now);
+                // Notify children of our new address
+                self.schedule_proactive_pulse(now);
             }
         } else {
             // Parent didn't include us - we might have been rejected
@@ -182,7 +193,7 @@ where
     }
 
     /// Handle a pulse from a node claiming us as parent.
-    fn handle_child_pulse(&mut self, pulse: &Pulse) {
+    fn handle_child_pulse(&mut self, pulse: &Pulse, now: Timestamp) {
         // Check if we can accept this child
         if self.children().len() >= MAX_CHILDREN {
             // At capacity, silently reject
@@ -196,6 +207,9 @@ where
             return;
         }
 
+        // Track if this is a new child
+        let is_new = !self.children().contains_key(&pulse.node_id);
+
         // Accept the child
         self.children_mut()
             .insert(pulse.node_id, pulse.subtree_size);
@@ -205,6 +219,11 @@ where
 
         // Update subtree size
         self.recalculate_subtree_size();
+
+        // If new child, schedule proactive pulse to acknowledge them
+        if is_new {
+            self.schedule_proactive_pulse(now);
+        }
     }
 
     /// Handle a pulse from our pending parent candidate.
@@ -287,6 +306,9 @@ where
 
         // Start parent switch process
         self.set_pending_parent(Some((pulse.node_id, 0)));
+
+        // Schedule proactive pulse to announce our intent to join
+        self.schedule_proactive_pulse(now);
     }
 
     /// Check if a node is distrusted.
@@ -384,7 +406,7 @@ where
     ///
     /// Pulse is sent to the protocol queue (high priority). If the queue is full,
     /// the Pulse is dropped - this is acceptable because the protocol tolerates
-    /// occasional missed Pulses (neighbors timeout after 3 missed Pulses).
+    /// occasional missed Pulses (neighbors timeout after 8 missed Pulses).
     /// See design.md "Best-effort delivery" section.
     pub(crate) fn send_pulse(&mut self, now: Timestamp) {
         let pulse = self.build_pulse();
@@ -409,6 +431,29 @@ where
         }
         self.set_last_pulse(Some(now));
         self.set_last_pulse_size(size);
+        // Clear proactive pulse flag - it's been sent (or will be soon in regular schedule)
+        self.set_proactive_pulse_pending(None);
+    }
+
+    /// Schedule a proactive pulse with batching delay (1τ to 2τ).
+    /// If already scheduled, reschedules only if the new time would be earlier
+    /// (coalesces multiple triggers while ensuring urgent events aren't delayed).
+    pub(crate) fn schedule_proactive_pulse(&mut self, now: Timestamp) {
+        let tau = self.tau();
+        let tau_ms = tau.as_millis();
+        // 1.5τ ± 0.5τ = range [1τ, 2τ]
+        let delay_ms = tau_ms + self.random_mut().gen_range(0, tau_ms);
+        let new_time = now + Duration::from_millis(delay_ms);
+
+        match self.proactive_pulse_pending() {
+            Some(existing) if existing <= new_time => {
+                // Already scheduled for earlier or same time - keep existing
+            }
+            _ => {
+                // No pending pulse, or new time is earlier - schedule/reschedule
+                self.set_proactive_pulse_pending(Some(new_time));
+            }
+        }
     }
 
     /// Build a Pulse message.
@@ -473,7 +518,7 @@ where
             let interval = timing
                 .prev_seen
                 .map(|prev| timing.last_seen.saturating_sub(prev))
-                .unwrap_or(DEFAULT_OBSERVED_INTERVAL);
+                .unwrap_or_else(|| self.tau() * 5);
 
             let timeout = timing.last_seen + interval * MISSED_PULSES_TIMEOUT;
             if now > timeout {
@@ -515,8 +560,9 @@ where
         let mut to_retry: Vec<[u8; 16]> = Vec::new();
         let mut to_fail: Vec<[u8; 16]> = Vec::new();
 
+        let lookup_timeout = self.lookup_timeout();
         for (target, lookup) in self.pending_lookups().iter() {
-            if now > lookup.last_query_at + LOOKUP_TIMEOUT {
+            if now > lookup.last_query_at + lookup_timeout {
                 if lookup.replica_index + 1 < K_REPLICAS {
                     to_retry.push(*target);
                 } else {
