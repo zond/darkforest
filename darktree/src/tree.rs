@@ -15,6 +15,12 @@ use crate::types::{
 };
 use crate::wire::{pulse_sign_data, Encode, Message};
 
+// Compile-time assertion: MAX_CHILDREN must fit in u8 for NeighborTiming.children_count
+const _: () = assert!(
+    MAX_CHILDREN <= u8::MAX as usize,
+    "MAX_CHILDREN must fit in u8"
+);
+
 /// Number of missed pulses before timeout.
 const MISSED_PULSES_TIMEOUT: u64 = 8;
 
@@ -85,6 +91,10 @@ where
             last_seen: now,
             prev_seen: prev,
             rssi,
+            root_id: pulse.root_id,
+            tree_size: pulse.tree_size,
+            tree_addr_len: pulse.tree_addr.len() as u8,
+            children_count: pulse.children.len() as u8,
         };
         self.insert_neighbor_time(pulse.node_id, timing);
 
@@ -267,6 +277,11 @@ where
 
     /// Consider merging with another tree based on received pulse.
     fn consider_merge(&mut self, pulse: &Pulse, now: Timestamp) {
+        // Don't merge during discovery phase - wait for select_best_parent
+        if self.is_in_discovery() {
+            return;
+        }
+
         // Don't merge if this node is distrusted
         if self.is_distrusted(&pulse.node_id, now) {
             return;
@@ -316,6 +331,90 @@ where
         self.distrusted()
             .get(node_id)
             .is_some_and(|&when| now < when + DISTRUST_TTL)
+    }
+
+    /// Select the best parent from discovered neighbors.
+    ///
+    /// Called when discovery phase ends. Implements the algorithm from design doc:
+    /// 1. Pick the best tree (largest tree_size, tie-break: lowest root_id)
+    /// 2. Filter by signal strength (if 3+ candidates with RSSI, remove bottom 50%)
+    /// 3. Pick shallowest (shortest tree_addr, tie-break: best RSSI)
+    pub(crate) fn select_best_parent(&mut self, now: Timestamp) {
+        // Collect valid candidates: not full, not distrusted
+        let mut candidates: Vec<([u8; 16], &crate::node::NeighborTiming)> = self
+            .neighbor_times()
+            .iter()
+            .filter(|(id, timing)| {
+                timing.children_count < MAX_CHILDREN as u8 && !self.is_distrusted(id, now)
+            })
+            .map(|(id, timing)| (*id, timing))
+            .collect();
+
+        if candidates.is_empty() {
+            // No valid candidates - stay as root of single-node tree
+            // Will join via normal merge when we hear a larger tree
+            return;
+        }
+
+        // Step 1: Pick the best tree
+        // Find the best (tree_size, root_id) - largest tree_size, tie-break by lowest root_id
+        let best_tree = candidates
+            .iter()
+            .map(|(_, t)| (t.tree_size, t.root_id))
+            .max_by(|a, b| {
+                // Compare by tree_size descending, then root_id ascending
+                match a.0.cmp(&b.0) {
+                    std::cmp::Ordering::Equal => b.1.cmp(&a.1), // lower root_id wins
+                    other => other,
+                }
+            })
+            .unwrap(); // Safe: we checked candidates.is_empty() above
+
+        // Filter to only candidates from the best tree
+        candidates.retain(|(_, t)| t.tree_size == best_tree.0 && t.root_id == best_tree.1);
+
+        // Step 2: Filter by signal strength (if 3+ candidates with RSSI)
+        let rssi_count = candidates.iter().filter(|(_, t)| t.rssi.is_some()).count();
+        if candidates.len() >= 3 && rssi_count >= 3 {
+            // Sort by RSSI descending (best signal first)
+            candidates.sort_by(|(_, a), (_, b)| {
+                match (b.rssi, a.rssi) {
+                    (Some(b_rssi), Some(a_rssi)) => b_rssi.cmp(&a_rssi),
+                    (Some(_), None) => std::cmp::Ordering::Less, // RSSI beats no RSSI
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
+            // Keep top 50% (remove bottom half)
+            let keep = candidates.len().div_ceil(2);
+            candidates.truncate(keep);
+        }
+
+        // Step 3: Pick shallowest (shortest tree_addr, tie-break: best RSSI)
+        candidates.sort_by(|(_, a), (_, b)| {
+            // First by tree_addr_len ascending (shallowest first)
+            match a.tree_addr_len.cmp(&b.tree_addr_len) {
+                std::cmp::Ordering::Equal => {
+                    // Tie-break by RSSI descending (best signal wins)
+                    match (b.rssi, a.rssi) {
+                        (Some(b_rssi), Some(a_rssi)) => b_rssi.cmp(&a_rssi),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    }
+                }
+                other => other,
+            }
+        });
+
+        // Select the best candidate
+        let (parent_id, _) = candidates[0];
+
+        // Start parent switch process (same as consider_merge)
+        self.set_pending_parent(Some((parent_id, 0)));
+
+        // Schedule proactive pulse to announce our intent to join
+        self.schedule_proactive_pulse(now);
     }
 
     /// Become root of our own subtree.

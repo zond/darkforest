@@ -59,14 +59,6 @@ Shortcuts are tracked in `shortcuts: ShortcutSet` but never used for routing. Co
 
 **Design doc (lines 745-777):** Use shortcut S if `common_prefix_len(S.tree_addr, dest_addr) > common_prefix_len(my_addr, dest_addr)`.
 
-### RSSI not used for parent selection
-**Source:** Protocol reviewer
-**Location:** `tree.rs`
-
-RSSI is stored in `NeighborTiming` but never used for parent selection decisions.
-
-**Design doc (lines 306-314):** "Parent selection priority: 1. Good enough signal strength"
-
 ### Memory pressure from pending_pubkey
 **Source:** Embedded reviewer
 **Location:** `node.rs`
@@ -151,3 +143,4 @@ Design doc: `MAX_RETRIES = 8`, Implementation: `MAX_RETRIES = 3`. Not currently 
 - Varint overflow attack protection
 - Children count validation in decoder
 - Fraud detection wired up and tested
+- RSSI-based parent selection with discovery phase

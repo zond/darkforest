@@ -39,8 +39,8 @@ use crate::types::{
     MAX_PENDING_LOOKUPS, MAX_PENDING_PUBKEY, MAX_PUBKEY_CACHE, MIN_PULSE_INTERVAL,
 };
 
-/// Timing and signal information for a neighbor.
-#[derive(Clone, Copy, Debug)]
+/// Timing, signal, and tree information for a neighbor.
+#[derive(Clone, Debug)]
 pub struct NeighborTiming {
     /// Last time we received a Pulse from this neighbor.
     pub last_seen: Timestamp,
@@ -48,6 +48,14 @@ pub struct NeighborTiming {
     pub prev_seen: Option<Timestamp>,
     /// Last observed signal strength in dBm (if available).
     pub rssi: Option<i16>,
+    /// Root of the neighbor's tree.
+    pub root_id: NodeId,
+    /// Size of the neighbor's tree.
+    pub tree_size: u32,
+    /// Length of the neighbor's tree address (depth indicator).
+    pub tree_addr_len: u8,
+    /// Number of children the neighbor has.
+    pub children_count: u8,
 }
 
 /// Pending lookup state.
@@ -161,6 +169,7 @@ pub struct Node<T, Cr, R, Clk> {
     next_publish: Option<Timestamp>,
     location_seq: u32,
     proactive_pulse_pending: Option<Timestamp>,
+    discovery_deadline: Option<Timestamp>,
 
     // Metrics
     metrics: TransportMetrics,
@@ -236,6 +245,7 @@ where
             next_publish: None,
             location_seq: 0,
             proactive_pulse_pending: None,
+            discovery_deadline: None,
 
             metrics: TransportMetrics::new(),
         }
@@ -352,16 +362,27 @@ where
         let now = self.clock.now();
         self.send_pulse(now);
 
+        // Start discovery phase if orphan (no parent, no children)
+        // Discovery lasts 3τ to collect neighbor Pulses before selecting parent
+        if self.parent.is_none() && self.children.is_empty() {
+            let discovery_duration = self.tau() * 3;
+            self.discovery_deadline = Some(now + discovery_duration);
+        }
+
         loop {
             // Calculate when we need to wake for timer work
             let next_pulse_time = self.next_pulse_time();
             let next_timeout = self.next_timeout_time();
-            let timer_wake = match (next_pulse_time, next_timeout) {
+            let mut timer_wake = match (next_pulse_time, next_timeout) {
                 (Some(p), Some(t)) => p.min(t),
                 (Some(p), None) => p,
                 (None, Some(t)) => t,
                 (None, None) => self.clock.now() + Duration::from_secs(60),
             };
+            // Include discovery deadline in timer wake
+            if let Some(deadline) = self.discovery_deadline {
+                timer_wake = timer_wake.min(deadline);
+            }
 
             // Wait for: incoming message, outgoing app data, or timer
             let result = select3(
@@ -468,6 +489,14 @@ where
 
     /// Handle timer events (pulse, timeouts).
     fn handle_timer(&mut self, now: Timestamp) {
+        // Check if discovery phase is complete
+        if let Some(deadline) = self.discovery_deadline {
+            if now >= deadline {
+                self.discovery_deadline = None;
+                self.select_best_parent(now);
+            }
+        }
+
         // Check if pulse is due
         if let Some(next_pulse) = self.next_pulse_time() {
             if now >= next_pulse {
@@ -723,6 +752,21 @@ where
 
     pub(crate) fn set_proactive_pulse_pending(&mut self, time: Option<Timestamp>) {
         self.proactive_pulse_pending = time;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn discovery_deadline(&self) -> Option<Timestamp> {
+        self.discovery_deadline
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_discovery_deadline(&mut self, time: Option<Timestamp>) {
+        self.discovery_deadline = time;
+    }
+
+    /// Check if node is in discovery phase.
+    pub(crate) fn is_in_discovery(&self) -> bool {
+        self.discovery_deadline.is_some()
     }
 
     pub(crate) fn secret(&self) -> &SecretKey {
