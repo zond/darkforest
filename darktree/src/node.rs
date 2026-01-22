@@ -52,8 +52,8 @@ pub struct NeighborTiming {
     pub root_id: NodeId,
     /// Size of the neighbor's tree.
     pub tree_size: u32,
-    /// Length of the neighbor's tree address (depth indicator).
-    pub tree_addr_len: u8,
+    /// Neighbor's tree address (used for shortcut routing and parent selection).
+    pub tree_addr: TreeAddr,
     /// Number of children the neighbor has.
     pub children_count: u8,
 }

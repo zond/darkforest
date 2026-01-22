@@ -239,10 +239,11 @@ impl TransportMetrics {
 }
 
 /// Events emitted by the node for application handling.
+///
+/// Note: Data received from other nodes is delivered via the `incoming()` channel
+/// rather than as events. Use `node.incoming().receive().await` to receive data.
 #[derive(Clone, Debug)]
 pub enum Event {
-    /// Data received from another node.
-    DataReceived { from: NodeId, data: Payload },
     /// Lookup completed successfully.
     LookupComplete {
         node_id: NodeId,

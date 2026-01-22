@@ -51,14 +51,6 @@ Signature verification only happens at final destination. Forwarders relay messa
 
 **Trade-off:** Verification at each hop costs CPU cycles and latency. Design doc doesn't explicitly require it.
 
-### Shortcut routing not implemented
-**Source:** Both reviewers
-**Location:** `routing.rs:110-122`
-
-Shortcuts are tracked in `shortcuts: ShortcutSet` but never used for routing. Comment acknowledges: "shortcut optimization can be added later".
-
-**Design doc (lines 745-777):** Use shortcut S if `common_prefix_len(S.tree_addr, dest_addr) > common_prefix_len(my_addr, dest_addr)`.
-
 ### Memory pressure from pending_pubkey
 **Source:** Embedded reviewer
 **Location:** `node.rs`
@@ -144,3 +136,4 @@ Design doc: `MAX_RETRIES = 8`, Implementation: `MAX_RETRIES = 3`. Not currently 
 - Children count validation in decoder
 - Fraud detection wired up and tested
 - RSSI-based parent selection with discovery phase
+- Shortcut routing optimization

@@ -6,6 +6,8 @@
 //! - Child management
 //! - Neighbor timeouts
 
+use std::cmp::Ordering;
+
 use crate::node::{JoinContext, NeighborTiming, Node};
 use crate::time::{Duration, Timestamp};
 use crate::traits::{Clock, Crypto, Random, Transport};
@@ -14,6 +16,19 @@ use crate::types::{
     MAX_CHILDREN, MIN_PULSE_INTERVAL, MSG_PUBLISH,
 };
 use crate::wire::{pulse_sign_data, Encode, Message};
+
+/// Compare two RSSI values, preferring stronger signals (higher values).
+/// Returns Ordering for b vs a (descending order: best signal first).
+/// Nodes with RSSI are preferred over nodes without.
+#[inline]
+fn cmp_rssi_desc(a_rssi: Option<i16>, b_rssi: Option<i16>) -> Ordering {
+    match (b_rssi, a_rssi) {
+        (Some(b), Some(a)) => b.cmp(&a),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
 
 // Compile-time assertion: MAX_CHILDREN must fit in u8 for NeighborTiming.children_count
 const _: () = assert!(
@@ -93,7 +108,7 @@ where
             rssi,
             root_id: pulse.root_id,
             tree_size: pulse.tree_size,
-            tree_addr_len: pulse.tree_addr.len() as u8,
+            tree_addr: pulse.tree_addr.clone(),
             children_count: pulse.children.len() as u8,
         };
         self.insert_neighbor_time(pulse.node_id, timing);
@@ -363,10 +378,7 @@ where
             .map(|(_, t)| (t.tree_size, t.root_id))
             .max_by(|a, b| {
                 // Compare by tree_size descending, then root_id ascending
-                match a.0.cmp(&b.0) {
-                    std::cmp::Ordering::Equal => b.1.cmp(&a.1), // lower root_id wins
-                    other => other,
-                }
+                a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1))
             })
             .unwrap(); // Safe: we checked candidates.is_empty() above
 
@@ -377,14 +389,7 @@ where
         let rssi_count = candidates.iter().filter(|(_, t)| t.rssi.is_some()).count();
         if candidates.len() >= 3 && rssi_count >= 3 {
             // Sort by RSSI descending (best signal first)
-            candidates.sort_by(|(_, a), (_, b)| {
-                match (b.rssi, a.rssi) {
-                    (Some(b_rssi), Some(a_rssi)) => b_rssi.cmp(&a_rssi),
-                    (Some(_), None) => std::cmp::Ordering::Less, // RSSI beats no RSSI
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                }
-            });
+            candidates.sort_by(|(_, a), (_, b)| cmp_rssi_desc(a.rssi, b.rssi));
             // Keep top 50% (remove bottom half)
             let keep = candidates.len().div_ceil(2);
             candidates.truncate(keep);
@@ -392,19 +397,10 @@ where
 
         // Step 3: Pick shallowest (shortest tree_addr, tie-break: best RSSI)
         candidates.sort_by(|(_, a), (_, b)| {
-            // First by tree_addr_len ascending (shallowest first)
-            match a.tree_addr_len.cmp(&b.tree_addr_len) {
-                std::cmp::Ordering::Equal => {
-                    // Tie-break by RSSI descending (best signal wins)
-                    match (b.rssi, a.rssi) {
-                        (Some(b_rssi), Some(a_rssi)) => b_rssi.cmp(&a_rssi),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => std::cmp::Ordering::Equal,
-                    }
-                }
-                other => other,
-            }
+            a.tree_addr
+                .len()
+                .cmp(&b.tree_addr.len())
+                .then_with(|| cmp_rssi_desc(a.rssi, b.rssi))
         });
 
         // Select the best candidate
@@ -692,13 +688,9 @@ where
 
     /// Handle location entry expiration.
     fn handle_location_expiry(&mut self, now: Timestamp) {
-        // Entries older than LOCATION_TTL are expired
-        // Use checked subtraction to handle case where now < LOCATION_TTL
-        let cutoff = if now.as_millis() >= LOCATION_TTL.as_millis() {
-            now - LOCATION_TTL
-        } else {
-            Timestamp::ZERO
-        };
+        // Entries older than LOCATION_TTL are expired.
+        // Saturating subtraction handles case where now < LOCATION_TTL (cutoff = ZERO).
+        let cutoff = now - LOCATION_TTL;
 
         // Collect expired entries
         let expired: Vec<[u8; 16]> = self

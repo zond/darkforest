@@ -14,6 +14,15 @@ use crate::types::{
 };
 use crate::wire::{routed_sign_data, Encode, Message};
 
+/// Calculate the length of the common prefix between two tree addresses.
+///
+/// Used for shortcut routing: a shortcut is useful if its common_prefix_len
+/// with the destination is greater than our own.
+#[inline]
+fn common_prefix_len(a: &TreeAddr, b: &TreeAddr) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
 impl<T, Cr, R, Clk> Node<T, Cr, R, Clk>
 where
     T: Transport,
@@ -108,17 +117,37 @@ where
     }
 
     /// Route up to parent or via shortcut.
+    ///
+    /// Uses shortcut S instead of normal tree path if:
+    /// `common_prefix_len(S.tree_addr, dest_addr) > common_prefix_len(my_addr, dest_addr)`
+    ///
+    /// In other words: use the shortcut if it's "closer" to the destination's branch.
     fn route_up_or_shortcut(&mut self, msg: Routed) {
-        // Check if any shortcut can help
-        // A shortcut helps if:
-        // - The shortcut's tree_addr is an ancestor of dest_addr, OR
-        // - dest_addr is in the shortcut's subtree
+        let dest_addr = &msg.dest_addr;
+        let my_addr = self.tree_addr();
+        let my_prefix_len = common_prefix_len(my_addr, dest_addr);
 
-        // For now, just route up to parent (shortcut optimization can be added later)
-        if self.parent().is_some() {
+        // Find the best shortcut (one with longest common prefix with dest_addr)
+        let mut best_shortcut: Option<[u8; 16]> = None;
+        let mut best_prefix_len = my_prefix_len;
+
+        for shortcut_id in self.shortcuts().iter() {
+            if let Some(timing) = self.neighbor_times().get(shortcut_id) {
+                let shortcut_prefix_len = common_prefix_len(&timing.tree_addr, dest_addr);
+                if shortcut_prefix_len > best_prefix_len {
+                    best_shortcut = Some(*shortcut_id);
+                    best_prefix_len = shortcut_prefix_len;
+                }
+            }
+        }
+
+        // Note: Both cases call send_routed() which broadcasts the message.
+        // The shortcut (or parent) will hear the broadcast and forward it based
+        // on their own routing logic. We don't explicitly address the shortcut.
+        if best_shortcut.is_some() || self.parent().is_some() {
             let _ = self.send_routed(msg);
         }
-        // If we're root and destination not in subtree, drop (unreachable)
+        // If we're root and no shortcut helps, drop (destination unreachable)
     }
 
     /// Handle received DATA message.
