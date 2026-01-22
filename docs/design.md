@@ -105,6 +105,59 @@ A Pulse serves multiple purposes:
 
 The protocol limits nodes to `MAX_CHILDREN = 16` to ensure Pulse messages fit within transport MTU limits.
 
+### Proactive Pulse Sending
+
+In addition to periodic Pulses, nodes send **proactive Pulses** to accelerate state propagation. This reduces join/merge latency from 25-75 seconds to just a few seconds while keeping the protocol simple (one message type).
+
+**Triggers for proactive Pulse:**
+
+1. **State change** — When your tree state changes (parent, children, root_id, tree_size, tree_addr)
+2. **Unknown neighbor** — When you receive a Pulse from an unrecognized node_id
+3. **Pubkey request** — When you see `need_pubkey=true` in a neighbor's Pulse and they need yours
+
+**Batching:** To avoid message storms during rapid changes, proactive Pulses are batched:
+
+```rust
+const PROACTIVE_PULSE_DELAY: Duration = Duration::from_secs(2);
+
+impl Node {
+    fn schedule_proactive_pulse(&mut self) {
+        // If already scheduled, don't reschedule (coalesce triggers)
+        if self.proactive_pulse_pending.is_none() {
+            self.proactive_pulse_pending = Some(now() + PROACTIVE_PULSE_DELAY);
+        }
+    }
+
+    fn on_state_changed(&mut self) {
+        self.schedule_proactive_pulse();
+    }
+
+    fn on_unknown_neighbor_pulse(&mut self, pulse: &Pulse) {
+        self.schedule_proactive_pulse();
+    }
+
+    fn on_neighbor_needs_pubkey(&mut self, pulse: &Pulse) {
+        if self.should_respond_with_pubkey(pulse) {
+            self.schedule_proactive_pulse();
+            self.include_pubkey_in_next_pulse = true;
+        }
+    }
+}
+```
+
+**Bandwidth budget:** Proactive Pulses count toward the maintenance bandwidth budget (1/5 of available bandwidth). If budget is exhausted, proactive Pulses are delayed until budget recovers. This prevents proactive sending from starving other traffic.
+
+**Latency improvement:**
+
+| Scenario | Periodic only | With proactive |
+|----------|---------------|----------------|
+| Join (get tree_addr) | 50-75s | ~5s |
+| Merge detection | 0-25s | ~2s |
+| State propagation | 0-25s | ~2s |
+| Pubkey exchange | 25-50s | ~5s |
+
+**Why this works:** The 2-second batch window coalesces multiple triggers (e.g., receiving several unknown Pulses at once) into a single proactive Pulse. The bandwidth budget prevents runaway sending during network churn.
+
 ### Node State
 
 ```rust
@@ -151,11 +204,13 @@ struct Node {
 
 Nodes cache pubkeys for signature verification. When a node receives a Pulse from an unknown node_id:
 
-1. Set `need_pubkey = true` in next Pulse
-2. Neighbors with matching node_ids include `pubkey` in their next Pulse
+1. Set `need_pubkey = true` and schedule proactive Pulse
+2. Neighbors see the request and send proactive Pulse with `pubkey` included
 3. **Verify binding:** `hash(pubkey)[..16] == node_id` (MUST check!)
 4. Receiver caches: `node_id → pubkey`
 5. Future signatures can be verified
+
+With proactive sending, pubkey exchange typically completes in ~5 seconds instead of 25-50 seconds.
 
 ```rust
 fn handle_pubkey(&mut self, claimed_node_id: NodeId, pubkey: PublicKey) {
@@ -233,34 +288,37 @@ If a joining node doesn't see itself in the parent's `children` list after 3 Pul
 This ensures Pulse messages always fit within transport MTU limits (LoRa: 255 bytes, BLE: 252 bytes). With `MAX_CHILDREN = 16` and ~4 bytes per child entry, the children list typically uses ~64 bytes, keeping total Pulse size under 220 bytes. The MTU check handles rare edge cases (unlucky prefix collisions in large trees) without penalizing the common case.
 
 ```
-N → Pulse{node_id: N, parent_id: None, root_id: N, tree_size: 1, ...}
+t=0: N → Pulse{node_id: N, parent_id: None, root_id: N, tree_size: 1, ...}
 
-P receives N's Pulse:
-  - Unknown node_id → P.need_pubkey.insert(N)
+t=0: P receives N's Pulse:
+  - Unknown node_id → schedule proactive Pulse, need_pubkey=true
 
-P → Pulse{node_id: P, parent_id: G, root_id: R, tree_size: 500,
+t=2s: P → proactive Pulse{node_id: P, parent_id: G, root_id: R, tree_size: 500,
           tree_addr: [2], need_pubkey: true, ...}
 
-N receives P's Pulse:
+t=2s: N receives P's Pulse:
   - Different root_id (N ≠ R)
   - N.tree_size(1) < P.tree_size(500) → N joins P's tree
-  - N.parent = P
-  - N.root_id = R
+  - N.parent = P, N.root_id = R
+  - State changed → schedule proactive Pulse with pubkey
 
-N → Pulse{node_id: N, parent_id: P, root_id: R, tree_size: 500,
+t=4s: N → proactive Pulse{node_id: N, parent_id: P, root_id: R, tree_size: 500,
           tree_addr: [],  // knows P's addr, not own ordinal yet
           pubkey: pubkey_N, ...}
 
-P receives N's Pulse:
+t=4s: P receives N's Pulse:
   - N.pubkey present → cache it
   - N claims parent_id = P → P.children.insert(N)
   - P.subtree_size += 1
+  - State changed → schedule proactive Pulse
 
-P → Pulse{..., children: [(N_prefix, 1), ...], ...}
+t=6s: P → proactive Pulse{..., children: [(N_prefix, 1), ...], ...}
 
-N receives P's Pulse:
+t=6s: N receives P's Pulse:
   - N finds itself in P.children → computes tree_addr = [2, 0]
 ```
+
+**Total join time: ~6 seconds** (vs 50-75 seconds with periodic-only Pulses)
 
 ### Tree Merging
 
@@ -279,18 +337,28 @@ Tree A (900 nodes)              Tree B (100 nodes)
 X: root_id=Ra, tree_size=900
 Y: root_id=Rb, tree_size=100
 
-Y receives X's Pulse:
-  - Y.tree_size(100) < X.tree_size(900) → Y dominated
-  - Y.parent = X
-  - Y.root_id = Ra
+t=0: X and Y exchange Pulses (or X's periodic Pulse reaches Y)
 
-Py receives Y's Pulse (Y now claims parent=X, root=Ra):
+t=0: Y receives X's Pulse:
+  - Unknown node → schedule proactive Pulse
+  - Y.tree_size(100) < X.tree_size(900) → Y dominated
+  - Y.parent = X, Y.root_id = Ra
+  - State changed → schedule proactive Pulse
+
+t=2s: Y → proactive Pulse (claiming parent=X, root=Ra)
+
+t=2s: Py receives Y's Pulse:
   - Py.tree_size < Y's tree_size → Py dominated
   - INVERSION: Py.parent = Y (former child becomes parent!)
   - Py.root_id = Ra
+  - State changed → schedule proactive Pulse
 
-(inversion propagates up tree B until reaching Rb)
+t=4s: Py → proactive Pulse (inversion propagates up tree B)
+
+(proactive Pulses propagate inversion to Rb in seconds, not minutes)
 ```
+
+**Merge time:** With proactive Pulses, the entire tree B inverts in ~2 seconds per hop. A 10-hop deep tree merges in ~20 seconds instead of 4-8 minutes.
 
 **Visual sequence:**
 
