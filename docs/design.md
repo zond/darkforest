@@ -105,6 +105,40 @@ A Pulse serves multiple purposes:
 
 The protocol limits nodes to `MAX_CHILDREN = 16` to ensure Pulse messages fit within transport MTU limits.
 
+### Timing Model
+
+All protocol timeouts scale with transport bandwidth to work correctly across vastly different link speeds (LoRa at ~38 bytes/sec vs UDP at effectively unlimited).
+
+**τ (tau) — the bandwidth time unit:**
+
+```rust
+const MIN_TAU_MS: u64 = 100;  // floor for unlimited-bandwidth links
+
+fn tau(&self) -> Duration {
+    match self.transport().bw() {
+        Some(bw) if bw > 0 => {
+            // τ = MTU / effective_bandwidth
+            let ms = (self.transport().mtu() as u64 * 1000) / bw as u64;
+            Duration::from_millis(ms.max(MIN_TAU_MS))
+        }
+        _ => Duration::from_millis(MIN_TAU_MS),
+    }
+}
+```
+
+**Example values:**
+
+| Transport | MTU | Effective BW | τ |
+|-----------|-----|--------------|---|
+| LoRa SF8, 10% duty | 255 | 38 bytes/sec | 6.7s |
+| LoRa SF8, 1% duty | 255 | 3.8 bytes/sec | 67s |
+| BLE extended | 252 | ~1000 bytes/sec | 252ms |
+| UDP | 512 | unlimited | 100ms (floor) |
+
+**Why τ = MTU / bw?** This represents the worst-case time to "afford" one maximum-size transmission under duty cycle constraints. For LoRa with 10% duty cycle, even though actual transmission of 255 bytes takes ~670ms, you can only transmit 10% of the time, so the effective cost is ~6.7 seconds of "budget."
+
+All protocol timeouts are expressed as multiples of τ, ensuring they scale appropriately for both slow constrained links and fast unconstrained ones.
+
 ### Proactive Pulse Sending
 
 In addition to periodic Pulses, nodes send **proactive Pulses** to accelerate state propagation. This reduces join/merge latency from 25-75 seconds to just a few seconds while keeping the protocol simple (one message type).
@@ -115,16 +149,23 @@ In addition to periodic Pulses, nodes send **proactive Pulses** to accelerate st
 2. **Unknown neighbor** — When you receive a Pulse from an unrecognized node_id
 3. **Pubkey request** — When you see `need_pubkey=true` in a neighbor's Pulse and they need yours
 
-**Batching:** To avoid message storms during rapid changes, proactive Pulses are batched:
+**Batching:** To avoid message storms during rapid changes, proactive Pulses are batched with jitter. The delay spreads concurrent senders over ~2τ to reduce collisions:
 
 ```rust
-const PROACTIVE_PULSE_DELAY: Duration = Duration::from_secs(2);
+// Proactive Pulse delay: 1.5τ ± 0.5τ (range: 1τ to 2τ)
+// For LoRa (τ=6.7s): 6.7s to 13.4s
+// For UDP (τ=0.1s): 100ms to 200ms
 
 impl Node {
     fn schedule_proactive_pulse(&mut self) {
         // If already scheduled, don't reschedule (coalesce triggers)
         if self.proactive_pulse_pending.is_none() {
-            self.proactive_pulse_pending = Some(now() + PROACTIVE_PULSE_DELAY);
+            let tau = self.tau();
+            let base = tau + tau / 2;  // 1.5τ
+            let jitter_range = tau.as_millis() as u64;  // 1τ range
+            let jitter = self.random.gen_range(0, jitter_range);
+            let delay = base - tau / 2 + Duration::from_millis(jitter);  // 1τ to 2τ
+            self.proactive_pulse_pending = Some(now() + delay);
         }
     }
 
@@ -149,14 +190,19 @@ impl Node {
 
 **Latency improvement:**
 
+Pulse interval is approximately 3τ (based on 150-byte pulse, PULSE_BW_DIVISOR=5, and τ = MTU/bw).
+
 | Scenario | Periodic only | With proactive |
 |----------|---------------|----------------|
-| Join (get tree_addr) | 50-75s | ~5s |
-| Merge detection | 0-25s | ~2s |
-| State propagation | 0-25s | ~2s |
-| Pubkey exchange | 25-50s | ~5s |
+| Join (get tree_addr) | 6-9τ | 2-4τ |
+| Merge detection | 0-3τ | 1-2τ |
+| State propagation | 0-3τ | 1-2τ |
+| Pubkey exchange | 3-6τ | 2-4τ |
 
-**Why this works:** The 2-second batch window coalesces multiple triggers (e.g., receiving several unknown Pulses at once) into a single proactive Pulse. The bandwidth budget prevents runaway sending during network churn.
+For LoRa (τ=6.7s): periodic join takes ~40-60s, proactive takes ~13-27s.
+For UDP (τ=0.1s): periodic join takes ~0.6-0.9s, proactive takes ~0.2-0.4s.
+
+**Why this works:** The 1-2τ batch window coalesces multiple triggers (e.g., receiving several unknown Pulses at once) into a single proactive Pulse. The bandwidth budget prevents runaway sending during network churn.
 
 ### Node State
 
@@ -643,12 +689,12 @@ Nodes track Pulse timestamps for all neighbors. After 8 missed Pulses, a neighbo
 - P(miss 3 in a row) = 12.5% — too high, causes spurious timeouts
 - P(miss 8 in a row) = 0.4% — rare enough to be acceptable
 
-At ~25 second Pulse intervals, 8 missed Pulses = ~200 seconds before declaring a neighbor dead.
+At ~3τ Pulse intervals (20 seconds for LoRa), 8 missed Pulses = ~24τ (~160 seconds for LoRa) before declaring a neighbor dead.
 
 Since Pulse intervals vary by node, we track the observed interval:
 
 ```rust
-const MIN_PULSE_INTERVAL: Duration = Duration::from_secs(8);  // rate limit
+const MIN_PULSE_INTERVAL: Duration = Duration::from_secs(10);  // rate limit floor
 const MISSED_PULSES_TIMEOUT: u32 = 8;  // pulses before declaring neighbor dead
 
 impl Node {
@@ -672,7 +718,7 @@ impl Node {
     fn expected_interval(&self, neighbor: &NodeId) -> Duration {
         match self.neighbor_times.get(neighbor) {
             Some((last, Some(prev))) => *last - *prev,
-            _ => Duration::from_secs(30),  // conservative default
+            _ => self.tau() * 5,  // conservative default (~5τ ≈ Pulse interval + margin)
         }
     }
 
@@ -988,7 +1034,7 @@ A node publishes its location to k=3 replica locations:
 
 ```rust
 const K_REPLICAS: usize = 3;
-const REPUBLISH_JITTER: Range<u64> = 0..5000;  // 0-5 seconds
+// Jitter for republish: 0 to 1τ (prevents storms during tree reshuffles)
 
 struct Node {
     location_seq: u64,  // persisted, incremented on each publish
@@ -1017,8 +1063,8 @@ impl Node {
 
     fn on_tree_addr_changed(&mut self) {
         // Jitter prevents publish storms during tree reshuffles
-        let delay = rand::thread_rng().gen_range(REPUBLISH_JITTER);
-        self.schedule_publish_after(Duration::from_millis(delay));
+        let jitter_ms = self.random.gen_range(0, self.tau().as_millis() as u64);
+        self.schedule_publish_after(Duration::from_millis(jitter_ms));
     }
 }
 ```
@@ -1050,12 +1096,13 @@ The `owner_node_id` is included explicitly (not inferred from Routed `src_node_i
 Lookups try each replica until one responds:
 
 ```rust
-// 4 minutes per replica to account for LoRa constraints:
-// - Slow effective bandwidth (~38 bytes/sec at SF8, 10% duty)
-// - Multi-hop routing through tree (each hop adds latency)
-// - Potential retransmissions at each hop
-// - Pulse intervals needed for route discovery
-const LOOKUP_TIMEOUT: Duration = Duration::from_secs(240);
+// LOOKUP_TIMEOUT = 32τ per replica
+// Accounts for: multi-hop routing (2×depth), retransmissions at each hop
+// For LoRa (τ=6.7s): ~3.5 minutes per replica
+// For UDP (τ=0.1s): ~3 seconds per replica
+fn lookup_timeout(&self) -> Duration {
+    self.tau() * 32
+}
 
 impl Node {
     fn lookup_node(&mut self, target: NodeId) {
@@ -1321,20 +1368,22 @@ The ACK contains the hash A is waiting for (the forwarded version with TTL-1).
 **Minimum time for forwarder to respond:**
 1. Receive full packet (~500ms)
 2. Process and decide to forward (~10ms)
-3. Possible duty cycle delay (0-30+ seconds under congestion)
+3. Possible duty cycle delay (0 to many τ under congestion)
 4. Transmit forwarded packet (~500ms)
 
-Under normal conditions: ~1-2 seconds. Under duty cycle pressure: could be 30+ seconds.
+Under normal conditions: ~0.1τ. Under duty cycle pressure: could be several τ.
 
 ### Retransmission Policy
 
+All retransmission timeouts use τ (see [Timing Model](#timing-model)) to scale with bandwidth:
+
 ```rust
 const MAX_RETRIES: u8 = 8;
-const INITIAL_BACKOFF_MS: u64 = 2000;  // 2 seconds minimum
 
-// Note: Actual retry timing may be delayed beyond backoff by duty cycle.
-// Logical backoffs: 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s
-// With duty cycle delays, total worst-case could be 10+ minutes.
+// Base backoffs: 1τ, 2τ, 4τ, 8τ, 16τ, 32τ, 64τ, 128τ (with ±10% jitter)
+// Total worst-case: ~280τ (255τ base + jitter margin)
+// For LoRa (τ=6.7s): ~31 minutes
+// For UDP (τ=0.1s): ~28 seconds
 
 struct PendingAck {
     expected_hash: [u8; 8],  // hash of message with TTL-1
@@ -1343,8 +1392,11 @@ struct PendingAck {
     next_retry: Instant,
 }
 
-fn retry_backoff(retries: u8) -> Duration {
-    Duration::from_millis(INITIAL_BACKOFF_MS << retries)
+fn retry_backoff(&self, retries: u8) -> Duration {
+    let base = self.tau() << retries;  // 1τ, 2τ, 4τ, ...
+    let jitter_range = base.as_millis() as u64 / 5;  // ±10% jitter
+    let jitter = self.random.gen_range(0, jitter_range * 2) as i64 - jitter_range as i64;
+    base + Duration::from_millis(jitter.unsigned_abs())
 }
 ```
 
@@ -1352,21 +1404,27 @@ fn retry_backoff(retries: u8) -> Duration {
 
 ```rust
 const MAX_PENDING_ACKS: usize = 32;          // messages awaiting ACK
-const MAX_RECENTLY_FORWARDED: usize = 128;   // for duplicate detection
+const MAX_RECENTLY_FORWARDED: usize = 256;   // for duplicate detection
 const ACK_HASH_SIZE: usize = 8;              // truncated hash bytes
-const RECENTLY_FORWARDED_TTL: Duration = Duration::from_secs(180);  // 3 minutes
+
+// RECENTLY_FORWARDED_TTL = 300τ (must exceed worst-case retry sequence of ~280τ with jitter)
+// For LoRa (τ=6.7s): ~33 minutes
+// For UDP (τ=0.1s): ~30 seconds
+fn recently_forwarded_ttl(&self) -> Duration {
+    self.tau() * 300
+}
 ```
 
 **Memory usage:**
 - `pending_acks`: 32 entries × ~16 bytes (hash + metadata) = ~512 bytes
   - Plus original messages for retransmission (bounded by MTU × 32 ≈ 8KB worst case)
-- `recently_forwarded`: 128 entries × ~16 bytes (hash + timestamp) = ~2KB
-- Total: ~2.5KB metadata + up to 8KB message storage
+- `recently_forwarded`: 256 entries × ~16 bytes (hash + timestamp) = ~4KB
+- Total: ~4.5KB metadata + up to 8KB message storage
 
 **Why these values:**
-- `RECENTLY_FORWARDED_TTL = 180s`: Must exceed worst-case time for duplicate to arrive (sender delayed by duty cycle, multiple backoffs). 3 minutes provides margin.
-- `MAX_RECENTLY_FORWARDED = 128`: At 0.5 messages/second forwarded (high for LoRa), 180s × 0.5 = 90 entries. 128 provides headroom.
-- `MAX_PENDING_ACKS = 32`: Limits concurrent outbound messages awaiting ACK. With ~10 minute worst-case per message, throughput floor is ~3 messages/minute under heavy loss.
+- `RECENTLY_FORWARDED_TTL = 300τ`: Must exceed worst-case retry sequence (~280τ with jitter). Provides ~7% margin.
+- `MAX_RECENTLY_FORWARDED = 256`: Forwarding rate scales inversely with τ (slow links forward slowly), so the product (TTL × rate) stays roughly constant. For LoRa at 33 min TTL but ~0.05 msg/s: ~99 entries needed. For UDP at 30s TTL but ~0.5 msg/s: ~15 entries needed. 256 provides headroom for both.
+- `MAX_PENDING_ACKS = 32`: Limits concurrent outbound messages awaiting ACK. With worst-case ~280τ per message, throughput floor is ~32/280τ messages per τ under heavy loss.
 
 When collections are full, oldest entries are evicted (LRU). This may cause:
 - Evicted pending_ack: give up on that message (application can retry)
