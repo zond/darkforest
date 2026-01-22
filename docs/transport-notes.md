@@ -38,12 +38,10 @@ Research and implementation guidance for transport backends (LoRa, BLE, UDP).
 
 ## Transport Trait
 
-The key abstraction for radio/network backends. Designed around the most constrained transport (LoRa):
+The key abstraction for radio/network backends. Uses embassy-sync channels for queue-based communication with **priority separation** between protocol and application traffic.
 
 ```rust
 pub trait Transport {
-    type Error: core::fmt::Debug;
-
     /// Maximum transmission unit for this transport
     fn mtu(&self) -> usize;
 
@@ -56,69 +54,94 @@ pub trait Transport {
         None
     }
 
-    /// Milliseconds until transport is ready to send again.
-    /// Returns 0 if ready now. Sync because it just checks state.
-    fn tx_backoff(&self) -> u32 {
-        0
-    }
+    /// Channel for outgoing protocol messages (Pulse, PUBLISH, LOOKUP, FOUND).
+    /// Transport MUST prioritize this queue over app_outgoing() to ensure
+    /// tree maintenance and DHT operations work under load.
+    fn protocol_outgoing(&self) -> &TransportOutChannel;
 
-    /// Transmit data to all neighbors (async - awaits completion)
-    /// For LoRa: awaits until TX done (can take 100s of ms)
-    /// For UDP: usually completes immediately (OS buffers)
-    async fn tx(&mut self, data: &[u8]) -> Result<(), Self::Error>;
+    /// Channel for outgoing application data (DATA messages).
+    /// Lower priority than protocol messages.
+    fn app_outgoing(&self) -> &TransportOutChannel;
 
-    /// Receive a message (async - awaits until data available)
-    /// Returns (data, rssi) where rssi is signal strength in dBm
-    async fn rx(&mut self) -> (Vec<u8>, Option<i16>);
+    /// Channel for incoming messages (all types).
+    fn incoming(&self) -> &TransportInChannel;
 }
 ```
 
-**Note:** Async trait methods require Rust 1.75+. For real hardware, implementations use interrupt-driven wakers. The Embassy ecosystem provides abstractions for this.
+### Priority Queue Model
+
+The Transport has **two outgoing queues** to ensure protocol traffic isn't starved by application data:
+
+| Queue | Message Types | Priority |
+|-------|--------------|----------|
+| `protocol_outgoing()` | Pulse, PUBLISH, LOOKUP, FOUND | High |
+| `app_outgoing()` | DATA | Low |
+
+**Why this matters:**
+- **Pulse messages** maintain tree structure. If they're delayed or dropped, neighbors timeout and the tree degrades.
+- **PUBLISH/LOOKUP/FOUND** are DHT infrastructure. Without them, nodes can't find each other.
+- **DATA** is application traffic. It can tolerate delays better than infrastructure.
+
+**Transport implementation responsibility:**
+The transport drains both queues, always checking `protocol_outgoing()` first:
+
+```rust
+// Example TX task in transport implementation
+async fn tx_task(transport: &mut impl Transport, radio: &mut Radio) {
+    loop {
+        // Always prioritize protocol queue
+        let packet = match transport.protocol_outgoing().try_receive() {
+            Ok(p) => p,
+            Err(_) => transport.app_outgoing().receive().await,
+        };
+
+        // Wait for duty cycle budget if needed
+        while radio.tx_backoff() > 0 {
+            Timer::after(Duration::from_millis(radio.tx_backoff() as u64)).await;
+        }
+
+        radio.tx(&packet).await;
+    }
+}
+```
+
+This ensures protocol messages get through even when the application is flooding the channel.
+
+**Note:** The Node layer handles queue selection automatically via `send_routed()` which checks `msg_type` and routes to the appropriate queue.
 
 ## Pulse Interval Calculation
 
-Protocol computes exact Pulse interval from bandwidth:
+Protocol computes Pulse interval from bandwidth using integer math for embedded compatibility:
 
 ```rust
-fn pulse_interval(&self, pulse_size: usize) -> Duration {
-    match self.transport.bw() {
-        Some(bw) => {
-            // Pulse budget = 20% of effective bandwidth
-            let pulse_budget_bps = bw as f32 * 0.20;
-            let interval_s = pulse_size as f32 / pulse_budget_bps;
-            Duration::from_secs_f32(interval_s.max(10.0))
+fn next_pulse_time(&self) -> Option<Timestamp> {
+    let last = self.last_pulse?;
+
+    let interval = match self.transport.bw() {
+        Some(bw) if bw > 0 => {
+            // Single division for integer accuracy:
+            // secs = pulse_size / (bw / PULSE_BW_DIVISOR)
+            //      = pulse_size * PULSE_BW_DIVISOR / bw
+            let secs = (self.last_pulse_size as u64 * PULSE_BW_DIVISOR as u64) / (bw as u64);
+            Duration::from_secs(secs).max(MIN_PULSE_INTERVAL)
         }
-        None => Duration::from_secs(10),  // Minimum interval (design spec)
-    }
+        _ => MIN_PULSE_INTERVAL,  // 10 seconds minimum
+    };
+
+    Some(last + interval)
 }
 ```
 
 For LoRa at SF8, 10% duty cycle, 150-byte Pulse:
-- Raw rate: 387 bytes/sec
-- Effective bw: 387 × 0.10 = 38.7 bytes/sec
-- Pulse budget: 38.7 × 0.20 = 7.74 bytes/sec
-- Interval: 150 / 7.74 = 19.4s
-
-## Duty Cycle Management
-
-The transport itself tracks duty cycle state internally. Protocol layer just checks `tx_backoff()`:
-
-```rust
-// In Node::run() event loop
-if self.transport.tx_backoff() == 0 {
-    let pulse = self.build_pulse();
-    self.transport.tx(&pulse).await?;  // Async TX
-}
-```
-
-This keeps duty cycle logic encapsulated in the transport where it belongs.
+- Effective bw: 38 bytes/sec
+- PULSE_BW_DIVISOR: 5 (20% budget for Pulse)
+- Interval: 150 × 5 / 38 = 19 seconds
 
 ## Design Rationale
 
-- **Broadcast-only send:** At LoRa level, all transmissions are broadcasts. BLE advertising is also broadcast. UDP can use multicast. No point exposing "send to specific neighbor" since the protocol handles routing.
-- **Async TX and RX:** Both methods are async. `tx()` awaits until transmission completes (important for LoRa where TX takes 100s of ms). `rx()` awaits until data arrives. This enables efficient event loops without polling.
+- **Channel-based API:** Transport exposes channels, not async tx/rx methods. This decouples the protocol from transport timing and allows the transport implementation to handle duty cycle, half-duplex, and scheduling internally.
+- **Broadcast semantics:** At LoRa level, all transmissions are broadcasts. BLE advertising is also broadcast. UDP can use multicast. No point exposing "send to specific neighbor" since the protocol handles routing.
 - **MTU exposed:** Protocol MUST check message size. BLE legacy (29 bytes) would require fragmenting Pulse messages, which we don't support - use extended advertising or GATT.
-- **Sync `tx_backoff()`:** Just checks state (no I/O), so stays synchronous.
 - **No unicast:** Even though UDP supports unicast and BLE GATT requires connections, the protocol doesn't need it. Pulse messages are always broadcast, and Routed messages are also broadcast at radio layer - only the intended recipient/forwarder processes them.
 
 ## RX/TX Queue Architecture

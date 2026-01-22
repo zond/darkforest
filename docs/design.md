@@ -953,7 +953,12 @@ The `owner_node_id` is included explicitly (not inferred from Routed `src_node_i
 Lookups try each replica until one responds:
 
 ```rust
-const LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
+// 4 minutes per replica to account for LoRa constraints:
+// - Slow effective bandwidth (~38 bytes/sec at SF8, 10% duty)
+// - Multi-hop routing through tree (each hop adds latency)
+// - Potential retransmissions at each hop
+// - Pulse intervals needed for route discovery
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(240);
 
 impl Node {
     fn lookup_node(&mut self, target: NodeId) {
@@ -1223,6 +1228,12 @@ pulse_budget = 0.20 × duty_cycle
 min_interval = max(10s, airtime / pulse_budget)
 ```
 
+**Transport priority queues:** The Transport trait provides two outgoing queues:
+- `protocol_outgoing()` — high priority: Pulse, PUBLISH, LOOKUP, FOUND
+- `app_outgoing()` — lower priority: DATA messages
+
+Transport implementations MUST drain the protocol queue before the app queue. This ensures tree maintenance and DHT operations work even when application traffic is heavy. Without this, a flood of DATA messages could starve Pulse broadcasts, causing neighbors to timeout and the tree to degrade.
+
 **Pulse intervals (SF8):**
 
 | Duty Cycle | Pulse Budget | Typical Interval | Data Budget |
@@ -1300,6 +1311,20 @@ This attack is fundamentally hard to prevent at the protocol layer — it requir
 - Request-response: timeout triggers re-lookup
 - Fire-and-forget: accept possible loss
 - DHT lookups: try multiple replicas
+
+The protocol is designed to tolerate packet loss at the transport layer. When send queues are full, messages are dropped rather than blocking. This is acceptable because:
+
+1. **Pulse loss is tolerable:** Neighbors timeout after 3 missed Pulses (~75-90 seconds). Occasional drops don't break the tree. The priority queue ensures Pulses are rarely dropped unless severely overloaded.
+
+2. **PUBLISH has redundancy:** Published to K=3 replicas, and refreshed every 8 hours. Missing one PUBLISH rarely matters.
+
+3. **LOOKUP has retries:** Tries each of K=3 replicas sequentially. One dropped LOOKUP just moves to the next replica.
+
+4. **FOUND is idempotent:** If lost, the requester will timeout and retry the LOOKUP.
+
+5. **DATA is application's responsibility:** Applications needing reliability should implement acks/retries.
+
+The transport's priority queue model (protocol messages before application data) ensures that infrastructure traffic (Pulse, PUBLISH, LOOKUP, FOUND) is protected from application traffic floods. Metrics are exposed so applications can monitor queue health and back off if needed.
 
 **Consistency during rebalancing:**
 - Keyspace ranges shift with tree structure

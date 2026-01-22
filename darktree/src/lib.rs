@@ -12,20 +12,24 @@
 //!
 //! # Example
 //!
-//! ```no_run
-//! use darktree::{Node, Transport, Crypto, Random, Clock};
+//! ```ignore
+//! use darktree::{Node, Transport, Crypto, Random, Clock, OutgoingData};
 //!
 //! // Implement traits for your platform...
 //!
 //! // Create a node
 //! // let mut node = Node::new(transport, crypto, random, clock);
 //!
-//! // Poll regularly in your main loop
-//! // loop {
-//! //     while let Some(event) = node.poll() {
-//! //         // Handle events
-//! //     }
-//! // }
+//! // Spawn the node's run loop
+//! // spawn(async move {
+//! //     node.run().await;
+//! // });
+//!
+//! // Send data to another node
+//! // node.outgoing().send(OutgoingData { target, payload }).await;
+//!
+//! // Receive data from other nodes
+//! // let data = node.incoming().receive().await;
 //! ```
 //!
 //! # Module Structure
@@ -38,11 +42,13 @@
 //! - [`routing`] - Message routing
 //! - [`dht`] - DHT operations (PUBLISH/LOOKUP/FOUND)
 //! - [`fraud`] - Fraud detection
+//! - [`time`] - Timestamp and Duration types
 
 pub mod dht;
 pub mod fraud;
 pub mod node;
 pub mod routing;
+pub mod time;
 pub mod traits;
 pub mod tree;
 pub mod types;
@@ -50,7 +56,8 @@ pub mod wire;
 
 // Re-export main types at crate root
 pub use node::Node;
-pub use traits::{Clock, Crypto, Random, Transport};
+pub use time::{Duration, Timestamp};
+pub use traits::{Clock, Crypto, IncomingData, OutgoingData, Random, Received, Transport};
 pub use types::{
     Error, Event, LocationEntry, NodeId, Payload, PublicKey, Pulse, Routed, SecretKey, Signature,
     TreeAddr,

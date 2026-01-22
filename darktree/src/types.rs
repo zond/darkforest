@@ -2,6 +2,8 @@
 
 use core::fmt;
 
+use crate::time::{Duration, Timestamp};
+
 // Memory bounds (kept as soft limits for validation)
 pub const MAX_TREE_DEPTH: usize = 127; // TTL 255 / 2 for round-trip
 pub const MAX_CHILDREN: usize = 16; // 4-bit nibble encoding limit
@@ -14,22 +16,26 @@ pub const MAX_DISTRUSTED: usize = 64;
 pub const MAX_PACKET_SIZE: usize = 255;
 pub const MAX_PENDING_REQUESTS: usize = 16;
 pub const MAX_PENDING_DATA: usize = 16;
-pub const MAX_PENDING_PUBKEY: usize = 16; // Messages awaiting pubkey verification
+pub const MAX_PENDING_PUBKEY: usize = 16; // Messages awaiting pubkey per node
+pub const MAX_PENDING_PUBKEY_NODES: usize = 32; // Max distinct nodes awaiting pubkey
 
 // Protocol constants
 pub const K_REPLICAS: usize = 3;
 pub const DEFAULT_TTL: u8 = 255; // Max hops
 
-// Timing constants (in seconds)
-pub const MIN_PULSE_INTERVAL_SECS: u64 = 8;
-pub const DEFAULT_PULSE_INTERVAL_SECS: u64 = 30;
-pub const LOOKUP_TIMEOUT_SECS: u64 = 30;
-pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+// Timing constants as Durations
+pub const MIN_PULSE_INTERVAL: Duration = Duration::from_secs(10);
+pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(240); // 4 min per replica
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(240); // 4 min for request-response
 pub const MAX_RETRIES: u8 = 3;
-pub const LOCATION_REFRESH_HOURS: u64 = 8;
-pub const LOCATION_TTL_HOURS: u64 = 12;
-pub const DISTRUST_TTL_HOURS: u64 = 24;
-pub const REPUBLISH_JITTER_MS: u64 = 5000;
+pub const LOCATION_REFRESH: Duration = Duration::from_hours(8);
+pub const LOCATION_TTL: Duration = Duration::from_hours(12);
+pub const DISTRUST_TTL: Duration = Duration::from_hours(24);
+pub const REPUBLISH_JITTER: Duration = Duration::from_millis(5000);
+
+// Bandwidth budget: Pulse traffic should use at most 1/PULSE_BW_DIVISOR of available bandwidth.
+// With divisor=5, pulse is limited to 20% of bandwidth, leaving 80% for application data.
+pub const PULSE_BW_DIVISOR: u32 = 5;
 
 // Message types (0-3 valid; 4-255 dropped silently)
 pub const MSG_PUBLISH: u8 = 0;
@@ -189,7 +195,46 @@ pub struct LocationEntry {
     /// Signature over "LOC:" || node_id || tree_addr || seq.
     pub signature: Signature,
     /// Local timestamp when entry was received (for expiry).
-    pub received_at_secs: u64,
+    pub received_at: Timestamp,
+}
+
+/// Transport queue metrics for monitoring.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TransportMetrics {
+    /// Protocol messages successfully queued (Pulse, PUBLISH, LOOKUP, FOUND).
+    pub protocol_sent: u64,
+    /// Protocol messages dropped (queue full).
+    pub protocol_dropped: u64,
+    /// Protocol messages received (Pulse, PUBLISH, LOOKUP, FOUND).
+    pub protocol_received: u64,
+    /// Application messages successfully queued (DATA).
+    pub app_sent: u64,
+    /// Application messages dropped (queue full).
+    pub app_dropped: u64,
+    /// Application messages received (DATA).
+    pub app_received: u64,
+}
+
+impl TransportMetrics {
+    /// Create new zeroed metrics.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Total messages sent (protocol + app).
+    pub fn total_sent(&self) -> u64 {
+        self.protocol_sent + self.app_sent
+    }
+
+    /// Total messages dropped (protocol + app).
+    pub fn total_dropped(&self) -> u64 {
+        self.protocol_dropped + self.app_dropped
+    }
+
+    /// Total messages received (protocol + app).
+    pub fn total_received(&self) -> u64 {
+        self.protocol_received + self.app_received
+    }
 }
 
 /// Events emitted by the node for application handling.
@@ -210,11 +255,11 @@ pub enum Event {
 
 /// Error type for node operations.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Error<T> {
-    /// Transport error.
-    Transport(T),
+pub enum Error {
     /// Message exceeds MTU.
     MessageTooLarge,
+    /// Outgoing queue is full.
+    QueueFull,
     /// No route to destination.
     NoRoute,
     /// Lookup in progress.
@@ -227,11 +272,11 @@ pub enum Error<T> {
     InvalidSignature,
 }
 
-impl<T: fmt::Debug> fmt::Display for Error<T> {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Transport(e) => write!(f, "transport error: {:?}", e),
             Error::MessageTooLarge => write!(f, "message too large"),
+            Error::QueueFull => write!(f, "outgoing queue full"),
             Error::NoRoute => write!(f, "no route to destination"),
             Error::LookupPending => write!(f, "lookup already pending"),
             Error::TooManyPending => write!(f, "too many pending operations"),

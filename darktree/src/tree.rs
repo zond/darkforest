@@ -7,10 +7,11 @@
 //! - Neighbor timeouts
 
 use crate::node::{JoinContext, NeighborTiming, Node};
+use crate::time::{Duration, Timestamp};
 use crate::traits::{Clock, Crypto, Random, Transport};
 use crate::types::{
-    ChildPrefix, ChildrenList, Event, Pulse, Signature, DISTRUST_TTL_HOURS, MAX_CHILDREN,
-    MIN_PULSE_INTERVAL_SECS, MSG_PUBLISH, REPUBLISH_JITTER_MS,
+    ChildPrefix, ChildrenList, Event, Pulse, Signature, DISTRUST_TTL, K_REPLICAS, LOCATION_TTL,
+    LOOKUP_TIMEOUT, MAX_CHILDREN, MIN_PULSE_INTERVAL, MSG_PUBLISH, REPUBLISH_JITTER,
 };
 use crate::wire::{pulse_sign_data, Encode, Message};
 
@@ -18,20 +19,20 @@ use crate::wire::{pulse_sign_data, Encode, Message};
 const MISSED_PULSES_TIMEOUT: u64 = 3;
 
 /// Default pulse interval for timeout calculation.
-const DEFAULT_OBSERVED_INTERVAL: u64 = 30;
+const DEFAULT_OBSERVED_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Number of pulses to wait for parent acknowledgment.
 const PARENT_ACK_PULSES: u8 = 3;
 
-impl<T, Cr, R, Cl> Node<T, Cr, R, Cl>
+impl<T, Cr, R, Clk> Node<T, Cr, R, Clk>
 where
     T: Transport,
     Cr: Crypto,
     R: Random,
-    Cl: Clock,
+    Clk: Clock,
 {
     /// Handle a received Pulse message.
-    pub(crate) fn handle_pulse(&mut self, pulse: Pulse, now: u64) {
+    pub(crate) fn handle_pulse(&mut self, pulse: Pulse, rssi: Option<i16>, now: Timestamp) {
         // Ignore our own pulses
         if pulse.node_id == *self.node_id() {
             return;
@@ -39,7 +40,7 @@ where
 
         // Rate limiting: ignore pulses that arrive too fast
         if let Some(timing) = self.neighbor_times().get(&pulse.node_id) {
-            if now <= timing.last_seen_secs + MIN_PULSE_INTERVAL_SECS {
+            if now < timing.last_seen + MIN_PULSE_INTERVAL {
                 return; // Too soon
             }
         }
@@ -77,10 +78,11 @@ where
         let prev = self
             .neighbor_times()
             .get(&pulse.node_id)
-            .map(|t| t.last_seen_secs);
+            .map(|t| t.last_seen);
         let timing = NeighborTiming {
-            last_seen_secs: now,
-            prev_seen_secs: prev,
+            last_seen: now,
+            prev_seen: prev,
+            rssi,
         };
         self.insert_neighbor_time(pulse.node_id, timing);
 
@@ -109,7 +111,7 @@ where
     }
 
     /// Handle pubkey exchange from a pulse.
-    fn handle_pubkey_exchange(&mut self, pulse: &Pulse, now: u64) {
+    fn handle_pubkey_exchange(&mut self, pulse: &Pulse, now: Timestamp) {
         // If pulse contains a pubkey, verify and cache it
         if let Some(pubkey) = pulse.pubkey {
             // CRITICAL: Verify cryptographic binding before caching
@@ -134,7 +136,7 @@ where
     }
 
     /// Handle a pulse from our current parent.
-    fn handle_parent_pulse(&mut self, pulse: &Pulse, now: u64) {
+    fn handle_parent_pulse(&mut self, pulse: &Pulse, now: Timestamp) {
         // Find our ordinal in parent's children list
         if let Some(ordinal) = self.find_ordinal_in_children(pulse) {
             // Compute our tree address
@@ -153,8 +155,8 @@ where
 
             // If address changed, schedule republish and rebalance keyspace
             if addr_changed {
-                let jitter = self.random_mut().gen_range(0, REPUBLISH_JITTER_MS);
-                self.set_next_publish_secs(Some(now + jitter / 1000));
+                let jitter_ms = self.random_mut().gen_range(0, REPUBLISH_JITTER.as_millis());
+                self.set_next_publish(Some(now + Duration::from_millis(jitter_ms)));
                 // Move DHT entries that we no longer own to their new owners
                 self.rebalance_keyspace(now);
             }
@@ -206,7 +208,7 @@ where
     }
 
     /// Handle a pulse from our pending parent candidate.
-    fn handle_pending_parent_pulse(&mut self, pulse: &Pulse, now: u64) {
+    fn handle_pending_parent_pulse(&mut self, pulse: &Pulse, now: Timestamp) {
         // Check if we're in the children list
         if self.find_ordinal_in_children(pulse).is_some() {
             // We're acknowledged! Complete the parent switch
@@ -217,7 +219,7 @@ where
             // Set join context for fraud detection
             self.set_join_context(Some(JoinContext {
                 parent_at_join: parent_id,
-                join_time_secs: now,
+                join_time: now,
             }));
 
             // Update tree info
@@ -245,7 +247,7 @@ where
     }
 
     /// Consider merging with another tree based on received pulse.
-    fn consider_merge(&mut self, pulse: &Pulse, now: u64) {
+    fn consider_merge(&mut self, pulse: &Pulse, now: Timestamp) {
         // Don't merge if this node is distrusted
         if self.is_distrusted(&pulse.node_id, now) {
             return;
@@ -288,10 +290,10 @@ where
     }
 
     /// Check if a node is distrusted.
-    fn is_distrusted(&self, node_id: &[u8; 16], now: u64) -> bool {
+    fn is_distrusted(&self, node_id: &[u8; 16], now: Timestamp) -> bool {
         self.distrusted()
             .get(node_id)
-            .is_some_and(|&when| now < when + DISTRUST_TTL_HOURS * 3600)
+            .is_some_and(|&when| now < when + DISTRUST_TTL)
     }
 
     /// Become root of our own subtree.
@@ -379,7 +381,12 @@ where
     }
 
     /// Build and send a Pulse message.
-    pub(crate) fn send_pulse(&mut self, now: u64) {
+    ///
+    /// Pulse is sent to the protocol queue (high priority). If the queue is full,
+    /// the Pulse is dropped - this is acceptable because the protocol tolerates
+    /// occasional missed Pulses (neighbors timeout after 3 missed Pulses).
+    /// See design.md "Best-effort delivery" section.
+    pub(crate) fn send_pulse(&mut self, now: Timestamp) {
         let pulse = self.build_pulse();
 
         // Encode with message type
@@ -392,9 +399,16 @@ where
             return;
         }
 
-        // Send
-        let _ = self.transport_mut().tx(&encoded);
-        self.set_last_pulse_secs(Some(now));
+        // Track size for bandwidth-aware scheduling
+        let size = encoded.len();
+
+        // Send via protocol queue (high priority)
+        match self.transport().protocol_outgoing().try_send(encoded) {
+            Ok(()) => self.record_protocol_sent(),
+            Err(_) => self.record_protocol_dropped(),
+        }
+        self.set_last_pulse(Some(now));
+        self.set_last_pulse_size(size);
     }
 
     /// Build a Pulse message.
@@ -444,24 +458,24 @@ where
     }
 
     /// Handle timeouts for neighbors, pending operations, etc.
-    pub(crate) fn handle_timeouts(&mut self, now: u64) {
+    pub(crate) fn handle_timeouts(&mut self, now: Timestamp) {
         self.handle_neighbor_timeouts(now);
         self.handle_lookup_timeouts(now);
         self.handle_location_expiry(now);
     }
 
     /// Handle neighbor timeouts.
-    fn handle_neighbor_timeouts(&mut self, now: u64) {
+    fn handle_neighbor_timeouts(&mut self, now: Timestamp) {
         // Collect timed out neighbors
         let mut timed_out: Vec<[u8; 16]> = Vec::new();
 
         for (id, timing) in self.neighbor_times().iter() {
             let interval = timing
-                .prev_seen_secs
-                .map(|prev| timing.last_seen_secs.saturating_sub(prev))
+                .prev_seen
+                .map(|prev| timing.last_seen.saturating_sub(prev))
                 .unwrap_or(DEFAULT_OBSERVED_INTERVAL);
 
-            let timeout = timing.last_seen_secs + interval * MISSED_PULSES_TIMEOUT;
+            let timeout = timing.last_seen + interval * MISSED_PULSES_TIMEOUT;
             if now > timeout {
                 timed_out.push(*id);
             }
@@ -496,15 +510,13 @@ where
     }
 
     /// Handle lookup timeouts.
-    fn handle_lookup_timeouts(&mut self, now: u64) {
-        use crate::types::{K_REPLICAS, LOOKUP_TIMEOUT_SECS};
-
+    fn handle_lookup_timeouts(&mut self, now: Timestamp) {
         // Collect lookups that need action
         let mut to_retry: Vec<[u8; 16]> = Vec::new();
         let mut to_fail: Vec<[u8; 16]> = Vec::new();
 
         for (target, lookup) in self.pending_lookups().iter() {
-            if now > lookup.last_query_secs + LOOKUP_TIMEOUT_SECS {
+            if now > lookup.last_query_at + LOOKUP_TIMEOUT {
                 if lookup.replica_index + 1 < K_REPLICAS {
                     to_retry.push(*target);
                 } else {
@@ -517,7 +529,7 @@ where
         for target in to_retry {
             if let Some(lookup) = self.pending_lookups_mut().get_mut(&target) {
                 lookup.replica_index += 1;
-                lookup.last_query_secs = now;
+                lookup.last_query_at = now;
                 let replica = lookup.replica_index;
                 self.send_lookup(target, replica, now);
             }
@@ -534,14 +546,20 @@ where
     }
 
     /// Handle location entry expiration.
-    fn handle_location_expiry(&mut self, now: u64) {
-        let cutoff = now.saturating_sub(crate::types::LOCATION_TTL_HOURS * 3600);
+    fn handle_location_expiry(&mut self, now: Timestamp) {
+        // Entries older than LOCATION_TTL are expired
+        // Use checked subtraction to handle case where now < LOCATION_TTL
+        let cutoff = if now.as_millis() >= LOCATION_TTL.as_millis() {
+            now - LOCATION_TTL
+        } else {
+            Timestamp::ZERO
+        };
 
         // Collect expired entries
         let expired: Vec<[u8; 16]> = self
             .location_store()
             .iter()
-            .filter(|(_, entry)| entry.received_at_secs < cutoff)
+            .filter(|(_, entry)| entry.received_at < cutoff)
             .map(|(id, _)| *id)
             .collect();
 

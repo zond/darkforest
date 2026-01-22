@@ -589,7 +589,7 @@ impl Decode for LocationEntry {
             tree_addr,
             seq,
             signature,
-            received_at_secs: 0,
+            received_at: crate::time::Timestamp::ZERO,
         })
     }
 }
@@ -785,7 +785,7 @@ mod tests {
                 algorithm: ALGORITHM_ED25519,
                 sig: [10u8; 64],
             },
-            received_at_secs: 0,
+            received_at: crate::time::Timestamp::ZERO,
         };
 
         let encoded = entry.encode_to_vec();

@@ -6,19 +6,20 @@
 //! - Storing and retrieving location entries
 
 use crate::node::Node;
+use crate::time::Timestamp;
 use crate::traits::{Clock, Crypto, Random, Transport};
 use crate::types::{
-    Event, LocationEntry, NodeId, Routed, K_REPLICAS, LOCATION_REFRESH_HOURS, MSG_FOUND,
-    MSG_LOOKUP, MSG_PUBLISH,
+    Event, LocationEntry, NodeId, Routed, K_REPLICAS, LOCATION_REFRESH, MSG_FOUND, MSG_LOOKUP,
+    MSG_PUBLISH,
 };
-use crate::wire::{location_sign_data, Encode, Message, Reader, Writer};
+use crate::wire::{location_sign_data, Reader, Writer};
 
-impl<T, Cr, R, Cl> Node<T, Cr, R, Cl>
+impl<T, Cr, R, Clk> Node<T, Cr, R, Clk>
 where
     T: Transport,
     Cr: Crypto,
     R: Random,
-    Cl: Clock,
+    Clk: Clock,
 {
     /// Check if we own any replica key for a node_id in our keyspace.
     fn owns_replica_key(&self, node_id: &NodeId) -> bool {
@@ -30,7 +31,7 @@ where
     }
 
     /// Publish our location to the DHT.
-    pub(crate) fn publish_location(&mut self, now: u64) {
+    pub(crate) fn publish_location(&mut self, now: Timestamp) {
         let seq = self.next_location_seq();
 
         // Build location signature
@@ -51,19 +52,15 @@ where
             let dest_addr = self.addr_for_key(key);
 
             let msg = self.build_routed_no_reply(dest_addr, MSG_PUBLISH, payload_bytes.clone());
-
-            let encoded = Message::Routed(msg).encode_to_vec();
-            if encoded.len() <= self.transport().mtu() {
-                let _ = self.transport_mut().tx(&encoded);
-            }
+            let _ = self.send_routed(msg);
         }
 
         // Schedule next publish
-        self.set_next_publish_secs(Some(now + LOCATION_REFRESH_HOURS * 3600));
+        self.set_next_publish(Some(now + LOCATION_REFRESH));
     }
 
     /// Handle a PUBLISH message.
-    pub(crate) fn handle_publish(&mut self, msg: Routed, now: u64) {
+    pub(crate) fn handle_publish(&mut self, msg: Routed, now: Timestamp) {
         // Decode payload: owner_node_id || tree_addr || seq || signature
         let mut reader = Reader::new(&msg.payload);
 
@@ -122,7 +119,7 @@ where
             tree_addr,
             seq,
             signature,
-            received_at_secs: now,
+            received_at: now,
         };
 
         self.insert_location_store(owner_node_id, entry);
@@ -132,21 +129,17 @@ where
     }
 
     /// Send a LOOKUP message.
-    pub(crate) fn send_lookup(&mut self, target: NodeId, replica: usize, _now: u64) {
+    pub(crate) fn send_lookup(&mut self, target: NodeId, replica: usize, _now: Timestamp) {
         let key = self.hash_to_key(&target, replica as u8);
         let dest_addr = self.addr_for_key(key);
 
         // Payload is just the target node_id
         let msg = self.build_routed(dest_addr, None, MSG_LOOKUP, target.to_vec());
-
-        let encoded = Message::Routed(msg).encode_to_vec();
-        if encoded.len() <= self.transport().mtu() {
-            let _ = self.transport_mut().tx(&encoded);
-        }
+        let _ = self.send_routed(msg);
     }
 
     /// Handle a LOOKUP message.
-    pub(crate) fn handle_lookup_msg(&mut self, msg: Routed, _now: u64) {
+    pub(crate) fn handle_lookup_msg(&mut self, msg: Routed, _now: Timestamp) {
         // Payload is the target node_id (16 bytes)
         if msg.payload.len() != 16 {
             return;
@@ -174,17 +167,13 @@ where
 
             let response =
                 self.build_routed(src_addr, Some(msg.src_node_id), MSG_FOUND, payload_bytes);
-
-            let encoded = Message::Routed(response).encode_to_vec();
-            if encoded.len() <= self.transport().mtu() {
-                let _ = self.transport_mut().tx(&encoded);
-            }
+            let _ = self.send_routed(response);
         }
         // If not found, don't respond - requester will try next replica
     }
 
     /// Handle a FOUND response.
-    pub(crate) fn handle_found(&mut self, msg: Routed, now: u64) {
+    pub(crate) fn handle_found(&mut self, msg: Routed, now: Timestamp) {
         // Decode payload: target_node_id || tree_addr || seq || location_signature
         let mut reader = Reader::new(&msg.payload);
 
@@ -251,7 +240,7 @@ where
     ///
     /// Call this when tree position changes (after merge, parent switch, etc.)
     /// to ensure entries are moved to their new owners.
-    pub(crate) fn rebalance_keyspace(&mut self, _now: u64) {
+    pub(crate) fn rebalance_keyspace(&mut self, _now: Timestamp) {
         // Collect entries we no longer own
         let to_republish: Vec<LocationEntry> = self
             .location_store()
@@ -281,11 +270,7 @@ where
                 let dest_addr = self.addr_for_key(key);
 
                 let msg = self.build_routed_no_reply(dest_addr, MSG_PUBLISH, payload_bytes.clone());
-
-                let encoded = Message::Routed(msg).encode_to_vec();
-                if encoded.len() <= self.transport().mtu() {
-                    let _ = self.transport_mut().tx(&encoded);
-                }
+                let _ = self.send_routed(msg);
             }
         }
     }
@@ -294,6 +279,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time::Timestamp;
     use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
 
     #[test]
@@ -306,9 +292,9 @@ mod tests {
         let mut node = Node::new(transport, crypto, random, clock);
 
         // Publish location
-        node.publish_location(0);
+        node.publish_location(Timestamp::ZERO);
 
         // Should have sent K_REPLICAS messages
-        assert_eq!(node.transport().tx_log.len(), K_REPLICAS);
+        assert_eq!(node.transport().take_sent().len(), K_REPLICAS);
     }
 }

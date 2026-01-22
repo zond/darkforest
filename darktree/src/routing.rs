@@ -6,22 +6,23 @@
 //! - Shortcut optimization
 
 use crate::node::Node;
+use crate::time::Timestamp;
 use crate::traits::{Clock, Crypto, Random, Transport};
 use crate::types::{
-    Error, NodeId, Payload, Routed, Signature, TreeAddr, DEFAULT_TTL, MSG_DATA, MSG_FOUND,
-    MSG_LOOKUP, MSG_PUBLISH,
+    Error, NodeId, Routed, Signature, TreeAddr, DEFAULT_TTL, MSG_DATA, MSG_FOUND, MSG_LOOKUP,
+    MSG_PUBLISH,
 };
 use crate::wire::{routed_sign_data, Encode, Message};
 
-impl<T, Cr, R, Cl> Node<T, Cr, R, Cl>
+impl<T, Cr, R, Clk> Node<T, Cr, R, Clk>
 where
     T: Transport,
     Cr: Crypto,
     R: Random,
-    Cl: Clock,
+    Clk: Clock,
 {
     /// Handle a received Routed message.
-    pub(crate) fn handle_routed(&mut self, mut msg: Routed, now: u64) {
+    pub(crate) fn handle_routed(&mut self, mut msg: Routed, now: Timestamp) {
         // TTL check - prevent routing loops
         if msg.ttl == 0 {
             return; // Drop message
@@ -54,7 +55,7 @@ where
     }
 
     /// Handle a message that has reached its destination.
-    fn handle_locally(&mut self, msg: Routed, now: u64) {
+    fn handle_locally(&mut self, msg: Routed, now: Timestamp) {
         // SECURITY: Require verified pubkey for signature verification
         let pubkey = match self.pubkey_cache().get(&msg.src_node_id) {
             Some(pk) => *pk,
@@ -101,8 +102,7 @@ where
 
         // Forward if ordinal is valid (broadcast, child will pick it up based on tree_addr)
         if (ordinal as usize) < prefixes.len() {
-            let encoded = Message::Routed(msg).encode_to_vec();
-            let _ = self.transport_mut().tx(&encoded);
+            let _ = self.send_routed(msg);
         }
         // If ordinal out of range, message is dropped (stale routing info)
     }
@@ -116,20 +116,15 @@ where
 
         // For now, just route up to parent (shortcut optimization can be added later)
         if self.parent().is_some() {
-            let encoded = Message::Routed(msg).encode_to_vec();
-            let _ = self.transport_mut().tx(&encoded);
+            let _ = self.send_routed(msg);
         }
         // If we're root and destination not in subtree, drop (unreachable)
     }
 
     /// Handle received DATA message.
     fn handle_data(&mut self, msg: Routed) {
-        use crate::types::Event;
-
-        self.push_event(Event::DataReceived {
-            from: msg.src_node_id,
-            data: msg.payload,
-        });
+        // Push to application incoming channel
+        self.push_incoming_data(msg.src_node_id, msg.payload);
     }
 
     /// Send data to a specific node at a known tree address.
@@ -137,20 +132,11 @@ where
         &mut self,
         target: NodeId,
         addr: TreeAddr,
-        data: Payload,
-        _now: u64,
-    ) -> Result<(), Error<T::Error>> {
+        data: Vec<u8>,
+        _now: Timestamp,
+    ) -> Result<(), Error> {
         let msg = self.build_routed(addr, Some(target), MSG_DATA, data);
-        let encoded = Message::Routed(msg).encode_to_vec();
-
-        if encoded.len() > self.transport().mtu() {
-            return Err(Error::MessageTooLarge);
-        }
-
-        self.transport_mut()
-            .tx(&encoded)
-            .map_err(Error::Transport)?;
-        Ok(())
+        self.send_routed(msg)
     }
 
     /// Build a signed Routed message with src_addr included (for messages expecting replies).
@@ -159,7 +145,7 @@ where
         dest_addr: TreeAddr,
         dest_node_id: Option<NodeId>,
         msg_type: u8,
-        payload: Payload,
+        payload: Vec<u8>,
     ) -> Routed {
         self.build_routed_inner(dest_addr, dest_node_id, msg_type, payload, true)
     }
@@ -169,7 +155,7 @@ where
         &self,
         dest_addr: TreeAddr,
         msg_type: u8,
-        payload: Payload,
+        payload: Vec<u8>,
     ) -> Routed {
         self.build_routed_inner(dest_addr, None, msg_type, payload, false)
     }
@@ -180,7 +166,7 @@ where
         dest_addr: TreeAddr,
         dest_node_id: Option<NodeId>,
         msg_type: u8,
-        payload: Payload,
+        payload: Vec<u8>,
         include_src_addr: bool,
     ) -> Routed {
         let src_addr = if include_src_addr {
@@ -283,5 +269,47 @@ where
         data.push(replica);
         let hash = self.crypto().hash(&data);
         u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]])
+    }
+
+    /// Send a Routed message to the appropriate queue based on msg_type.
+    ///
+    /// Protocol messages (PUBLISH, LOOKUP, FOUND) go to the protocol queue.
+    /// Application data (DATA) goes to the app queue.
+    ///
+    /// If the queue is full, the message is dropped and metrics are updated.
+    /// This is acceptable because the protocol is designed for lossy operation
+    /// (see design.md "Best-effort delivery" section).
+    pub(crate) fn send_routed(&mut self, msg: Routed) -> Result<(), Error> {
+        let is_data = msg.msg_type == MSG_DATA;
+        let encoded = Message::Routed(msg).encode_to_vec();
+
+        if encoded.len() > self.transport().mtu() {
+            return Err(Error::MessageTooLarge);
+        }
+
+        let queue = if is_data {
+            self.transport().app_outgoing()
+        } else {
+            self.transport().protocol_outgoing()
+        };
+
+        match queue.try_send(encoded) {
+            Ok(()) => {
+                if is_data {
+                    self.record_app_sent();
+                } else {
+                    self.record_protocol_sent();
+                }
+                Ok(())
+            }
+            Err(_) => {
+                if is_data {
+                    self.record_app_dropped();
+                } else {
+                    self.record_protocol_dropped();
+                }
+                Err(Error::QueueFull)
+            }
+        }
     }
 }
