@@ -1538,11 +1538,13 @@ Transport implementations MUST drain the protocol queue before the app queue. Th
 
 | Scenario | Detection | Effect |
 |----------|-----------|--------|
-| Leaf dies | Parent: 8 missed Pulses (~200s) | Remove from children |
-| Internal node dies | Children: 8 missed Pulses (~200s) | Each child becomes subtree root |
-| Root dies | Children: 8 missed Pulses (~200s) | Children merge (largest wins) |
-| Partition | 8 missed Pulses (~200s) | Two independent trees |
+| Leaf dies | Parent: 8 missed Pulses (~24τ) | Remove from children |
+| Internal node dies | Children: 8 missed Pulses (~24τ) | Each child becomes subtree root |
+| Root dies | Children: 8 missed Pulses (~24τ) | Children merge (largest wins) |
+| Partition | 8 missed Pulses (~24τ) | Two independent trees |
 | Partition heals | Pulses from other tree | Merge (larger wins) |
+
+*For LoRa (τ=6.7s): 24τ ≈ 160 seconds*
 
 ### Security Model
 
@@ -1598,7 +1600,7 @@ This attack is fundamentally hard to prevent at the protocol layer — it requir
 
 The protocol is designed to tolerate packet loss at the transport layer. When send queues are full, messages are dropped rather than blocking. This is acceptable because:
 
-1. **Pulse loss is tolerable:** Neighbors timeout after 8 missed Pulses (~200 seconds). With 50% packet loss, P(miss 8) = 0.4%, so spurious timeouts are rare. The priority queue ensures Pulses are rarely dropped unless severely overloaded.
+1. **Pulse loss is tolerable:** Neighbors timeout after 8 missed Pulses (~24τ ≈ 160s for LoRa). With 50% packet loss, P(miss 8) = 0.4%, so spurious timeouts are rare. The priority queue ensures Pulses are rarely dropped unless severely overloaded.
 
 2. **PUBLISH has redundancy:** Published to K=3 replicas, and refreshed every 8 hours. Missing one PUBLISH rarely matters.
 
@@ -1614,3 +1616,83 @@ The transport's priority queue model (protocol messages before application data)
 - Keyspace ranges shift with tree structure
 - Lookups may temporarily fail
 - Entries pushed to new owners
+
+### Expected Latency
+
+This section provides expected latency for delivering application-level DATA messages under various conditions.
+
+**Assumptions (LoRa SF8, 10% duty cycle):**
+- τ = 6.7 seconds (see [Timing Model](#timing-model))
+- Per-hop on success: ~0.1τ (forwarder receives and transmits)
+- Per-hop on failure: sender waits backoff (1τ, 2τ, 4τ...) then retries
+- Tree depth ≈ ceil(log₁₆(N)) for network size N
+
+**Tree depth vs network size:**
+
+| Network Size | Typical Depth | Avg Hops (random pair) |
+|--------------|---------------|------------------------|
+| 10 nodes | 2 | 2 |
+| 100 nodes | 3 | 3 |
+| 1,000 nodes | 4 | 4 |
+| 10,000 nodes | 5 | 5 |
+
+**Per-hop latency model:**
+
+With packet loss probability P and exponential backoff retries (1τ, 2τ, 4τ...), expected latency is:
+
+```
+E[hop] = Σ P^k × (1-P) × time(k)   where time(k) ≈ 2^k τ for k retries
+```
+
+| Loss Rate | Expected Per-Hop | Calculation |
+|-----------|------------------|-------------|
+| 10% (low) | ~0.25τ | 90% succeed first try (0.1τ), 9% need one retry (1.2τ) |
+| 30% (medium) | ~0.8τ | 70% first try, 21% one retry, 6% two retries... |
+| 50% (high) | ~3.2τ | Each retry tier contributes ~0.5τ, series converges slowly |
+
+*Note: High loss is expensive because exponential backoff (1τ, 2τ, 4τ, 8τ...) makes repeated failures very costly. At 50% loss, P(need 3+ retries) = 12.5%, contributing ~1.5τ to expected latency.*
+
+**With prefetched tree address (DATA only):**
+
+| Network | Congestion | Hops | Per-Hop | Total | LoRa Time |
+|---------|------------|------|---------|-------|-----------|
+| 10 nodes | Low (10%) | 2 | 0.25τ | 0.5τ | ~3s |
+| 10 nodes | Medium (30%) | 2 | 0.8τ | 1.6τ | ~11s |
+| 10 nodes | High (50%) | 2 | 3.2τ | 6.4τ | ~43s |
+| 100 nodes | Low | 3 | 0.25τ | 0.75τ | ~5s |
+| 100 nodes | Medium | 3 | 0.8τ | 2.4τ | ~16s |
+| 100 nodes | High | 3 | 3.2τ | 9.6τ | ~64s |
+| 1,000 nodes | Low | 4 | 0.25τ | 1τ | ~7s |
+| 1,000 nodes | Medium | 4 | 0.8τ | 3.2τ | ~21s |
+| 1,000 nodes | High | 4 | 3.2τ | 12.8τ | ~86s |
+
+**Without prefetched address (LOOKUP round-trip + DATA):**
+
+Total hops ≈ 3 × depth (LOOKUP to storage node + FOUND back + DATA to destination)
+
+| Network | Congestion | Hops | Per-Hop | Total | LoRa Time |
+|---------|------------|------|---------|-------|-----------|
+| 10 nodes | Low | 6 | 0.25τ | 1.5τ | ~10s |
+| 10 nodes | Medium | 6 | 0.8τ | 4.8τ | ~32s |
+| 10 nodes | High | 6 | 3.2τ | 19.2τ | ~2 min |
+| 100 nodes | Low | 9 | 0.25τ | 2.25τ | ~15s |
+| 100 nodes | Medium | 9 | 0.8τ | 7.2τ | ~48s |
+| 100 nodes | High | 9 | 3.2τ | 28.8τ | ~3 min |
+| 1,000 nodes | Low | 12 | 0.25τ | 3τ | ~20s |
+| 1,000 nodes | Medium | 12 | 0.8τ | 9.6τ | ~64s |
+| 1,000 nodes | High | 12 | 3.2τ | 38.4τ | ~4 min |
+
+**Summary:**
+
+| Scenario | Low Loss | Medium Loss | High Loss |
+|----------|----------|-------------|-----------|
+| Small network, prefetched | ~3s | ~11s | ~43s |
+| Small network, lookup | ~10s | ~32s | ~2 min |
+| Large network (1K), prefetched | ~7s | ~21s | ~86s |
+| Large network (1K), lookup | ~20s | ~64s | ~4 min |
+
+**Key takeaways:**
+1. **Prefetching cuts latency by ~3×** — Cache tree addresses when possible
+2. **Congestion has dramatic impact** — 10× between low and high loss
+3. **Network size has modest impact** — Logarithmic scaling (4 vs 12 hops for 10 vs 1000 nodes)
+4. **For LoRa, expect seconds to minutes** — This is a low-bandwidth, high-latency network
