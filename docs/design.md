@@ -637,7 +637,13 @@ Tree reunified: R.tree_size = 100
 
 ### Liveness and Timeouts
 
-Nodes track Pulse timestamps for all neighbors. After 8 missed Pulses, a neighbor is presumed dead. (See Part 6 for rationale: with 50% packet loss, P(miss 8) = 0.4%.)
+Nodes track Pulse timestamps for all neighbors. After 8 missed Pulses, a neighbor is presumed dead.
+
+**Why 8 Pulses?** With 50% packet loss per Pulse:
+- P(miss 3 in a row) = 12.5% — too high, causes spurious timeouts
+- P(miss 8 in a row) = 0.4% — rare enough to be acceptable
+
+At ~25 second Pulse intervals, 8 missed Pulses = ~200 seconds before declaring a neighbor dead.
 
 Since Pulse intervals vary by node, we track the observed interval:
 
@@ -687,14 +693,42 @@ impl Node {
 | Child | 8 × observed interval (~200s) | Remove from children |
 | Shortcut | 8 × observed interval (~200s) | Remove from shortcuts |
 
-### Shortcut Discovery
+### Shortcuts
 
-Shortcuts (non-tree neighbors) are discovered passively:
+Shortcuts are non-tree neighbors that enable faster routing by skipping tree hops.
 
+**Discovery:** Shortcuts are discovered passively:
 1. Pulses are broadcast (heard by all nodes in radio range)
 2. Non-parent/child nodes that hear you add you as a shortcut
 3. Shortcuts expire after 8 missed Pulses
 4. No additional bandwidth cost
+
+**Routing optimization:** When routing, use a shortcut S instead of the normal tree path if:
+
+```
+common_prefix_len(S.tree_addr, dest_addr) > common_prefix_len(my_addr, dest_addr)
+```
+
+In other words: use the shortcut if it's "closer" to the destination's branch than you are.
+
+**Example:**
+```
+         []
+        /   \
+      [0]   [1]
+      /       \
+   [0,0]     [1,0]
+   /           \
+[0,0,0]     [1,0,0]
+   A            B
+```
+
+A at `[0,0,0]` sends to B at `[1,0,0]`:
+- Normal route: A → [0,0] → [0] → [] → [1] → [1,0] → B = **6 hops**
+- Via shortcut at `[1]`: A → [1] → [1,0] → B = **3 hops**
+- Via shortcut at `[1,0]`: A → [1,0] → B = **2 hops**
+
+The shortcut at `[1,0]` has `common_prefix_len([1,0], [1,0,0]) = 2`, which is greater than A's `common_prefix_len([0,0,0], [1,0,0]) = 0`, so it's used.
 
 ---
 
@@ -832,12 +866,6 @@ Node [0,0] sends to [2]:
   [0]   → []  (up)     not in subtree, route to parent
   []    → [2] (down)   in subtree, route to child ordinal 2
 ```
-
-### Shortcuts
-
-Shortcuts enable faster routing by skipping tree hops. When routing up, a node can send directly to a shortcut if:
-- The shortcut is an ancestor of the destination, OR
-- The destination is in the shortcut's subtree
 
 ---
 
@@ -1234,7 +1262,135 @@ impl Node {
 
 ---
 
-## Part 5: Reference
+## Part 5: Link-Layer Reliability
+
+This part describes how nodes handle packet loss on half-duplex radio links.
+
+### The Problem
+
+LoRa radios are half-duplex: a node cannot receive while transmitting. When node A sends to node B:
+- B may be transmitting simultaneously (can't hear A)
+- Radio interference may corrupt the packet
+- B's receive buffer may be full
+
+Without acknowledgment, A doesn't know if B received the message. For multi-hop Routed messages, each hop has independent loss probability. With 50% loss per hop and 64 hops, delivery probability approaches zero.
+
+### Implicit ACKs via Overhearing
+
+Since all transmissions are broadcasts, A can overhear when B forwards A's message. This serves as an implicit acknowledgment.
+
+**For Routed messages:**
+1. A sends `Routed` with TTL=X to B
+2. A stores `hash(Routed with TTL=X-1)` in pending set
+3. A starts exponential backoff timer
+4. If A hears B's forwarded message (matching hash): implicit ACK, done
+5. If timeout without ACK: A resends original (TTL=X), up to 8 retries
+
+**Hash comparison:**
+The sender computes the expected hash by taking the message with TTL decremented. When overhearing any broadcast, nodes compare hashes against their pending set to detect if it's a forwarded version of a pending message.
+
+### Explicit ACK Messages
+
+When B receives a duplicate (same message, same TTL), B knows A didn't hear B's original forward. Instead of re-forwarding (which would create duplicates), B sends an explicit ACK:
+
+```rust
+// New message type: ACK = 4
+struct Ack {
+    hash: [u8; 8],  // truncated hash of the message being ACKed
+}
+```
+
+**Forwarder (B) behavior:**
+1. B receives `Routed` with TTL=X from A
+2. B decrements TTL to X-1 and forwards
+3. B stores `hash(Routed with TTL=X)` in recently_forwarded set
+4. If B receives same message again (same hash, same TTL=X):
+   - Send `ACK(hash(Routed with TTL=X-1))` back
+   - Do NOT re-forward (duplicate suppression)
+
+The ACK contains the hash A is waiting for (the forwarded version with TTL-1).
+
+### Timing Considerations
+
+**Time-on-air at SF8 @ 125kHz:**
+- Symbol time ≈ 2ms
+- ~3-5ms per payload byte
+- 150-byte Pulse ≈ 500-750ms airtime
+- 100-byte Routed ≈ 300-500ms airtime
+
+**Minimum time for forwarder to respond:**
+1. Receive full packet (~500ms)
+2. Process and decide to forward (~10ms)
+3. Possible duty cycle delay (0-30+ seconds under congestion)
+4. Transmit forwarded packet (~500ms)
+
+Under normal conditions: ~1-2 seconds. Under duty cycle pressure: could be 30+ seconds.
+
+### Retransmission Policy
+
+```rust
+const MAX_RETRIES: u8 = 8;
+const INITIAL_BACKOFF_MS: u64 = 2000;  // 2 seconds minimum
+
+// Note: Actual retry timing may be delayed beyond backoff by duty cycle.
+// Logical backoffs: 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s
+// With duty cycle delays, total worst-case could be 10+ minutes.
+
+struct PendingAck {
+    expected_hash: [u8; 8],  // hash of message with TTL-1
+    original_msg: Vec<u8>,   // for retransmission
+    retries: u8,
+    next_retry: Instant,
+}
+
+fn retry_backoff(retries: u8) -> Duration {
+    Duration::from_millis(INITIAL_BACKOFF_MS << retries)
+}
+```
+
+### Memory Bounds
+
+```rust
+const MAX_PENDING_ACKS: usize = 32;          // messages awaiting ACK
+const MAX_RECENTLY_FORWARDED: usize = 128;   // for duplicate detection
+const ACK_HASH_SIZE: usize = 8;              // truncated hash bytes
+const RECENTLY_FORWARDED_TTL: Duration = Duration::from_secs(180);  // 3 minutes
+```
+
+**Memory usage:**
+- `pending_acks`: 32 entries × ~16 bytes (hash + metadata) = ~512 bytes
+  - Plus original messages for retransmission (bounded by MTU × 32 ≈ 8KB worst case)
+- `recently_forwarded`: 128 entries × ~16 bytes (hash + timestamp) = ~2KB
+- Total: ~2.5KB metadata + up to 8KB message storage
+
+**Why these values:**
+- `RECENTLY_FORWARDED_TTL = 180s`: Must exceed worst-case time for duplicate to arrive (sender delayed by duty cycle, multiple backoffs). 3 minutes provides margin.
+- `MAX_RECENTLY_FORWARDED = 128`: At 0.5 messages/second forwarded (high for LoRa), 180s × 0.5 = 90 entries. 128 provides headroom.
+- `MAX_PENDING_ACKS = 32`: Limits concurrent outbound messages awaiting ACK. With ~10 minute worst-case per message, throughput floor is ~3 messages/minute under heavy loss.
+
+When collections are full, oldest entries are evicted (LRU). This may cause:
+- Evicted pending_ack: give up on that message (application can retry)
+- Evicted recently_forwarded: may forward a duplicate (harmless, just wasteful)
+
+### Why This Works
+
+1. **Uses existing broadcasts:** No extra transmissions for implicit ACKs
+2. **Handles half-duplex:** Retries when sender was transmitting during forward
+3. **Prevents duplicates:** Explicit ACK + duplicate detection prevents message explosion
+4. **Bounded memory:** Fixed-size hash storage, LRU eviction
+5. **Graceful degradation:** After max retries, message is dropped (application can retry)
+
+### What This Doesn't Provide
+
+- **End-to-end reliability:** Only hop-by-hop. Multi-hop messages may still fail if every hop loses 50%.
+- **Ordering guarantees:** Messages may arrive out of order
+- **Exactly-once delivery:** Receivers must handle duplicates (same signature = same message)
+
+Applications needing stronger guarantees should implement their own ack/retry at the DATA message level.
+
+---
+
+## Part 6: Reference
 
 ### Message Summary
 
@@ -1277,6 +1433,7 @@ impl Node {
 | LOOKUP | 1 | None | target_node_id |
 | FOUND | 2 | Some | target_node_id, tree_addr, seq (varint), location_signature |
 | DATA | 3 | Some | application data |
+| ACK | 4 | — | hash (8 bytes) |
 
 *Location signature covers `"LOC:" || owner_node_id || tree_addr || seq`. Routed signature covers all fields except ttl. src_addr is None for PUBLISH and FOUND (no response expected).*
 
@@ -1298,7 +1455,7 @@ min_interval = max(10s, airtime / pulse_budget)
 ```
 
 **Transport priority queues:** The Transport trait provides two outgoing queues:
-- `protocol_outgoing()` — high priority: Pulse, PUBLISH, LOOKUP, FOUND
+- `protocol_outgoing()` — high priority: Pulse, PUBLISH, LOOKUP, FOUND, ACK
 - `app_outgoing()` — lower priority: DATA messages
 
 Transport implementations MUST drain the protocol queue before the app queue. This ensures tree maintenance and DHT operations work even when application traffic is heavy. Without this, a flood of DATA messages could starve Pulse broadcasts, causing neighbors to timeout and the tree to degrade.
@@ -1399,141 +1556,3 @@ The transport's priority queue model (protocol messages before application data)
 - Keyspace ranges shift with tree structure
 - Lookups may temporarily fail
 - Entries pushed to new owners
-
----
-
-## Part 6: Link-Layer Reliability
-
-This part describes how nodes handle packet loss on half-duplex radio links.
-
-### The Problem
-
-LoRa radios are half-duplex: a node cannot receive while transmitting. When node A sends to node B:
-- B may be transmitting simultaneously (can't hear A)
-- Radio interference may corrupt the packet
-- B's receive buffer may be full
-
-Without acknowledgment, A doesn't know if B received the message. For multi-hop Routed messages, each hop has independent loss probability. With 50% loss per hop and 64 hops, delivery probability approaches zero.
-
-### Implicit ACKs via Overhearing
-
-Since all transmissions are broadcasts, A can overhear when B forwards A's message. This serves as an implicit acknowledgment.
-
-**For Routed messages:**
-1. A sends `Routed` with TTL=X to B
-2. A stores `hash(Routed with TTL=X-1)` in pending set
-3. A starts exponential backoff timer
-4. If A hears B's forwarded message (matching hash): implicit ACK, done
-5. If timeout without ACK: A resends original (TTL=X), up to 8 retries
-
-**Hash comparison:**
-The sender computes the expected hash by taking the message with TTL decremented. When overhearing any broadcast, nodes compare hashes against their pending set to detect if it's a forwarded version of a pending message.
-
-### Explicit ACK Messages
-
-When B receives a duplicate (same message, same TTL), B knows A didn't hear B's original forward. Instead of re-forwarding (which would create duplicates), B sends an explicit ACK:
-
-```rust
-// New message type: ACK = 4
-struct Ack {
-    hash: [u8; 8],  // truncated hash of the message being ACKed
-}
-```
-
-**Forwarder (B) behavior:**
-1. B receives `Routed` with TTL=X from A
-2. B decrements TTL to X-1 and forwards
-3. B stores `hash(Routed with TTL=X)` in recently_forwarded set
-4. If B receives same message again (same hash, same TTL=X):
-   - Send `ACK(hash(Routed with TTL=X-1))` back
-   - Do NOT re-forward (duplicate suppression)
-
-The ACK contains the hash A is waiting for (the forwarded version with TTL-1).
-
-### Timing Considerations
-
-**Time-on-air at SF8 @ 125kHz:**
-- Symbol time ≈ 2ms
-- ~3-5ms per payload byte
-- 150-byte Pulse ≈ 500-750ms airtime
-- 100-byte Routed ≈ 300-500ms airtime
-
-**Minimum time for forwarder to respond:**
-1. Receive full packet (~500ms)
-2. Process and decide to forward (~10ms)
-3. Possible duty cycle delay (0-30+ seconds under congestion)
-4. Transmit forwarded packet (~500ms)
-
-Under normal conditions: ~1-2 seconds. Under duty cycle pressure: could be 30+ seconds.
-
-### Retransmission Policy
-
-```rust
-const MAX_RETRIES: u8 = 8;
-const INITIAL_BACKOFF_MS: u64 = 2000;  // 2 seconds minimum
-
-// Note: Actual retry timing may be delayed beyond backoff by duty cycle.
-// Logical backoffs: 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s
-// With duty cycle delays, total worst-case could be 10+ minutes.
-
-struct PendingAck {
-    expected_hash: [u8; 8],  // hash of message with TTL-1
-    original_msg: Vec<u8>,   // for retransmission
-    retries: u8,
-    next_retry: Instant,
-}
-
-fn retry_backoff(retries: u8) -> Duration {
-    Duration::from_millis(INITIAL_BACKOFF_MS << retries)
-}
-```
-
-### Pulse Liveness
-
-For Pulse messages, we increase the liveness window from 3 to 8 missed Pulses.
-
-**Rationale:** With 50% loss per Pulse:
-- P(miss 3 in a row) = 0.5³ = 12.5% — too high, causes spurious timeouts
-- P(miss 8 in a row) = 0.5⁸ = 0.4% — rare enough to be acceptable
-
-At ~25 second Pulse intervals, 8 missed Pulses = ~200 seconds before declaring a neighbor dead. This balances robustness against loss with reasonable failure detection time.
-
-### Memory Bounds
-
-```rust
-const MAX_PENDING_ACKS: usize = 32;          // messages awaiting ACK
-const MAX_RECENTLY_FORWARDED: usize = 128;   // for duplicate detection
-const ACK_HASH_SIZE: usize = 8;              // truncated hash bytes
-const RECENTLY_FORWARDED_TTL: Duration = Duration::from_secs(180);  // 3 minutes
-```
-
-**Memory usage:**
-- `pending_acks`: 32 entries × ~16 bytes (hash + metadata) = ~512 bytes
-  - Plus original messages for retransmission (bounded by MTU × 32 ≈ 8KB worst case)
-- `recently_forwarded`: 128 entries × ~16 bytes (hash + timestamp) = ~2KB
-- Total: ~2.5KB metadata + up to 8KB message storage
-
-**Why these values:**
-- `RECENTLY_FORWARDED_TTL = 180s`: Must exceed worst-case time for duplicate to arrive (sender delayed by duty cycle, multiple backoffs). 3 minutes provides margin.
-- `MAX_RECENTLY_FORWARDED = 128`: At 0.5 messages/second forwarded (high for LoRa), 180s × 0.5 = 90 entries. 128 provides headroom.
-- `MAX_PENDING_ACKS = 32`: Limits concurrent outbound messages awaiting ACK. With ~10 minute worst-case per message, throughput floor is ~3 messages/minute under heavy loss.
-
-When collections are full, oldest entries are evicted (LRU). This may cause:
-- Evicted pending_ack: give up on that message (application can retry)
-- Evicted recently_forwarded: may forward a duplicate (harmless, just wasteful)
-
-### Why This Works
-
-1. **Uses existing broadcasts:** No extra transmissions for implicit ACKs
-2. **Handles half-duplex:** Retries when sender was transmitting during forward
-3. **Prevents duplicates:** Explicit ACK + duplicate detection prevents message explosion
-4. **Bounded memory:** Fixed-size hash storage, LRU eviction
-5. **Graceful degradation:** After max retries, message is dropped (application can retry)
-
-### What This Doesn't Provide
-
-- **End-to-end reliability:** Only hop-by-hop. Multi-hop messages may still fail if every hop loses 50%.
-- **Ordering guarantees:** Messages may arrive out of order
-- **Exactly-once delivery:** Receivers must handle duplicates (same signature = same message)
-
-Applications needing stronger guarantees should implement their own ack/retry at the DATA message level.
