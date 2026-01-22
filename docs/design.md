@@ -1636,6 +1636,18 @@ This section provides expected latency for delivering application-level DATA mes
 | 1,000 nodes | 4 | 4 |
 | 10,000 nodes | 5 | 5 |
 
+**Real-world LoRa packet loss rates:**
+
+Based on studies of deployed LoRa networks (see `docs/lora-packet-loss-study.md`):
+
+| Congestion Level | Device Density | Typical Loss Rate |
+|------------------|----------------|-------------------|
+| Light | Optimized, sparse | 6-15% |
+| Typical | Normal deployment | 25-35% |
+| Congested | 100-200 devices/gateway | 35-50% |
+| Severe | 500+ devices/gateway | 50-75% |
+| Extreme | 1000+ devices, high traffic | 75-95% |
+
 **Per-hop latency model:**
 
 With packet loss probability P and exponential backoff retries (1τ, 2τ, 4τ...), expected latency is:
@@ -1646,25 +1658,29 @@ E[hop] = Σ P^k × (1-P) × time(k)   where time(k) ≈ 2^k τ for k retries
 
 | Loss Rate | Expected Per-Hop | Calculation |
 |-----------|------------------|-------------|
-| 10% (low) | ~0.25τ | 90% succeed first try (0.1τ), 9% need one retry (1.2τ) |
-| 30% (medium) | ~0.8τ | 70% first try, 21% one retry, 6% two retries... |
-| 50% (high) | ~3.2τ | Each retry tier contributes ~0.5τ, series converges slowly |
+| 10% (light) | ~0.25τ | 90% succeed first try (0.1τ), 9% need one retry (1.2τ) |
+| 30% (typical) | ~0.8τ | 70% first try, 21% one retry, 6% two retries... |
+| 50% (congested) | ~3.2τ | Each retry tier contributes ~0.5τ, series converges slowly |
+| 70% (severe) | ~12τ | Series converges very slowly; most packets need 3+ retries |
 
-*Note: High loss is expensive because exponential backoff (1τ, 2τ, 4τ, 8τ...) makes repeated failures very costly. At 50% loss, P(need 3+ retries) = 12.5%, contributing ~1.5τ to expected latency.*
+*Note: Exponential backoff (1τ, 2τ, 4τ, 8τ...) makes repeated failures very costly. At 50% loss, P(need 3+ retries) = 12.5%. At 70% loss, P(need 3+ retries) = 34%.*
 
 **With prefetched tree address (DATA only):**
 
 | Network | Congestion | Hops | Per-Hop | Total | LoRa Time |
 |---------|------------|------|---------|-------|-----------|
-| 10 nodes | Low (10%) | 2 | 0.25τ | 0.5τ | ~3s |
-| 10 nodes | Medium (30%) | 2 | 0.8τ | 1.6τ | ~11s |
-| 10 nodes | High (50%) | 2 | 3.2τ | 6.4τ | ~43s |
-| 100 nodes | Low | 3 | 0.25τ | 0.75τ | ~5s |
-| 100 nodes | Medium | 3 | 0.8τ | 2.4τ | ~16s |
-| 100 nodes | High | 3 | 3.2τ | 9.6τ | ~64s |
-| 1,000 nodes | Low | 4 | 0.25τ | 1τ | ~7s |
-| 1,000 nodes | Medium | 4 | 0.8τ | 3.2τ | ~21s |
-| 1,000 nodes | High | 4 | 3.2τ | 12.8τ | ~86s |
+| 10 nodes | Light (10%) | 2 | 0.25τ | 0.5τ | ~3s |
+| 10 nodes | Typical (30%) | 2 | 0.8τ | 1.6τ | ~11s |
+| 10 nodes | Congested (50%) | 2 | 3.2τ | 6.4τ | ~43s |
+| 10 nodes | Severe (70%) | 2 | 12τ | 24τ | ~3 min |
+| 100 nodes | Light | 3 | 0.25τ | 0.75τ | ~5s |
+| 100 nodes | Typical | 3 | 0.8τ | 2.4τ | ~16s |
+| 100 nodes | Congested | 3 | 3.2τ | 9.6τ | ~64s |
+| 100 nodes | Severe | 3 | 12τ | 36τ | ~4 min |
+| 1,000 nodes | Light | 4 | 0.25τ | 1τ | ~7s |
+| 1,000 nodes | Typical | 4 | 0.8τ | 3.2τ | ~21s |
+| 1,000 nodes | Congested | 4 | 3.2τ | 12.8τ | ~86s |
+| 1,000 nodes | Severe | 4 | 12τ | 48τ | ~5 min |
 
 **Without prefetched address (LOOKUP round-trip + DATA):**
 
@@ -1672,27 +1688,31 @@ Total hops ≈ 3 × depth (LOOKUP to storage node + FOUND back + DATA to destina
 
 | Network | Congestion | Hops | Per-Hop | Total | LoRa Time |
 |---------|------------|------|---------|-------|-----------|
-| 10 nodes | Low | 6 | 0.25τ | 1.5τ | ~10s |
-| 10 nodes | Medium | 6 | 0.8τ | 4.8τ | ~32s |
-| 10 nodes | High | 6 | 3.2τ | 19.2τ | ~2 min |
-| 100 nodes | Low | 9 | 0.25τ | 2.25τ | ~15s |
-| 100 nodes | Medium | 9 | 0.8τ | 7.2τ | ~48s |
-| 100 nodes | High | 9 | 3.2τ | 28.8τ | ~3 min |
-| 1,000 nodes | Low | 12 | 0.25τ | 3τ | ~20s |
-| 1,000 nodes | Medium | 12 | 0.8τ | 9.6τ | ~64s |
-| 1,000 nodes | High | 12 | 3.2τ | 38.4τ | ~4 min |
+| 10 nodes | Light | 6 | 0.25τ | 1.5τ | ~10s |
+| 10 nodes | Typical | 6 | 0.8τ | 4.8τ | ~32s |
+| 10 nodes | Congested | 6 | 3.2τ | 19.2τ | ~2 min |
+| 10 nodes | Severe | 6 | 12τ | 72τ | ~8 min |
+| 100 nodes | Light | 9 | 0.25τ | 2.25τ | ~15s |
+| 100 nodes | Typical | 9 | 0.8τ | 7.2τ | ~48s |
+| 100 nodes | Congested | 9 | 3.2τ | 28.8τ | ~3 min |
+| 100 nodes | Severe | 9 | 12τ | 108τ | ~12 min |
+| 1,000 nodes | Light | 12 | 0.25τ | 3τ | ~20s |
+| 1,000 nodes | Typical | 12 | 0.8τ | 9.6τ | ~64s |
+| 1,000 nodes | Congested | 12 | 3.2τ | 38.4τ | ~4 min |
+| 1,000 nodes | Severe | 12 | 12τ | 144τ | ~16 min |
 
 **Summary:**
 
-| Scenario | Low Loss | Medium Loss | High Loss |
-|----------|----------|-------------|-----------|
-| Small network, prefetched | ~3s | ~11s | ~43s |
-| Small network, lookup | ~10s | ~32s | ~2 min |
-| Large network (1K), prefetched | ~7s | ~21s | ~86s |
-| Large network (1K), lookup | ~20s | ~64s | ~4 min |
+| Scenario | Light | Typical | Congested | Severe |
+|----------|-------|---------|-----------|--------|
+| Small network, prefetched | ~3s | ~11s | ~43s | ~3 min |
+| Small network, lookup | ~10s | ~32s | ~2 min | ~8 min |
+| Large network (1K), prefetched | ~7s | ~21s | ~86s | ~5 min |
+| Large network (1K), lookup | ~20s | ~64s | ~4 min | ~16 min |
 
 **Key takeaways:**
 1. **Prefetching cuts latency by ~3×** — Cache tree addresses when possible
-2. **Congestion has dramatic impact** — 10× between low and high loss
+2. **Congestion has dramatic impact** — 50× between light and severe loss
 3. **Network size has modest impact** — Logarithmic scaling (4 vs 12 hops for 10 vs 1000 nodes)
 4. **For LoRa, expect seconds to minutes** — This is a low-bandwidth, high-latency network
+5. **At severe congestion, consider giving up** — Applications should set realistic timeouts; waiting 15+ minutes for a message is often worse than failing fast and retrying later
