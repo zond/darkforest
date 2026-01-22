@@ -7,7 +7,7 @@ consultant, and analyst.
 
 ## Development Workflow
 
-Run the `date` command to understand what date it is today.
+Run the `date` command to understand what date it is today, because it's not 2025 anymore.
 
 ### Documentation ideals
 
