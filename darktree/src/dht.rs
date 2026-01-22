@@ -1,0 +1,314 @@
+//! DHT operations - PUBLISH, LOOKUP, and FOUND handling.
+//!
+//! This module handles:
+//! - Publishing node locations to the DHT
+//! - Looking up node locations
+//! - Storing and retrieving location entries
+
+use crate::node::Node;
+use crate::traits::{Clock, Crypto, Random, Transport};
+use crate::types::{
+    Event, LocationEntry, NodeId, Routed, K_REPLICAS, LOCATION_REFRESH_HOURS, MSG_FOUND,
+    MSG_LOOKUP, MSG_PUBLISH,
+};
+use crate::wire::{location_sign_data, Encode, Message, Reader, Writer};
+
+impl<T, Cr, R, Cl> Node<T, Cr, R, Cl>
+where
+    T: Transport,
+    Cr: Crypto,
+    R: Random,
+    Cl: Clock,
+{
+    /// Check if we own any replica key for a node_id in our keyspace.
+    fn owns_replica_key(&self, node_id: &NodeId) -> bool {
+        (0..K_REPLICAS).any(|replica| {
+            let key = self.hash_to_key(node_id, replica as u8);
+            let dest_addr = self.addr_for_key(key);
+            dest_addr.starts_with(self.tree_addr())
+        })
+    }
+
+    /// Publish our location to the DHT.
+    pub(crate) fn publish_location(&mut self, now: u64) {
+        let seq = self.next_location_seq();
+
+        // Build location signature
+        let sign_data = location_sign_data(self.node_id(), self.tree_addr(), seq);
+        let signature = self.crypto().sign(self.secret(), sign_data.as_slice());
+
+        // Build payload: owner_node_id || tree_addr || seq || signature
+        let mut payload = Writer::new();
+        payload.write_node_id(self.node_id());
+        payload.write_tree_addr(self.tree_addr());
+        payload.write_varint(seq);
+        payload.write_signature(&signature);
+        let payload_bytes = payload.finish();
+
+        // Publish to K_REPLICAS locations
+        for replica in 0..K_REPLICAS {
+            let key = self.hash_to_key(self.node_id(), replica as u8);
+            let dest_addr = self.addr_for_key(key);
+
+            let msg = self.build_routed_no_reply(dest_addr, MSG_PUBLISH, payload_bytes.clone());
+
+            let encoded = Message::Routed(msg).encode_to_vec();
+            if encoded.len() <= self.transport().mtu() {
+                let _ = self.transport_mut().tx(&encoded);
+            }
+        }
+
+        // Schedule next publish
+        self.set_next_publish_secs(Some(now + LOCATION_REFRESH_HOURS * 3600));
+    }
+
+    /// Handle a PUBLISH message.
+    pub(crate) fn handle_publish(&mut self, msg: Routed, now: u64) {
+        // Decode payload: owner_node_id || tree_addr || seq || signature
+        let mut reader = Reader::new(&msg.payload);
+
+        let owner_node_id = match reader.read_node_id() {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+        let tree_addr = match reader.read_tree_addr() {
+            Ok(addr) => addr,
+            Err(_) => return,
+        };
+        let seq = match reader.read_varint() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let signature = match reader.read_signature() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        // SECURITY: Verify keyspace ownership to prevent DHT pollution attacks
+        if !self.owns_replica_key(&owner_node_id) {
+            return;
+        }
+
+        // SECURITY: Require verified pubkey for signature verification
+        let pubkey = match self.pubkey_cache().get(&owner_node_id) {
+            Some(pk) => *pk,
+            None => {
+                // Can't verify without pubkey - queue for later and mark that we need it
+                self.need_pubkey_mut().insert(owner_node_id);
+                self.queue_pending_pubkey(owner_node_id, msg);
+                return;
+            }
+        };
+
+        // Verify signature
+        let sign_data = location_sign_data(&owner_node_id, &tree_addr, seq);
+        if !self
+            .crypto()
+            .verify(&pubkey, sign_data.as_slice(), &signature)
+        {
+            return; // Invalid signature
+        }
+
+        // Check if this is a newer entry
+        if let Some(existing) = self.location_store().get(&owner_node_id) {
+            if seq <= existing.seq {
+                return; // Replay or old entry
+            }
+        }
+
+        // Store the entry
+        let entry = LocationEntry {
+            node_id: owner_node_id,
+            tree_addr,
+            seq,
+            signature,
+            received_at_secs: now,
+        };
+
+        self.insert_location_store(owner_node_id, entry);
+
+        // Update fraud detection counters
+        self.fraud_detection_mut().on_publish_received();
+    }
+
+    /// Send a LOOKUP message.
+    pub(crate) fn send_lookup(&mut self, target: NodeId, replica: usize, _now: u64) {
+        let key = self.hash_to_key(&target, replica as u8);
+        let dest_addr = self.addr_for_key(key);
+
+        // Payload is just the target node_id
+        let msg = self.build_routed(dest_addr, None, MSG_LOOKUP, target.to_vec());
+
+        let encoded = Message::Routed(msg).encode_to_vec();
+        if encoded.len() <= self.transport().mtu() {
+            let _ = self.transport_mut().tx(&encoded);
+        }
+    }
+
+    /// Handle a LOOKUP message.
+    pub(crate) fn handle_lookup_msg(&mut self, msg: Routed, _now: u64) {
+        // Payload is the target node_id (16 bytes)
+        if msg.payload.len() != 16 {
+            return;
+        }
+
+        let mut target = [0u8; 16];
+        target.copy_from_slice(&msg.payload);
+
+        // Need src_addr to reply
+        let src_addr = match &msg.src_addr {
+            Some(addr) => addr.clone(),
+            None => return, // Can't reply without source address
+        };
+
+        // Check if we have the entry
+        if let Some(entry) = self.location_store().get(&target) {
+            // Build FOUND response
+            // Payload: target_node_id || tree_addr || seq || location_signature
+            let mut payload = Writer::new();
+            payload.write_node_id(&entry.node_id);
+            payload.write_tree_addr(&entry.tree_addr);
+            payload.write_varint(entry.seq);
+            payload.write_signature(&entry.signature);
+            let payload_bytes = payload.finish();
+
+            let response =
+                self.build_routed(src_addr, Some(msg.src_node_id), MSG_FOUND, payload_bytes);
+
+            let encoded = Message::Routed(response).encode_to_vec();
+            if encoded.len() <= self.transport().mtu() {
+                let _ = self.transport_mut().tx(&encoded);
+            }
+        }
+        // If not found, don't respond - requester will try next replica
+    }
+
+    /// Handle a FOUND response.
+    pub(crate) fn handle_found(&mut self, msg: Routed, now: u64) {
+        // Decode payload: target_node_id || tree_addr || seq || location_signature
+        let mut reader = Reader::new(&msg.payload);
+
+        let node_id = match reader.read_node_id() {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+        let tree_addr = match reader.read_tree_addr() {
+            Ok(addr) => addr,
+            Err(_) => return,
+        };
+        let seq = match reader.read_varint() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let signature = match reader.read_signature() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        // Check if we have a pending lookup for this node
+        if self.pending_lookups().get(&node_id).is_none() {
+            return; // Unexpected response
+        }
+
+        // SECURITY: Verify the location signature (signed by the target node)
+        // We need the target's pubkey to verify - if we don't have it, mark that we need it
+        let pubkey = match self.pubkey_cache().get(&node_id) {
+            Some(pk) => *pk,
+            None => {
+                // Can't verify location without pubkey - request it
+                self.need_pubkey_mut().insert(node_id);
+                return;
+            }
+        };
+
+        let sign_data = location_sign_data(&node_id, &tree_addr, seq);
+        if !self
+            .crypto()
+            .verify(&pubkey, sign_data.as_slice(), &signature)
+        {
+            return; // Invalid location signature
+        }
+
+        // Cache the location
+        self.insert_location_cache(node_id, tree_addr.clone());
+
+        // Remove pending lookup
+        self.pending_lookups_mut().remove(&node_id);
+
+        // Emit event
+        self.push_event(Event::LookupComplete {
+            node_id,
+            tree_addr: tree_addr.clone(),
+        });
+
+        // Send any pending data
+        if let Some(data) = self.pending_data_mut().remove(&node_id) {
+            let _ = self.send_data_to(node_id, tree_addr, data, now);
+        }
+    }
+
+    /// Rebalance keyspace: re-publish entries that we no longer own.
+    ///
+    /// Call this when tree position changes (after merge, parent switch, etc.)
+    /// to ensure entries are moved to their new owners.
+    pub(crate) fn rebalance_keyspace(&mut self, _now: u64) {
+        // Collect entries we no longer own
+        let to_republish: Vec<LocationEntry> = self
+            .location_store()
+            .iter()
+            .filter(|(node_id, _)| !self.owns_replica_key(node_id))
+            .map(|(_, entry)| entry.clone())
+            .collect();
+
+        // Remove entries we no longer own
+        for entry in &to_republish {
+            self.location_store_mut().remove(&entry.node_id);
+        }
+
+        // Re-publish to new owners
+        for entry in to_republish {
+            // Build payload with the stored signature
+            let mut payload = Writer::new();
+            payload.write_node_id(&entry.node_id);
+            payload.write_tree_addr(&entry.tree_addr);
+            payload.write_varint(entry.seq);
+            payload.write_signature(&entry.signature);
+            let payload_bytes = payload.finish();
+
+            // Send to all replicas (they'll filter based on keyspace ownership)
+            for replica in 0..K_REPLICAS {
+                let key = self.hash_to_key(&entry.node_id, replica as u8);
+                let dest_addr = self.addr_for_key(key);
+
+                let msg = self.build_routed_no_reply(dest_addr, MSG_PUBLISH, payload_bytes.clone());
+
+                let encoded = Message::Routed(msg).encode_to_vec();
+                if encoded.len() <= self.transport().mtu() {
+                    let _ = self.transport_mut().tx(&encoded);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
+
+    #[test]
+    fn test_publish_creates_messages() {
+        let transport = MockTransport::new();
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+
+        let mut node = Node::new(transport, crypto, random, clock);
+
+        // Publish location
+        node.publish_location(0);
+
+        // Should have sent K_REPLICAS messages
+        assert_eq!(node.transport().tx_log.len(), K_REPLICAS);
+    }
+}

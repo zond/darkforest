@@ -644,7 +644,7 @@ pub enum Event {
 ## Wire Format (`wire.rs`)
 
 Binary serialization for embedded efficiency:
-- Varints for sizes (1-5 bytes) using `tiny-varint` (canonical encoding required)
+- Varints for sizes (1-5 bytes) with canonical encoding validation (custom implementation)
 - Nibble-packed tree addresses (4 bits per level)
 - Length-prefixed vectors
 - Optional fields encoded with presence byte
@@ -658,8 +658,10 @@ Use a cursor (reader) that tracks position and returns references into the origi
 pub enum DecodeError {
     UnexpectedEof,
     InvalidVarint,
+    NonCanonicalVarint,  // Non-minimal varint encoding
     InvalidLength,
     InvalidSignature,
+    CapacityExceeded,    // e.g., children_count > MAX_CHILDREN
 }
 
 /// Zero-copy reader over a byte slice
@@ -695,14 +697,44 @@ impl<'a> Reader<'a> {
         Ok(slice)
     }
 
-    // Use tiny-varint for canonical decoding (rejects non-minimal encodings)
+    /// Read a varint (1-5 bytes for u32) with canonical encoding validation.
+    /// Rejects non-minimal encodings (e.g., 0x80 0x00 for 0).
     pub fn read_varint(&mut self) -> Result<u32, DecodeError> {
-        tiny_varint::VarInt::decode(&self.buf[self.pos..])
-            .map(|(value, bytes_read)| {
-                self.pos += bytes_read;
-                value
-            })
-            .map_err(|_| DecodeError::InvalidVarint)
+        let start_pos = self.pos;
+        let mut result: u32 = 0;
+        let mut shift = 0;
+        let mut byte_count = 0;
+
+        loop {
+            let byte = self.read_u8()?;
+            byte_count += 1;
+
+            if shift == 28 && (byte & 0xF0) != 0 {
+                return Err(DecodeError::InvalidVarint);
+            }
+
+            result |= ((byte & 0x7F) as u32) << shift;
+            if byte & 0x80 == 0 {
+                // Reject non-canonical (non-minimal) encodings
+                let minimal_bytes = if result == 0 {
+                    1
+                } else {
+                    let bits_needed = 32 - result.leading_zeros();
+                    (bits_needed as usize).div_ceil(7).max(1)
+                };
+
+                if byte_count > minimal_bytes {
+                    self.pos = start_pos;
+                    return Err(DecodeError::NonCanonicalVarint);
+                }
+
+                return Ok(result);
+            }
+            shift += 7;
+            if shift > 28 {
+                return Err(DecodeError::InvalidVarint);
+            }
+        }
     }
 
     /// Read length-prefixed bytes (returns reference, no allocation)
@@ -746,9 +778,19 @@ impl Writer {
     pub fn write_u8(&mut self, v: u8) { self.buf.push(v); }
     pub fn write_bytes(&mut self, v: &[u8]) { self.buf.extend_from_slice(v); }
 
-    // Use tiny-varint for canonical encoding
-    pub fn write_varint(&mut self, v: u32) {
-        tiny_varint::VarInt::encode(v, &mut self.buf);
+    /// Write a varint (canonical/minimal encoding)
+    pub fn write_varint(&mut self, mut v: u32) {
+        loop {
+            let mut byte = (v & 0x7F) as u8;
+            v >>= 7;
+            if v != 0 {
+                byte |= 0x80;
+            }
+            self.buf.push(byte);
+            if v == 0 {
+                break;
+            }
+        }
     }
 
     pub fn write_len_prefixed(&mut self, v: &[u8]) {
@@ -815,6 +857,7 @@ pub trait Decode<'a>: Sized {
      5. Verify seq > existing_seq for replay protection
      6. Store entry with timestamp
    - Pubkey queue: bounded (MAX_PENDING_PUBKEY=16), oldest eviction
+   - When pubkey arrives via Pulse, queued messages for that node_id are re-processed
 8. **fraud.rs** - Tree size verification
 9. **lib.rs** - Public exports
 
@@ -824,8 +867,7 @@ pub trait Decode<'a>: Sized {
 
 ```toml
 [dependencies]
-# Varint encoding - zero dependencies, no_std, canonical encoding
-tiny-varint = "0.1"
+# No external dependencies for core functionality - varint implemented inline
 
 [dev-dependencies]
 ed25519-dalek = "2"        # For default crypto impl in tests
@@ -834,13 +876,11 @@ rand = "0.8"               # For default random impl in tests
 tokio = { version = "1", features = ["rt", "macros", "time"] }  # Async runtime for tests
 ```
 
-**Varint library choice:** `tiny-varint` is recommended:
-- Zero dependencies (dependency-free)
-- no_std compatible, no dynamic allocation required
-- High-performance with optimized critical paths
-- Ideal for embedded/resource-constrained environments
-
-**IMPORTANT:** Verify tiny-varint rejects non-canonical varints during decode (not just produces canonical on encode). Per design.md, non-minimal encodings MUST be rejected. If tiny-varint doesn't reject, add explicit validation after decode or use a different library.
+**Varint implementation:** Custom implementation is used instead of external crates because:
+- Per design.md, non-minimal varint encodings MUST be rejected during decode
+- Most varint crates only ensure canonical encoding on write, not validation on read
+- Custom implementation allows rejecting non-canonical encodings with `NonCanonicalVarint` error
+- Zero external dependencies for embedded/resource-constrained environments
 
 Optional feature flags:
 ```toml

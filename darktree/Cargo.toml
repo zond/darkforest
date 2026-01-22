@@ -1,0 +1,21 @@
+[package]
+name = "darktree"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tree-based DHT protocol for LoRa mesh networks"
+
+[features]
+default = []
+default-crypto = ["dep:ed25519-dalek", "dep:sha2"]
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"], optional = true }
+sha2 = { version = "0.10", optional = true }
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+rand = "0.8"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
