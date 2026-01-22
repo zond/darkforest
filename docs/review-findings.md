@@ -4,8 +4,7 @@ Comprehensive review by protocol-security-architect and embedded-rust-engineer a
 
 ## Critical Issues
 
-### 1. Link-layer reliability not implemented
-**Status:** Not started
+### Link-layer reliability not implemented
 **Source:** Both reviewers
 **Design doc:** Part 5 (lines 1310-1446)
 
@@ -18,8 +17,7 @@ The entire link-layer reliability system is missing:
 
 **Impact:** Without hop-by-hop reliability, multi-hop message delivery degrades severely. With 50% loss per hop and 6 hops, only ~1.5% of messages arrive.
 
-### 2. No-std incompatible
-**Status:** Not started
+### No-std incompatible
 **Source:** Embedded reviewer
 **Location:** `node.rs:26`
 
@@ -31,17 +29,7 @@ Cannot compile for `#![no_std]` targets (Cortex-M, etc.).
 
 **Fix:** Use `hashbrown::HashMap` or `heapless` collections, change to `alloc::collections` for BTreeMap/BTreeSet.
 
-### 3. Fraud detection never called
-**Status:** Not started
-**Source:** Protocol reviewer
-**Location:** `node.rs` timer loop
-
-`check_tree_size_fraud()` exists in `fraud.rs` but is never invoked. Malicious nodes can inflate tree_size indefinitely.
-
-**Fix:** Add fraud check call to `handle_timer()` or `handle_timeouts()`.
-
-### 4. Keyspace calculation broken outside subtree
-**Status:** Not started
+### Keyspace calculation broken outside subtree
 **Source:** Protocol reviewer
 **Location:** `routing.rs:195-263`
 
@@ -55,8 +43,7 @@ Cannot compile for `#![no_std]` targets (Cortex-M, etc.).
 
 ## High Priority Issues
 
-### 5. Routed signatures not verified by forwarders
-**Status:** Not started
+### Routed signatures not verified by forwarders
 **Source:** Protocol reviewer
 **Location:** `routing.rs:25-55`
 
@@ -64,8 +51,7 @@ Signature verification only happens at final destination. Forwarders relay messa
 
 **Trade-off:** Verification at each hop costs CPU cycles and latency. Design doc doesn't explicitly require it.
 
-### 6. Shortcut routing not implemented
-**Status:** Not started
+### Shortcut routing not implemented
 **Source:** Both reviewers
 **Location:** `routing.rs:110-122`
 
@@ -73,8 +59,7 @@ Shortcuts are tracked in `shortcuts: ShortcutSet` but never used for routing. Co
 
 **Design doc (lines 745-777):** Use shortcut S if `common_prefix_len(S.tree_addr, dest_addr) > common_prefix_len(my_addr, dest_addr)`.
 
-### 7. RSSI not used for parent selection
-**Status:** Not started
+### RSSI not used for parent selection
 **Source:** Protocol reviewer
 **Location:** `tree.rs`
 
@@ -82,8 +67,7 @@ RSSI is stored in `NeighborTiming` but never used for parent selection decisions
 
 **Design doc (lines 306-314):** "Parent selection priority: 1. Good enough signal strength"
 
-### 8. Memory pressure from pending_pubkey
-**Status:** Not started
+### Memory pressure from pending_pubkey
 **Source:** Embedded reviewer
 **Location:** `node.rs`
 
@@ -95,8 +79,7 @@ Stores full `Routed` messages (up to 255 bytes each) for nodes awaiting pubkey. 
 
 ## Medium Priority Issues
 
-### 9. Parent rejection tracking logic confusing
-**Status:** Not started
+### Parent rejection tracking logic confusing
 **Source:** Protocol reviewer
 **Location:** `tree.rs:145-192`
 
@@ -106,8 +89,7 @@ The `pending_parent` field is used both for:
 
 This overloading is confusing and may cause edge case bugs.
 
-### 10. u128 division in keyspace calculation
-**Status:** Not started
+### u128 division in keyspace calculation
 **Source:** Embedded reviewer
 **Location:** `routing.rs:237`
 
@@ -118,8 +100,7 @@ let child_range = ((range_size as u128) * (*child_subtree as u128)
 
 u128 division is emulated on 32-bit MCUs (hundreds of cycles). Consider alternative algorithms if this is hot path.
 
-### 11. Missing radio power control in Transport trait
-**Status:** Not started
+### Missing radio power control in Transport trait
 **Source:** Embedded reviewer
 **Location:** `traits.rs`
 
@@ -127,34 +108,27 @@ No methods for radio sleep/wake control. Important for battery-powered LoRa devi
 
 **Suggestion:** Add `enable_rx()`, `disable_rx()`, `radio_state()` to Transport trait.
 
-### 12. location_seq is u32 not u64
-**Status:** Not started
-**Source:** Protocol reviewer
-**Location:** `node.rs:162`
-
-Design doc specifies `u64`, implementation uses `u32`. Low impact (4 billion publishes before wrap at 8-hour intervals = 3.9 million years).
-
 ---
 
 ## Low Priority / Future Work
 
-### 13. Unbounded Vec allocations
+### Unbounded Vec allocations
 **Source:** Embedded reviewer
 
 `TreeAddr`, `ChildPrefix`, `Payload` use `Vec<u8>`. While validated at decode time, consider `heapless::Vec` for compile-time bounds on memory-constrained targets.
 
-### 14. Sort allocation in find_ordinal_in_children
+### Sort allocation in find_ordinal_in_children
 **Source:** Embedded reviewer
 **Location:** `tree.rs:331-349`
 
 Allocates and sorts a Vec on every pulse from parent. With MAX_CHILDREN=16, this is bounded but could be avoided with cached ordering.
 
-### 15. Const generics for memory bounds
+### Const generics for memory bounds
 **Source:** Embedded reviewer
 
 Allow compile-time tuning of MAX_NEIGHBORS, MAX_PUBKEY_CACHE, etc. for different MCU memory sizes.
 
-### 16. MAX_RETRIES mismatch
+### MAX_RETRIES mismatch
 **Source:** Protocol reviewer
 
 Design doc: `MAX_RETRIES = 8`, Implementation: `MAX_RETRIES = 3`. Not currently used since link-layer reliability isn't implemented.
@@ -176,3 +150,4 @@ Design doc: `MAX_RETRIES = 8`, Implementation: `MAX_RETRIES = 3`. Not currently 
 - Timestamp overflow/underflow protection
 - Varint overflow attack protection
 - Children count validation in decoder
+- Fraud detection wired up and tested

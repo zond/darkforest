@@ -73,6 +73,7 @@ pub use types::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::JoinContext;
     use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
 
     #[test]
@@ -188,5 +189,43 @@ mod tests {
         let timeout = node.lookup_timeout();
 
         assert_eq!(timeout.as_millis(), 6710 * 32);
+    }
+
+    #[test]
+    fn test_fraud_detection_triggers() {
+        // Test that fraud detection fires when PUBLISH count is too low
+        let transport = MockTransport::new();
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+
+        let mut node = Node::new(transport, crypto, random, clock);
+
+        // Without join context, fraud detection should not trigger
+        let now = Timestamp::from_secs(7200); // 2 hours
+        assert!(!node.check_tree_size_fraud(now));
+
+        // Set up join context (required for fraud detection)
+        let fake_parent = [1u8; 16];
+        node.set_join_context(Some(JoinContext {
+            parent_at_join: fake_parent,
+            join_time: Timestamp::ZERO,
+        }));
+
+        // Initialize fraud detection: subtree_size=10, starting at t=0
+        node.fraud_detection_mut().reset(Timestamp::ZERO, 10);
+
+        // After 2 hours with subtree_size=10:
+        // expected = 3.0 * 10 * (2/8) = 7.5 PUBLISH messages
+        // With 0 observed, z = 7.5 / sqrt(7.5) = 2.74 > 2.33 threshold
+        assert!(node.check_tree_size_fraud(now));
+
+        // Now record enough PUBLISH messages to avoid fraud detection
+        // Need observed close to expected (7.5), let's do 6
+        for _ in 0..6 {
+            node.fraud_detection_mut().on_publish_received();
+        }
+        // z = (7.5 - 6) / sqrt(7.5) = 0.55 < 2.33
+        assert!(!node.check_tree_size_fraud(now));
     }
 }

@@ -1037,7 +1037,7 @@ const K_REPLICAS: usize = 3;
 // Jitter for republish: 0 to 1τ (prevents storms during tree reshuffles)
 
 struct Node {
-    location_seq: u64,  // persisted, incremented on each publish
+    location_seq: u32,  // persisted, incremented on each publish (varint 1-5 bytes on wire)
     // ...
 }
 

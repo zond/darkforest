@@ -484,6 +484,9 @@ where
 
         // Handle various timeouts
         self.handle_timeouts(now);
+
+        // Check for tree size fraud
+        self.handle_fraud_check(now);
     }
 
     /// Start a lookup for a target node.
