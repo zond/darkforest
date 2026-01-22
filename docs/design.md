@@ -59,13 +59,23 @@ struct Pulse {
     root_id: NodeId,                    // 16 bytes
     subtree_size: varint,               // 1-3 bytes
     tree_size: varint,                  // 1-3 bytes
-    tree_addr: Vec<u8>,                 // 1 + len bytes
+    tree_addr: TreeAddr,                // nibble-packed: 1 + ⌈D/2⌉ bytes
     need_pubkey: bool,                  // 1 byte
     pubkey: Option<PublicKey>,          // 0 or 32 bytes
     child_prefix_len: u8,               // 1 byte
     children: Vec<(prefix, varint)>,    // variable
     signature: Signature,               // 65 bytes (1 algorithm + 64 sig)
 }
+
+// TreeAddr: nibble-packed path from root. Each level uses 4 bits (0-15 for child index).
+// Wire format: 1 byte depth + ⌈depth/2⌉ bytes of nibbles (high nibble first).
+// Example: depth 5, path [3,7,2,15,1] → 0x05 0x37 0x2F 0x10 (last nibble padded with 0)
+//
+// Validation requirements:
+// - For odd depths, the low nibble of the final byte MUST be 0x0
+// - Exactly ⌈depth/2⌉ nibble bytes MUST follow the depth byte
+// - Messages violating these requirements MUST be rejected
+// - depth=0 (root) is encoded as just 0x00 with zero additional bytes
 
 // Signature covers ALL fields (domain-separated):
 // "PULSE:" || node_id || parent_id || root_id || subtree_size || tree_size ||
@@ -98,8 +108,15 @@ The protocol limits nodes to `MAX_CHILDREN = 16` to ensure Pulse messages fit wi
 ### Node State
 
 ```rust
+// Protocol limits (theoretical maximums)
+const MAX_TREE_DEPTH: usize = 127;     // TTL 255 / 2 for round-trip routing
+const MAX_CHILDREN: usize = 16;        // 4-bit nibble encoding limit
+
+// MTU is transport-dependent (LoRa: 255, BLE: 252, etc.)
+// All message builders MUST check result size against transport.mtu() and return
+// an error if exceeded. This naturally limits practical depth based on message type.
+
 // Memory bounds for embedded systems
-const MAX_CHILDREN: usize = 16;        // limits Pulse size to fit MTU
 const MAX_NEIGHBORS: usize = 128;      // for congested environments; ~5KB
 const MAX_PUBKEY_CACHE: usize = 128;   // LRU eviction
 const MAX_LOCATION_STORE: usize = 256; // bounded by keyspace fraction
@@ -188,6 +205,24 @@ When node N boots and discovers neighbor P (in a tree with 500 nodes):
 - It has `children.len() >= MAX_CHILDREN` (parent is full)
 - It is in the distrusted set
 - Its tree_size is smaller than N's current tree
+
+**Parent selection priority** (among valid candidates):
+1. **Good enough signal strength** — reliability first; skip neighbors with poor signal
+2. **Shortest tree address** — minimizes routing hops; keeps trees wide and shallow
+3. **Fewest children** — leaves room for other nodes to join
+
+This prioritization naturally produces wide, shallow trees. Deep chains are discouraged because nodes prefer shorter addresses. This matters because message size grows with depth (nibble-packed addresses), and MTU limits will cause errors for very deep nodes.
+
+**Practical depth limits for LoRa (MTU=255):**
+
+| Message Type | Overhead Formula | Max Depth |
+|--------------|------------------|-----------|
+| PUBLISH | 170 + D bytes | ~85 |
+| LOOKUP | 103 + D bytes | ~152 |
+| FOUND | 186 + D bytes | **~69** |
+| DATA (empty) | 103 + D bytes | ~152 |
+
+FOUND is the limiting case because it includes both `dest_node_id` (Some, 17 bytes) and the location payload (tree_addr + seq + signature). A node at depth 69 can participate fully; deeper nodes may fail to receive lookup responses. In practice, trees rarely exceed depth 20-30 even in large networks.
 
 **Implicit rejection:** When a node claims a parent (by setting `parent_id` in its Pulse), the parent decides whether to accept by including the child in its `children` list. A parent silently ignores a child if:
 - It already has `MAX_CHILDREN` children
@@ -627,18 +662,35 @@ Unicast messages use tree addresses for routing:
 
 ```rust
 struct Routed {
-    dest_addr: Vec<u8>,             // tree address for routing
+    dest_addr: TreeAddr,            // nibble-packed tree address (4 bits per level)
     dest_node_id: Option<NodeId>,   // Some(id) for specific node, None for keyspace
-    src_addr: Vec<u8>,              // for replies
+    src_addr: Option<TreeAddr>,     // for replies; None if no response expected
     src_node_id: NodeId,            // sender identity
-    msg_type: u8,                   // message type
+    msg_type: u8,                   // message type (0-3)
     ttl: u8,                        // hop limit, decremented at each hop
     payload: Vec<u8>,               // type-specific content
     signature: Signature,           // Ed25519 signature (see below)
 }
 
+// Tree addresses are nibble-packed: 4 bits per level, 2 levels per byte.
+// Depth D uses ⌈D/2⌉ bytes. This enables deeper trees within MTU limits.
+
+// msg_type values: 0=PUBLISH, 1=LOOKUP, 2=FOUND, 3=DATA
+// Messages with undefined msg_type (4-255) MUST be dropped silently (future extensions)
+
+// src_addr is optional:
+// - PUBLISH: None (no response expected)
+// - LOOKUP: Some (FOUND needs to route back); MUST drop if None
+// - FOUND: None (no further response)
+// - DATA: application-dependent
+
 // Signature covers all fields EXCEPT ttl (forwarders must decrement it):
 // "ROUTE:" || dest_addr || dest_node_id || src_addr || src_node_id || msg_type || payload
+
+fn routed_sign_data(msg: &Routed) -> Vec<u8> {
+    encode(b"ROUTE:", &msg.dest_addr, &msg.dest_node_id,
+           &msg.src_addr, &msg.src_node_id, msg.msg_type, &msg.payload)
+}
 ```
 
 The signature covers all fields except `ttl` to prevent:
@@ -658,7 +710,7 @@ The `dest_node_id` field distinguishes:
 Messages route up to a common ancestor, then down to the destination:
 
 ```rust
-const DEFAULT_TTL: u8 = 64;  // max hops, ~10x expected tree depth
+const DEFAULT_TTL: u8 = 255;  // max hops; theoretical max depth 127
 
 impl Node {
     fn route(&mut self, mut msg: Routed) {
@@ -730,7 +782,7 @@ The keyspace is `[0, 2³²)`. Each node owns a range proportional to its subtree
 
 ```
 Root has range [0, 2³²), subtree_size=200
-Children (sorted by node_id): A (100), B (50), C (50)
+Children (sorted by prefix): A (100), B (50), C (50)
 
 Assigned:
   A: [0, 2³¹)           // 50% → tree_addr [0]
@@ -738,13 +790,67 @@ Assigned:
   C: [3×2³⁰, 2³²)       // 25% → tree_addr [2]
 ```
 
+**Keyspace range calculation** (precise algorithm with integer math):
+
+```rust
+/// Calculate the keyspace range [start, end) owned by a node at the given tree address.
+/// Uses u64 intermediate values to avoid overflow when multiplying u32 × u32.
+fn range_for_addr(
+    addr: &[u8],                           // tree address (nibbles)
+    children_at_level: &[Vec<(u8, u32)>],  // children list at each level: (prefix, subtree_size)
+) -> (u32, u32) {
+    let mut start: u64 = 0;
+    let mut range_size: u64 = 1 << 32;  // 2³²
+
+    for (level, &child_index) in addr.iter().enumerate() {
+        let children = &children_at_level[level];
+        let total_subtree: u64 = children.iter().map(|(_, s)| *s as u64).sum();
+
+        // Find our position among siblings (sorted by prefix)
+        let mut offset: u64 = 0;
+        for (i, &(prefix, subtree_size)) in children.iter().enumerate() {
+            if prefix == child_index {
+                // This is us - calculate our range
+                let my_fraction = (range_size * subtree_size as u64) / total_subtree;
+                start += offset;
+                range_size = my_fraction;
+                break;
+            }
+            // Accumulate offset for siblings before us
+            offset += (range_size * subtree_size as u64) / total_subtree;
+        }
+    }
+
+    (start as u32, (start + range_size) as u32)
+}
+
+/// Check if this node owns the given key (for storage decisions)
+fn owns_key(&self, key: u32) -> bool {
+    let (start, end) = self.my_range();
+    if start <= end {
+        key >= start && key < end
+    } else {
+        // Range wraps around 2³² (only possible for root)
+        key >= start || key < end
+    }
+}
+```
+
+**Important precision notes:**
+- Use u64 for intermediate calculations to avoid overflow (u32 × u32 can exceed u32)
+- Division truncates, so the sum of children's ranges may be slightly less than parent's range
+- The "leftover" keyspace (due to truncation) goes to the parent node itself
+- Children are always sorted by prefix for consistent range assignment across all nodes
+
 To find which tree address owns a key:
 
 ```rust
 impl Node {
     fn addr_for_key(&self, key: u32) -> Vec<u8> {
         // Walk down from root, narrowing range at each level
-        // based on child ordinal and subtree sizes
+        // At each level: find which child's range contains the key
+        // Append that child's prefix to the address
+        // Stop when we reach a leaf or the key falls in "leftover" space
     }
 }
 ```
@@ -756,12 +862,14 @@ The directory stores node locations (`node_id → tree_addr`). Each entry is sig
 ```rust
 struct LocationEntry {
     node_id: NodeId,
-    tree_addr: Vec<u8>,
-    seq: u64,                   // monotonic sequence number
+    tree_addr: TreeAddr,        // nibble-packed
+    seq: varint,                // monotonic sequence number (1-5 bytes)
     signature: Signature,       // sign("LOC:" || node_id || tree_addr || seq)
     received_at: Instant,       // local timestamp for expiry
 }
 ```
+
+**Varint encoding:** All varint fields (seq, subtree_size, tree_size) use LEB128 encoding. Implementations MUST use canonical (minimal) encoding: the shortest byte sequence that represents the value. Non-minimal encodings (e.g., `0x80 0x00` for 0 instead of `0x00`) MUST be rejected during decoding to prevent signature ambiguity attacks. Standard libraries like `integer-encoding` or `postcard` handle this correctly.
 
 The signature includes a sequence number for replay protection. Storage nodes reject entries with `seq <= current_seq` for the same node_id. The `"LOC:"` prefix provides domain separation (prevents signature reuse across message types).
 
@@ -818,13 +926,27 @@ impl Node {
 }
 ```
 
-**PUBLISH payload:** `tree_addr || seq || location_signature`
+**PUBLISH payload:** `owner_node_id (16) || tree_addr (1+⌈D/2⌉) || seq (varint, 1-5) || location_signature (65)`
 
-The storage node validates:
-1. Key falls in my range
-2. Signature is valid (covers `"LOC:" || node_id || tree_addr || seq`)
-3. `seq > existing_seq` for this node_id (replay protection)
-4. Entry hasn't expired
+Typical size: 83 + ⌈D/2⌉ to 87 + ⌈D/2⌉ bytes (seq usually 1-2 bytes at normal publish rates).
+
+The `owner_node_id` is included explicitly (not inferred from Routed `src_node_id`) so that:
+- Forwarders can re-publish entries during keyspace rebalancing with their own Routed signature
+- Receivers can always verify the location signature against the correct owner
+
+**Routing behavior:** Routed messages are forwarded as-is during normal routing (only TTL decremented). For keyspace rebalancing, a node creates a new Routed message (signed with their own key) containing the original PUBLISH payload.
+
+**PUBLISH verification order** (storage node receiving a PUBLISH):
+1. Verify Routed signature against `src_node_id` (authenticates sender)
+   - If pubkey not cached: queue message, request via next Pulse (need_pubkey)
+2. Parse PUBLISH payload to extract `owner_node_id`, `tree_addr`, `seq`, `location_signature`
+3. Verify location signature against `owner_node_id` (covers `"LOC:" || owner_node_id || tree_addr || seq`)
+   - If pubkey not cached: queue message, request via next Pulse (need_pubkey)
+4. Verify keyspace ownership: at least one of `hash(owner_node_id || 0)`, `hash(owner_node_id || 1)`, `hash(owner_node_id || 2)` falls in my range
+5. Verify `seq > existing_seq` for this `owner_node_id` (replay protection)
+6. Store entry with current timestamp for expiry tracking
+
+**Pubkey queue:** Messages awaiting pubkey verification are held in a small bounded queue (e.g., 16 entries). When a pubkey arrives via Pulse, queued messages for that node_id are re-processed. When the queue is full, oldest entries are evicted. This reduces retransmission overhead.
 
 ### Lookup (LOOKUP / FOUND)
 
@@ -890,7 +1012,7 @@ impl Node {
 
 **LOOKUP payload:** `target_node_id` (16 bytes)
 
-**FOUND payload:** `target_node_id || tree_addr || seq || location_signature`
+**FOUND payload:** `target_node_id (16) || tree_addr (1+⌈D/2⌉) || seq (varint, 1-5) || location_signature (65)`
 
 **Lookup process:**
 1. Send LOOKUP to replica 0
@@ -1047,11 +1169,11 @@ impl Node {
 | Field | Size |
 |-------|------|
 | node_id | 16 |
-| parent_id | 17 |
+| parent_id | 1 or 17 |
 | root_id | 16 |
-| subtree_size | 1-3 |
-| tree_size | 1-3 |
-| tree_addr | 1+len |
+| subtree_size | 1-3 (varint) |
+| tree_size | 1-3 (varint) |
+| tree_addr | 1 + ⌈D/2⌉ (nibble-packed) |
 | need_pubkey | 1 |
 | pubkey | 0 or 32 |
 | child_prefix_len | 1 |
@@ -1062,27 +1184,27 @@ impl Node {
 
 | Field | Size |
 |-------|------|
-| dest_addr | 1+len |
-| dest_node_id | 0 or 17 |
-| src_addr | 1+len |
+| dest_addr | 1 + ⌈D/2⌉ (nibble-packed) |
+| dest_node_id | 1 or 17 |
+| src_addr | 1 or 1 + ⌈D/2⌉ (optional, nibble-packed) |
 | src_node_id | 16 |
 | msg_type | 1 |
 | ttl | 1 |
 | payload | variable |
 | signature | 65 |
 
-*Signature is 65 bytes: 1 byte algorithm identifier + 64 bytes Ed25519 signature.*
+*Tree addresses are nibble-packed: 1 byte depth + ⌈depth/2⌉ bytes of nibbles. Signature is 65 bytes: 1 byte algorithm + 64 bytes Ed25519.*
 
 **Message types:**
 
 | Type | Value | dest_node_id | Payload |
 |------|-------|--------------|---------|
-| PUBLISH | 0x01 | None | tree_addr, seq, location_signature |
-| LOOKUP | 0x02 | None | target_node_id |
-| FOUND | 0x03 | Some | target_node_id, tree_addr, seq, location_signature |
-| DATA | 0x10 | Some | application data |
+| PUBLISH | 0 | None | owner_node_id, tree_addr, seq (varint), location_signature |
+| LOOKUP | 1 | None | target_node_id |
+| FOUND | 2 | Some | target_node_id, tree_addr, seq (varint), location_signature |
+| DATA | 3 | Some | application data |
 
-*Location signature covers `"LOC:" || node_id || tree_addr || seq`. Routed signature covers all fields except ttl.*
+*Location signature covers `"LOC:" || owner_node_id || tree_addr || seq`. Routed signature covers all fields except ttl. src_addr is None for PUBLISH and FOUND (no response expected).*
 
 ### Bandwidth
 

@@ -421,6 +421,10 @@ pub trait Random {
 pub type NodeId = [u8; 16];
 pub type PublicKey = [u8; 32];
 pub type SecretKey = [u8; 32];  // Ed25519 seed
+
+/// Nibble-packed tree address: depth + ⌈depth/2⌉ bytes of nibbles
+/// Each level uses 4 bits (0-15 for child index), high nibble first.
+/// For odd depths, last nibble must be 0.
 pub type TreeAddr = Vec<u8>;
 
 pub struct Signature {
@@ -434,7 +438,7 @@ pub struct Pulse {
     pub root_id: NodeId,
     pub subtree_size: u32,
     pub tree_size: u32,
-    pub tree_addr: TreeAddr,
+    pub tree_addr: TreeAddr,       // nibble-packed
     pub need_pubkey: bool,
     pub pubkey: Option<PublicKey>,
     pub child_prefix_len: u8,
@@ -443,9 +447,9 @@ pub struct Pulse {
 }
 
 pub struct Routed {
-    pub dest_addr: TreeAddr,
+    pub dest_addr: TreeAddr,           // nibble-packed
     pub dest_node_id: Option<NodeId>,
-    pub src_addr: TreeAddr,
+    pub src_addr: Option<TreeAddr>,    // optional; None for PUBLISH/FOUND
     pub src_node_id: NodeId,
     pub msg_type: u8,
     pub ttl: u8,
@@ -453,11 +457,48 @@ pub struct Routed {
     pub signature: Signature,
 }
 
-// Message types
-pub const MSG_PUBLISH: u8 = 0x01;
-pub const MSG_LOOKUP: u8 = 0x02;
-pub const MSG_FOUND: u8 = 0x03;
-pub const MSG_DATA: u8 = 0x10;
+// Message types (0-3; undefined values 4-255 must be dropped)
+pub const MSG_PUBLISH: u8 = 0;
+pub const MSG_LOOKUP: u8 = 1;
+pub const MSG_FOUND: u8 = 2;
+pub const MSG_DATA: u8 = 3;
+
+// --- Supporting types for Node state ---
+
+pub struct LocationEntry {
+    pub node_id: NodeId,
+    pub tree_addr: TreeAddr,        // nibble-packed
+    pub seq: u32,                   // monotonic sequence number
+    pub signature: Signature,       // covers "LOC:" || node_id || tree_addr || seq
+    pub received_at: Instant,       // local timestamp for expiry
+}
+
+pub struct NeighborTiming {
+    pub last_seen: Instant,
+    pub observed_interval: Option<u32>,  // milliseconds between pulses
+}
+
+pub struct PendingLookup {
+    pub replica_index: u8,
+    pub started_secs: u64,
+}
+
+pub struct PendingRequest {
+    pub dest_addr: TreeAddr,
+    pub payload: Vec<u8>,
+    pub started_secs: u64,
+}
+
+pub struct JoinContext {
+    pub candidate_parent: NodeId,
+    pub pulses_waited: u8,
+}
+
+pub struct FraudDetection {
+    pub publish_count: u32,
+    pub count_start_secs: u64,
+    pub subtree_size_at_start: u32,
+}
 ```
 
 ## Node State (`node.rs`)
@@ -603,7 +644,8 @@ pub enum Event {
 ## Wire Format (`wire.rs`)
 
 Binary serialization for embedded efficiency:
-- Varints for sizes (1-3 bytes)
+- Varints for sizes (1-5 bytes) using `tiny-varint` (canonical encoding required)
+- Nibble-packed tree addresses (4 bits per level)
 - Length-prefixed vectors
 - Optional fields encoded with presence byte
 
@@ -653,21 +695,14 @@ impl<'a> Reader<'a> {
         Ok(slice)
     }
 
+    // Use tiny-varint for canonical decoding (rejects non-minimal encodings)
     pub fn read_varint(&mut self) -> Result<u32, DecodeError> {
-        // Standard varint decoding (1-5 bytes for u32)
-        let mut result: u32 = 0;
-        let mut shift = 0;
-        loop {
-            let byte = self.read_u8()?;
-            result |= ((byte & 0x7F) as u32) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(result);
-            }
-            shift += 7;
-            if shift >= 35 {
-                return Err(DecodeError::InvalidVarint);
-            }
-        }
+        tiny_varint::VarInt::decode(&self.buf[self.pos..])
+            .map(|(value, bytes_read)| {
+                self.pos += bytes_read;
+                value
+            })
+            .map_err(|_| DecodeError::InvalidVarint)
     }
 
     /// Read length-prefixed bytes (returns reference, no allocation)
@@ -675,36 +710,65 @@ impl<'a> Reader<'a> {
         let len = self.read_varint()? as usize;
         self.read_bytes(len)
     }
+
+    /// Read nibble-packed tree address into Vec
+    pub fn read_tree_addr(&mut self) -> Result<Vec<u8>, DecodeError> {
+        let depth = self.read_u8()? as usize;
+        let byte_len = (depth + 1) / 2;
+        let nibble_bytes = self.read_bytes(byte_len)?;
+
+        let mut addr = Vec::with_capacity(depth);
+        for i in 0..depth {
+            let byte = nibble_bytes[i / 2];
+            let nibble = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
+            addr.push(nibble);
+        }
+
+        // Validate: for odd depth, last nibble (low nibble of last byte) must be 0
+        if depth % 2 == 1 && (nibble_bytes[byte_len - 1] & 0x0F) != 0 {
+            return Err(DecodeError::InvalidLength);  // Could use a more specific error
+        }
+
+        Ok(addr)
+    }
 }
 
 /// Writer for encoding
 pub struct Writer {
-    #[cfg(feature = "alloc")]
-    buf: alloc::vec::Vec<u8>,
-    #[cfg(not(feature = "alloc"))]
-    buf: heapless::Vec<u8, MAX_PACKET_SIZE>,
+    buf: Vec<u8>,
 }
 
 impl Writer {
     pub fn new() -> Self {
-        Self { buf: Default::default() }
+        Self { buf: Vec::new() }
     }
 
-    pub fn write_u8(&mut self, v: u8) { self.buf.push(v).ok(); }
-    pub fn write_bytes(&mut self, v: &[u8]) { self.buf.extend_from_slice(v).ok(); }
-    pub fn write_varint(&mut self, mut v: u32) {
-        while v >= 0x80 {
-            self.buf.push((v as u8) | 0x80).ok();
-            v >>= 7;
-        }
-        self.buf.push(v as u8).ok();
+    pub fn write_u8(&mut self, v: u8) { self.buf.push(v); }
+    pub fn write_bytes(&mut self, v: &[u8]) { self.buf.extend_from_slice(v); }
+
+    // Use tiny-varint for canonical encoding
+    pub fn write_varint(&mut self, v: u32) {
+        tiny_varint::VarInt::encode(v, &mut self.buf);
     }
+
     pub fn write_len_prefixed(&mut self, v: &[u8]) {
         self.write_varint(v.len() as u32);
         self.write_bytes(v);
     }
 
-    pub fn finish(self) -> impl AsRef<[u8]> { self.buf }
+    /// Write nibble-packed tree address
+    pub fn write_tree_addr(&mut self, addr: &[u8]) {
+        let depth = addr.len();
+        self.write_u8(depth as u8);
+        for i in (0..depth).step_by(2) {
+            let high = addr[i];
+            let low = if i + 1 < depth { addr[i + 1] } else { 0 };
+            self.write_u8((high << 4) | low);
+        }
+    }
+
+    pub fn finish(self) -> Vec<u8> { self.buf }
+    pub fn len(&self) -> usize { self.buf.len() }
 }
 
 pub trait Encode {
@@ -727,7 +791,11 @@ pub trait Decode<'a>: Sized {
 3. **traits.rs** - Transport, Crypto, Random traits
 4. **node.rs** - Node struct with basic initialization
 5. **tree.rs** - Pulse handling, tree formation, merging, parent selection
-   - Parent selection must skip neighbors with `children.len() >= MAX_CHILDREN`
+   - **Parent selection priority** (among valid candidates):
+     1. Good enough signal strength (skip neighbors with poor RSSI)
+     2. Shortest tree address (minimizes routing hops)
+     3. Fewest children (leaves room for others)
+   - Skip neighbors with `children.len() >= MAX_CHILDREN` or in distrusted set
    - Parent ignores (doesn't add to children list) a child if:
      - Already at `MAX_CHILDREN`
      - Adding child would cause Pulse to exceed transport MTU
@@ -735,7 +803,18 @@ pub trait Decode<'a>: Sized {
      children list after 3 Pulses, tries another neighbor
    - This ensures Pulse messages always fit within MTU
 6. **routing.rs** - Routing algorithm, keyspace calculations
+   - Use u64 intermediate values for keyspace range calculations to avoid overflow
+   - Children sorted by prefix for consistent range assignment
+   - `addr_for_key()` walks down from root narrowing range at each level
 7. **dht.rs** - PUBLISH/LOOKUP/FOUND handling
+   - **PUBLISH verification order** (6 steps):
+     1. Verify Routed signature against src_node_id (queue if pubkey not cached)
+     2. Parse PUBLISH payload: owner_node_id, tree_addr, seq, location_signature
+     3. Verify location signature against owner_node_id (queue if pubkey not cached)
+     4. Verify keyspace ownership (any of 3 replica keys in my range)
+     5. Verify seq > existing_seq for replay protection
+     6. Store entry with timestamp
+   - Pubkey queue: bounded (MAX_PENDING_PUBKEY=16), oldest eviction
 8. **fraud.rs** - Tree size verification
 9. **lib.rs** - Public exports
 
@@ -745,69 +824,52 @@ pub trait Decode<'a>: Sized {
 
 ```toml
 [dependencies]
-embassy-futures = "0.1"    # Async combinators (select, join)
-embassy-time = "0.3"       # Timer, Instant, Duration
-embassy-sync = "0.6"       # Async channels and signals
-heapless = "0.8"           # Static collections for no_std
+# Varint encoding - zero dependencies, no_std, canonical encoding
+tiny-varint = "0.1"
 
 [dev-dependencies]
 ed25519-dalek = "2"        # For default crypto impl in tests
 sha2 = "0.10"              # For default hash impl in tests
 rand = "0.8"               # For default random impl in tests
-tokio = { version = "1", features = ["rt", "macros"] }  # Async runtime for tests
+tokio = { version = "1", features = ["rt", "macros", "time"] }  # Async runtime for tests
 ```
+
+**Varint library choice:** `tiny-varint` is recommended:
+- Zero dependencies (dependency-free)
+- no_std compatible, no dynamic allocation required
+- High-performance with optimized critical paths
+- Ideal for embedded/resource-constrained environments
+
+**IMPORTANT:** Verify tiny-varint rejects non-canonical varints during decode (not just produces canonical on encode). Per design.md, non-minimal encodings MUST be rejected. If tiny-varint doesn't reject, add explicit validation after decode or use a different library.
 
 Optional feature flags:
 ```toml
 [features]
 default = []
-std = ["heapless/std"]
-alloc = []                 # Enable alloc-based collections (Vec, HashMap)
 default-crypto = ["ed25519-dalek", "sha2"]
 ```
 
-**Note:** Embassy-time works on both embedded (HAL backends) and std (using tokio).
+## Constants
 
-## Allocation Strategy
-
-The library supports two allocation modes via feature flags:
-
-**Default (no features): Static allocation with `heapless`**
-- All collections use fixed-capacity `heapless` types
-- Works on bare-metal with no allocator
-- Maximum portability (Cortex-M0+, 16KB+ RAM)
-
-**With `alloc` feature: Dynamic allocation**
-- Uses `Vec`, `HashMap` from `alloc` crate
-- More flexible sizing, simpler APIs
-- Requires global allocator (fine for nRF52840, ESP32, STM32F4+)
-
+Protocol limits (theoretical maximums):
 ```rust
-// In types.rs
-#[cfg(not(feature = "alloc"))]
-pub type TreeAddr = heapless::Vec<u8, MAX_TREE_DEPTH>;
-
-#[cfg(feature = "alloc")]
-pub type TreeAddr = alloc::vec::Vec<u8>;
-
-#[cfg(not(feature = "alloc"))]
-pub type ChildMap = heapless::FnvIndexMap<NodeId, u32, MAX_CHILDREN>;
-
-#[cfg(feature = "alloc")]
-pub type ChildMap = alloc::collections::BTreeMap<NodeId, u32>;
+const MAX_TREE_DEPTH: usize = 127;     // TTL 255 / 2 for round-trip routing
+const MAX_CHILDREN: usize = 16;        // 4-bit nibble encoding limit
+const DEFAULT_TTL: u8 = 255;           // Max hops
 ```
 
-**Memory bounds (heapless mode):**
+Memory bounds (implementation limits):
 ```rust
-const MAX_TREE_DEPTH: usize = 32;      // Supports trees up to 16^32 nodes
-const MAX_CHILDREN: usize = 16;        // Per design spec
 const MAX_NEIGHBORS: usize = 128;
 const MAX_PUBKEY_CACHE: usize = 128;
 const MAX_LOCATION_STORE: usize = 256;
 const MAX_LOCATION_CACHE: usize = 64;
 const MAX_PENDING_LOOKUPS: usize = 16;
+const MAX_PENDING_PUBKEY: usize = 16;  // Messages awaiting pubkey verification
 const MAX_DISTRUSTED: usize = 64;
 ```
+
+**MTU enforcement:** All message builders MUST check result size against `transport.mtu()` and return an error if exceeded. This naturally limits practical depth based on message type and transport.
 
 ## Testing Strategy
 
@@ -815,36 +877,42 @@ const MAX_DISTRUSTED: usize = 64;
 2. **Integration tests** with in-memory transport simulating multiple nodes
 3. **Property tests** for wire format (encode/decode roundtrip)
 
-Example test transport (uses channel for async simulation):
+Example test transport (uses queues for simulation):
 ```rust
-use embassy_sync::channel::{Channel, Receiver, Sender};
+use std::collections::VecDeque;
 
-struct TestTransport {
-    tx_channel: Sender<'static, CriticalSectionRawMutex, Vec<u8>, 16>,
-    rx_channel: Receiver<'static, CriticalSectionRawMutex, (Vec<u8>, Option<i16>), 16>,
+struct MockTransport {
+    mtu: usize,
+    rx_queue: VecDeque<(Vec<u8>, Option<i16>)>,
+    tx_log: Vec<Vec<u8>>,
 }
 
-impl Transport for TestTransport {
-    type Error = Infallible;
+#[derive(Debug)]
+struct MockTransportError;
 
-    fn mtu(&self) -> usize { 255 }
+impl Transport for MockTransport {
+    type Error = MockTransportError;
+
+    fn mtu(&self) -> usize { self.mtu }
 
     fn bw(&self) -> Option<u32> {
         Some(38)  // Simulate LoRa SF8 @ 10% duty cycle
     }
 
     async fn tx(&mut self, data: &[u8]) -> Result<(), Self::Error> {
-        self.tx_channel.send(data.to_vec()).await;
+        self.tx_log.push(data.to_vec());
         Ok(())
     }
 
     async fn rx(&mut self) -> (Vec<u8>, Option<i16>) {
-        self.rx_channel.receive().await
+        // In tests, we can poll until data is available
+        // Real impl would use async waker
+        self.rx_queue.pop_front().unwrap_or((vec![], None))
     }
 }
 ```
 
-Test harness connects multiple nodes by routing tx_channel outputs to other nodes' rx_channels.
+Test harness connects multiple nodes by routing tx_log outputs to other nodes' rx_queues.
 
 ## Verification
 
