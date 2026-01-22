@@ -300,17 +300,29 @@ N is root of its own single-node tree.
 
 ### Joining an Existing Tree
 
-When node N boots and discovers neighbor P (in a tree with 500 nodes):
+When node N boots, it has no parent and no children. It enters a **discovery phase** to find the best parent:
 
-**Parent selection:** N evaluates all neighbors as potential parents. A neighbor is skipped if:
+**Discovery phase:**
+1. N sends its first Pulse (as root of single-node tree)
+2. N starts a discovery timer (3τ) to collect neighbor Pulses
+3. When timer fires, N evaluates all discovered neighbors
+
+**Candidate filtering:** A neighbor is skipped if:
 - It has `children.len() >= MAX_CHILDREN` (parent is full)
 - It is in the distrusted set
-- Its tree_size is smaller than N's current tree
 
-**Parent selection priority** (among valid candidates):
-1. **Good enough signal strength** — reliability first; skip neighbors with poor signal
-2. **Shortest tree address** — minimizes routing hops; keeps trees wide and shallow
-3. **Fewest children** — leaves room for other nodes to join
+**Parent selection algorithm:**
+1. **Pick the best tree** — if multiple root_ids visible, choose largest tree_size (tie-break: lowest root_id). This makes N a bridge that triggers tree merging.
+2. **Filter by signal strength** — if 3+ candidates and RSSI data available, remove bottom 50% by RSSI. This ensures reliable parent links. Skip this step for non-radio transports (e.g., UDP) or when fewer than 3 candidates.
+3. **Pick shallowest** — from remaining candidates, choose shortest tree_addr (tie-break: best RSSI, or arbitrary if no RSSI). This keeps trees wide and shallow.
+
+If no valid candidates remain after filtering, N stays root of its single-node tree and will join via normal merge when it hears a larger tree.
+
+**After joining:** Once N has a parent, it only switches parent when:
+- **Merge** — N sees a better tree (larger tree_size, or equal size with lower root_id)
+- **Parent timeout** — after 8 missed Pulses, N becomes root of its own subtree (see "Partition and Reconnection")
+
+There is no "parent shopping" after joining. This provides stability while still allowing trees to merge and recover from partitions.
 
 This prioritization naturally produces wide, shallow trees. Deep chains are discouraged because nodes prefer shorter addresses. This matters because message size grows with depth (nibble-packed addresses), and MTU limits will cause errors for very deep nodes.
 
