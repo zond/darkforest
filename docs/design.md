@@ -582,14 +582,15 @@ struct JoinContext {
 }
 
 struct FraudDetection {
-    publish_count: u32,
+    unique_publishers: HashSet<NodeId>,  // count unique nodes, not total messages
     count_start: Instant,
     subtree_size_at_start: u32,
 }
 
 fn on_publish_received(&mut self, msg: &Routed) {
     if self.is_storage_node_for(msg) {
-        self.fraud_detection.publish_count += 1;
+        // Count unique node_ids to prevent spoofing via repeated PUBLISH
+        self.fraud_detection.unique_publishers.insert(msg.src_node_id);
     }
 }
 
@@ -599,7 +600,7 @@ fn on_subtree_size_changed(&mut self) {
     let new = self.subtree_size;
     if new > old * 2 || new < old / 2 {
         self.fraud_detection = FraudDetection {
-            publish_count: 0,
+            unique_publishers: HashSet::new(),
             count_start: Instant::now(),
             subtree_size_at_start: new,
         };
@@ -621,7 +622,7 @@ fn check_tree_size_fraud(&mut self) {
         return;
     }
 
-    let observed = fd.publish_count as f64;
+    let observed = fd.unique_publishers.len() as f64;
     let z = (expected - observed) / expected.sqrt();
 
     if z > FRAUD_Z_THRESHOLD {
@@ -635,7 +636,7 @@ fn check_tree_size_fraud(&mut self) {
 fn leave_and_rejoin(&mut self) {
     self.join_context = None;
     self.fraud_detection = FraudDetection {
-        publish_count: 0,
+        unique_publishers: HashSet::new(),
         count_start: Instant::now(),
         subtree_size_at_start: self.subtree_size,
     };
@@ -685,8 +686,15 @@ fn on_pulse_from_potential_parent(&mut self, pulse: &Pulse) {
 - **Subtree size resets:** When subtree_size changes significantly (2× either way), counters reset, delaying detection.
 
 **Sybil attacks:**
-- **PUBLISH spoofing:** Attacker can generate fake PUBLISH by grinding keypairs until `hash(node_id || replica)` lands in victim's keyspace. Cost: ~`tree_size/(3×S)` keypairs per fake message. For S=10 in 1000-node tree: ~33 keypairs per fake PUBLISH. Sustaining fraud indefinitely requires ongoing computation.
+- **PUBLISH spoofing:** Attacker can generate fake PUBLISH by grinding keypairs until `hash(node_id || replica)` lands in victim's keyspace. Cost: ~`tree_size/(3×S)` keypairs per fake message. For S=10 in 1000-node tree: ~33 keypairs per fake PUBLISH. Since we count *unique* node_ids (not total messages), each fake PUBLISH requires a fresh keypair. Sustaining fraud indefinitely requires ongoing computation proportional to network size.
 - **Identity rotation:** After being distrusted, attacker generates new keypair and rejoins. The distrust mechanism provides temporary relief only. Possible mitigation: progressive backoff (after N frauds in time T, become more conservative about joining any tree).
+
+**Controlled merge attack:**
+- An attacker operates a small "tree" (possibly just themselves) claiming an inflated `tree_size`
+- When a legitimate node comes in radio range, it sees the attacker's larger claimed size and joins
+- The attacker now controls routing for the victim's subtree until fraud detection triggers
+- **Temporary win:** The attacker intercepts traffic for several hours before detection
+- **Mitigation:** Fraud detection limits the attack duration. For high-security deployments, consider requiring multiple consistent Pulses before merge (merge hysteresis), though this slows legitimate merges.
 
 **Fundamental limits:**
 - **Distrust is local:** Each node detects fraud independently. No gossip (to avoid false-accusation amplification attacks).
@@ -852,7 +860,7 @@ struct Routed {
     dest_hash: Option<[u8; 4]>,     // truncated hash(node_id) for recipient verification
     src_addr: Option<u32>,          // sender's keyspace address for replies
     src_node_id: NodeId,            // sender identity
-    src_pubkey: PublicKey,          // sender's public key (for signature verification)
+    src_pubkey: Option<PublicKey>,  // sender's public key (optional, for signature verification)
     ttl: u8,                        // hop limit, decremented at each hop
     payload: Vec<u8>,               // type-specific content
     signature: Signature,           // Ed25519 signature (see below)
@@ -862,7 +870,8 @@ struct Routed {
 // - bits 0-3: msg_type (0-15)
 // - bit 4: has_dest_hash (1 = dest_hash present for recipient verification)
 // - bit 5: has_src_addr (1 = src_addr present for replies)
-// - bits 6-7: reserved (must be 0)
+// - bit 6: has_src_pubkey (1 = src_pubkey present for signature verification)
+// - bit 7: reserved (must be 0)
 
 // msg_type values: 0=PUBLISH, 1=LOOKUP, 2=FOUND, 3=DATA, 4=ACK
 // Messages with undefined msg_type MUST be dropped silently (future extensions)
@@ -880,12 +889,15 @@ struct Routed {
 // src_pubkey enables signature verification for messages from far-away nodes
 // whose pubkey isn't cached from Pulses. Receivers MUST verify:
 //   src_node_id == hash(src_pubkey)[..16]
+// Include src_pubkey when: first message to a node, PUBLISH, LOOKUP, FOUND.
+// Omit src_pubkey when: established DATA exchange (receiver has cached pubkey).
+// If receiver lacks pubkey and message has none, drop message (sender retries with pubkey).
 
 // Typical flag combinations:
-// - PUBLISH: has_dest_hash=0, has_src_addr=1 (src_addr carries our location)
-// - LOOKUP:  has_dest_hash=1, has_src_addr=1 (dest_hash identifies target, src_addr for reply)
-// - FOUND:   has_dest_hash=1, has_src_addr=0 (no reply expected)
-// - DATA:    has_dest_hash=1, has_src_addr=0/1 (app decides)
+// - PUBLISH: has_dest_hash=0, has_src_addr=1, has_src_pubkey=1 (storage nodes need pubkey)
+// - LOOKUP:  has_dest_hash=1, has_src_addr=1, has_src_pubkey=1 (FOUND sender needs pubkey)
+// - FOUND:   has_dest_hash=1, has_src_addr=0, has_src_pubkey=0 (requester has target's pubkey)
+// - DATA:    has_dest_hash=1, has_src_addr=0/1, has_src_pubkey=0/1 (app decides)
 
 // Signature covers all fields EXCEPT ttl (forwarders must decrement it):
 // "ROUTE:" || flags_and_type || dest_addr || dest_hash || src_addr || src_node_id || payload
@@ -1552,12 +1564,12 @@ Applications needing stronger guarantees should implement their own ack/retry at
 
 | Field | Size |
 |-------|------|
-| flags_and_type | 1 (bits 0-3: msg_type; bit 4: has_dest_hash; bit 5: has_src_addr) |
+| flags_and_type | 1 (bits 0-3: msg_type; bit 4: has_dest_hash; bit 5: has_src_addr; bit 6: has_src_pubkey) |
 | dest_addr | 4 (u32 keyspace location) |
 | dest_hash | 0 or 4 |
 | src_addr | 0 or 4 (u32 keyspace location) |
 | src_node_id | 16 |
-| src_pubkey | 32 |
+| src_pubkey | 0 or 32 |
 | ttl | 1 |
 | payload | variable |
 | signature | 65 |
@@ -1566,15 +1578,15 @@ Applications needing stronger guarantees should implement their own ack/retry at
 
 **Message types:**
 
-| Type | Value | dest_hash | src_addr | Payload |
-|------|-------|-----------|----------|---------|
-| PUBLISH | 0 | None | Some | replica_index (1), seq (varint) |
-| LOOKUP | 1 | Some | Some | replica_index (1) |
-| FOUND | 2 | Some | None | target_pubkey (32), keyspace_addr (4), seq (varint) |
-| DATA | 3 | Some | 0/1 | application data |
-| ACK | 4 | — | — | hash (8 bytes) |
+| Type | Value | dest_hash | src_addr | src_pubkey | Payload |
+|------|-------|-----------|----------|------------|---------|
+| PUBLISH | 0 | None | Some | Some | replica_index (1), seq (varint) |
+| LOOKUP | 1 | Some | Some | Some | replica_index (1) |
+| FOUND | 2 | Some | None | None | target_pubkey (32), keyspace_addr (4), seq (varint) |
+| DATA | 3 | Some | 0/1 | 0/1 | application data |
+| ACK | 4 | — | — | — | hash (8 bytes) |
 
-*Routed signature covers all fields except ttl. For PUBLISH, src_node_id is the owner, src_addr is their published location, and src_pubkey enables immediate signature verification.*
+*Routed signature covers all fields except ttl. For PUBLISH, src_node_id is the owner, src_addr is their published location, and src_pubkey enables immediate signature verification. For DATA, src_pubkey can be omitted after initial exchange (receiver has cached pubkey).*
 
 ### Bandwidth
 
