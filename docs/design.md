@@ -71,7 +71,7 @@ struct Pulse {
 // - bit 0: has_parent (if set, parent_hash is present)
 // - bit 1: need_pubkey (requesting pubkeys from neighbors)
 // - bit 2: has_pubkey (if set, pubkey field is present)
-// - bits 3-7: child_count (0-16, number of children)
+// - bits 3-7: child_count (0-12, number of children)
 //
 // Example: 5 children, has parent, includes pubkey → 0b00101_101 = 0x2D
 
@@ -120,7 +120,7 @@ A child finds its ordinal by computing `hash(own_node_id)[..4]` and counting how
 
 **Hash collision handling:**
 
-With 4-byte hashes, the probability of two children having the same hash is 1 in 2³² (~2.3 × 10⁻¹⁰). Even with 16 children (120 pairs), collision probability is ~2.8 × 10⁻⁸.
+With 4-byte hashes, the probability of two children having the same hash is 1 in 2³² (~2.3 × 10⁻¹⁰). Even with 12 children (66 pairs), collision probability is ~1.5 × 10⁻⁸.
 
 To prevent collisions:
 - **Parents** MUST NOT accept a child whose hash matches an existing child's hash
@@ -148,13 +148,14 @@ A Pulse serves multiple purposes:
 | Leaf (no pubkey) | ~98 bytes |
 | Leaf (with pubkey) | ~130 bytes |
 | 8 children + pubkey | ~175 bytes |
-| 16 children + pubkey | ~215 bytes |
+| 12 children + pubkey | ~205 bytes |
+| 12 children + pubkey (worst) | ~247 bytes |
 
-**Size formula:** `94 + has_parent×4 + has_pubkey×32 + children×5 + varint_overhead`
+**Size formula:** `94 + has_parent×4 + has_pubkey×32 + children×(4+varint) + varint_overhead`
 
-Base: 16 (node_id) + 1 (flags) + 4 (root_hash) + 2 (subtree_size) + 2 (tree_size) + 4 (keyspace_lo) + 4 (keyspace_hi) + 65 (signature) = 98 bytes. Subtract 4 for no parent = 94 bytes minimum.
+Base: 16 (node_id) + 1 (flags) + 4 (root_hash) + 2 (subtree_size) + 2 (tree_size) + 4 (keyspace_lo) + 4 (keyspace_hi) + 64 (signature) = 97 bytes. Subtract 4 for no parent ≈ 94 bytes minimum.
 
-**MTU constraints:** With 16 children and pubkey, Pulse is ~215 bytes, well within 255-byte LoRa MTU. Keyspace ranges are fixed size regardless of tree depth.
+**MTU constraints:** MAX_CHILDREN is set to 12 to guarantee worst-case Pulse (with pubkey and maximum varints) fits within 252 bytes, leaving headroom for any transport framing.
 
 ### Timing Model
 
@@ -260,7 +261,7 @@ For UDP (τ=0.1s): periodic join takes ~0.6-0.9s, proactive takes ~0.2-0.4s.
 ```rust
 // Protocol limits (theoretical maximums)
 const MAX_TREE_DEPTH: usize = 127;     // TTL 255 / 2 for round-trip routing
-const MAX_CHILDREN: usize = 16;        // 4-bit nibble encoding limit
+const MAX_CHILDREN: usize = 12;        // Guarantees worst-case Pulse fits in 252 bytes
 
 // MTU is transport-dependent (LoRa: 255, BLE: 252, etc.)
 // All message builders MUST check result size against transport.mtu() and return
