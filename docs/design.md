@@ -4,8 +4,8 @@ A protocol for building mesh networks over LoRa radios with O(log N) routing.
 
 **Key properties:**
 - Nodes form a spanning tree via periodic broadcasts
-- Tree addresses enable efficient routing without flooding
-- A distributed hash table maps node IDs to tree addresses
+- Keyspace addresses enable efficient routing without flooding
+- A distributed hash table maps node IDs to keyspace addresses
 - Ed25519 signatures prevent impersonation
 - No clock synchronization required
 
@@ -55,37 +55,83 @@ Nodes broadcast periodic **Pulse** messages to maintain the tree:
 ```rust
 struct Pulse {
     node_id: NodeId,                    // 16 bytes
-    parent_id: Option<NodeId>,          // 17 bytes (1 + 16)
-    root_id: NodeId,                    // 16 bytes
+    flags: u8,                          // 1 byte (see layout below)
+    parent_hash: Option<[u8; 4]>,       // 0 or 4 bytes (truncated hash of parent node_id)
+    root_hash: [u8; 4],                 // 4 bytes (truncated hash of root node_id)
     subtree_size: varint,               // 1-3 bytes
     tree_size: varint,                  // 1-3 bytes
-    tree_addr: TreeAddr,                // nibble-packed: 1 + ⌈D/2⌉ bytes
-    need_pubkey: bool,                  // 1 byte
-    pubkey: Option<PublicKey>,          // 0 or 32 bytes
-    child_prefix_len: u8,               // 1 byte
-    children: Vec<(prefix, varint)>,    // variable
+    keyspace_lo: u32,                   // 4 bytes (start of owned keyspace range)
+    keyspace_hi: u32,                   // 4 bytes (end of owned keyspace range, exclusive)
+    pubkey: Option<PublicKey>,          // 0 or 32 bytes (if has_pubkey flag set)
+    children: ChildList,                // N × (4 + varint) bytes (see encoding below)
     signature: Signature,               // 65 bytes (1 algorithm + 64 sig)
 }
 
-// TreeAddr: nibble-packed path from root. Each level uses 4 bits (0-15 for child index).
-// Wire format: 1 byte depth + ⌈depth/2⌉ bytes of nibbles (high nibble first).
-// Example: depth 5, path [3,7,2,15,1] → 0x05 0x37 0x2F 0x10 (last nibble padded with 0)
+// Flags byte layout:
+// - bit 0: has_parent (if set, parent_hash is present)
+// - bit 1: need_pubkey (requesting pubkeys from neighbors)
+// - bit 2: has_pubkey (if set, pubkey field is present)
+// - bits 3-7: child_count (0-16, number of children)
 //
-// Validation requirements:
-// - For odd depths, the low nibble of the final byte MUST be 0x0
-// - Exactly ⌈depth/2⌉ nibble bytes MUST follow the depth byte
-// - Messages violating these requirements MUST be rejected
-// - depth=0 (root) is encoded as just 0x00 with zero additional bytes
+// Example: 5 children, has parent, includes pubkey → 0b00101_101 = 0x2D
+
+// Keyspace range [keyspace_lo, keyspace_hi): The portion of 32-bit keyspace this node owns.
+// Root owns [0, 2³²). Children compute their range from parent's Pulse (see Keyspace section).
+// A node's "address" for routing is the center of its range: (keyspace_lo + keyspace_hi) / 2.
 
 // Signature covers ALL fields (domain-separated):
-// "PULSE:" || node_id || parent_id || root_id || subtree_size || tree_size ||
-//            tree_addr || need_pubkey || pubkey || child_prefix_len || children
+// "PULSE:" || node_id || flags || parent_hash || root_hash || subtree_size ||
+//            tree_size || keyspace_lo || keyspace_hi || pubkey || children
 ```
+
+**Children encoding (ChildList):**
+
+Each child is identified by a 4-byte truncated hash of its node_id:
+```rust
+fn child_hash(node_id: &NodeId) -> [u8; 4] {
+    hash(node_id)[..4].try_into().unwrap()
+}
+```
+
+**Format:** For each child (count from flags bits 3-7):
+```
+[hash: [u8; 4]] [subtree_size: varint]
+```
+
+**Ordering:** Children MUST be sorted by their 4-byte hash in lexicographic (big-endian) order. This ordering:
+- Determines keyspace division order (first child by hash gets first slice)
+- Determines key range responsibility
+- Enables binary search for child lookup
+- Provides deterministic ordering across all nodes
+
+**Example:** 3 children with hashes:
+- Child A: hash `0xAB123456`
+- Child B: hash `0xCD789012`
+- Child C: hash `0xEF345678`
+
+Wire encoding (sorted by hash):
+```
+[0xAB123456] [size_A]   // Child A (ordinal 0)
+[0xCD789012] [size_B]   // Child B (ordinal 1)
+[0xEF345678] [size_C]   // Child C (ordinal 2)
+```
+
+A child finds its ordinal by computing `hash(own_node_id)[..4]` and counting how many children have lexicographically smaller hashes.
+
+**Hash collision handling:**
+
+With 4-byte hashes, the probability of two children having the same hash is 1 in 2³² (~2.3 × 10⁻¹⁰). Even with 16 children (120 pairs), collision probability is ~2.8 × 10⁻⁸.
+
+To prevent collisions:
+- **Parents** MUST NOT accept a child whose hash matches an existing child's hash
+- **Children** SHOULD NOT attempt to join a parent that already has a child with their hash
+
+**Known limitation:** If two nodes with the same 4-byte hash race to join the same parent simultaneously, one will be silently rejected. The rejected node sees its hash in the parent's child list and believes it was accepted, but messages routed to that keyspace range will be delivered to the other node. This doesn't self-correct—it persists until one node leaves. Given the ~10⁻¹⁰ probability per join attempt, this is an acceptable trade-off for simpler encoding.
 
 A Pulse serves multiple purposes:
 - **Liveness signal** for parent and children
-- **Tree state** for merge decisions (root_id, tree_size)
-- **Children list** for tree address computation
+- **Tree state** for merge decisions (root_hash, tree_size)
+- **Children list** for keyspace range computation
 - **Pubkey exchange** for signature verification
 
 **Replay consideration:** Pulses have no sequence number. This is a deliberate tradeoff:
@@ -98,12 +144,17 @@ A Pulse serves multiple purposes:
 
 | Scenario | Size |
 |----------|------|
-| Leaf (no pubkey) | ~122 bytes |
-| Leaf (with pubkey) | ~154 bytes |
-| 8 children + pubkey | ~194 bytes |
-| 16 children (max) + pubkey | ~218 bytes |
+| Root (no parent, no children, no pubkey) | ~94 bytes |
+| Leaf (no pubkey) | ~98 bytes |
+| Leaf (with pubkey) | ~130 bytes |
+| 8 children + pubkey | ~175 bytes |
+| 16 children + pubkey | ~215 bytes |
 
-The protocol limits nodes to `MAX_CHILDREN = 16` to ensure Pulse messages fit within transport MTU limits.
+**Size formula:** `94 + has_parent×4 + has_pubkey×32 + children×5 + varint_overhead`
+
+Base: 16 (node_id) + 1 (flags) + 4 (root_hash) + 2 (subtree_size) + 2 (tree_size) + 4 (keyspace_lo) + 4 (keyspace_hi) + 65 (signature) = 98 bytes. Subtract 4 for no parent = 94 bytes minimum.
+
+**MTU constraints:** With 16 children and pubkey, Pulse is ~215 bytes, well within 255-byte LoRa MTU. Keyspace ranges are fixed size regardless of tree depth.
 
 ### Timing Model
 
@@ -145,7 +196,7 @@ In addition to periodic Pulses, nodes send **proactive Pulses** to accelerate st
 
 **Triggers for proactive Pulse:**
 
-1. **State change** — When your tree state changes (parent, children, root_id, tree_size, tree_addr)
+1. **State change** — When your tree state changes (parent, children, root, tree_size, subtree_size, keyspace range)
 2. **Unknown neighbor** — When you receive a Pulse from an unrecognized node_id
 3. **Pubkey request** — When you see `need_pubkey=true` in a neighbor's Pulse and they need yours
 
@@ -194,7 +245,7 @@ Pulse interval is approximately 3τ (based on 150-byte pulse, PULSE_BW_DIVISOR=5
 
 | Scenario | Periodic only | With proactive |
 |----------|---------------|----------------|
-| Join (get tree_addr) | 6-9τ | 2-4τ |
+| Join (get keyspace range) | 6-9τ | 2-4τ |
 | Merge detection | 0-3τ | 1-2τ |
 | State propagation | 0-3τ | 1-2τ |
 | Pubkey exchange | 3-6τ | 2-4τ |
@@ -233,11 +284,13 @@ struct Node {
     root_id: NodeId,
     tree_size: u32,
     subtree_size: u32,
-    tree_addr: Vec<u8>,
+    keyspace_lo: u32,                       // start of owned keyspace range
+    keyspace_hi: u32,                       // end of owned keyspace range (exclusive)
 
     // Neighbors (bounded by MAX_NEIGHBORS)
     children: HashMap<NodeId, u32>,         // child -> subtree_size
-    shortcuts: HashSet<NodeId>,
+    child_ranges: HashMap<NodeId, (u32, u32)>, // child -> (keyspace_lo, keyspace_hi)
+    shortcuts: HashMap<NodeId, (u32, u32)>, // shortcut -> (keyspace_lo, keyspace_hi)
     neighbor_times: HashMap<NodeId, (Timestamp, Option<Timestamp>)>,
 
     // Caches (bounded with LRU/oldest eviction)
@@ -281,19 +334,20 @@ N.node_id = hash(pubkey_N)[0:16]
 
 N → Pulse{
   node_id: N,
-  parent_id: None,
-  root_id: N,
+  parent_hash: None,
+  root_hash: hash(N)[..4],
   subtree_size: 1,
   tree_size: 1,
-  tree_addr: [],
+  keyspace_lo: 0,
+  keyspace_hi: 2³²,
   children: []
 }
 
 N state:
   parent = None
-  root_id = N
+  root = N
   tree_size = 1
-  tree_addr = []
+  keyspace = [0, 2³²)
 ```
 
 N is root of its own single-node tree.
@@ -312,68 +366,53 @@ When node N boots, it has no parent and no children. It enters a **discovery pha
 - It is in the distrusted set
 
 **Parent selection algorithm:**
-1. **Pick the best tree** — if multiple root_ids visible, choose largest tree_size (tie-break: lowest root_id). This makes N a bridge that triggers tree merging.
+1. **Pick the best tree** — if multiple roots visible, choose largest tree_size (tie-break: lowest root_hash). This makes N a bridge that triggers tree merging.
 2. **Filter by signal strength** — if 3+ candidates and RSSI data available, remove bottom 50% by RSSI. This ensures reliable parent links. Skip this step for non-radio transports (e.g., UDP) or when fewer than 3 candidates.
-3. **Pick shallowest** — from remaining candidates, choose shortest tree_addr (tie-break: best RSSI, or arbitrary if no RSSI). This keeps trees wide and shallow.
+3. **Pick shallowest** — from remaining candidates, choose the one with largest keyspace range (tie-break: best RSSI, or arbitrary if no RSSI). This keeps trees wide and shallow.
 
 If no valid candidates remain after filtering, N stays root of its single-node tree and will join via normal merge when it hears a larger tree.
 
 **After joining:** Once N has a parent, it only switches parent when:
-- **Merge** — N sees a better tree (larger tree_size, or equal size with lower root_id)
+- **Merge** — N sees a better tree (larger tree_size, or equal size with lower root_hash)
 - **Parent timeout** — after 8 missed Pulses, N becomes root of its own subtree (see "Partition and Reconnection")
 
 There is no "parent shopping" after joining. This provides stability while still allowing trees to merge and recover from partitions.
 
-This prioritization naturally produces wide, shallow trees. Deep chains are discouraged because nodes prefer shorter addresses. This matters because message size grows with depth (nibble-packed addresses), and MTU limits will cause errors for very deep nodes.
+This prioritization naturally produces wide, shallow trees. Larger keyspace ranges indicate shallower positions in the tree.
 
-**Practical depth limits for LoRa (MTU=255):**
-
-| Message Type | Overhead Formula | Max Depth |
-|--------------|------------------|-----------|
-| PUBLISH | 170 + D bytes | ~85 |
-| LOOKUP | 103 + D bytes | ~152 |
-| FOUND | 186 + D bytes | **~69** |
-| DATA (empty) | 103 + D bytes | ~152 |
-
-FOUND is the limiting case because it includes both `dest_node_id` (Some, 17 bytes) and the location payload (tree_addr + seq + signature). A node at depth 69 can participate fully; deeper nodes may fail to receive lookup responses. In practice, trees rarely exceed depth 20-30 even in large networks.
-
-**Implicit rejection:** When a node claims a parent (by setting `parent_id` in its Pulse), the parent decides whether to accept by including the child in its `children` list. A parent silently ignores a child if:
-- It already has `MAX_CHILDREN` children
-- Adding the child would cause the Pulse to exceed the transport MTU
+**Implicit rejection:** When a node claims a parent (by setting `parent_hash` in its Pulse), the parent decides whether to accept by including the child in its `children` list. A parent silently ignores a child if it already has `MAX_CHILDREN` children.
 
 If a joining node doesn't see itself in the parent's `children` list after 3 Pulses, it assumes rejection and tries another neighbor.
 
-This ensures Pulse messages always fit within transport MTU limits (LoRa: 255 bytes, BLE: 252 bytes). With `MAX_CHILDREN = 16` and ~4 bytes per child entry, the children list typically uses ~64 bytes, keeping total Pulse size under 220 bytes. The MTU check handles rare edge cases (unlucky prefix collisions in large trees) without penalizing the common case.
-
 ```
-t=0: N → Pulse{node_id: N, parent_id: None, root_id: N, tree_size: 1, ...}
+t=0: N → Pulse{node_id: N, parent_hash: None, root_hash: hash(N), tree_size: 1, ...}
 
 t=0: P receives N's Pulse:
   - Unknown node_id → schedule proactive Pulse, need_pubkey=true
 
-t=2s: P → proactive Pulse{node_id: P, parent_id: G, root_id: R, tree_size: 500,
-          tree_addr: [2], need_pubkey: true, ...}
+t=2s: P → proactive Pulse{node_id: P, parent_hash: hash(G), root_hash: hash(R), tree_size: 500,
+          keyspace_lo: X, keyspace_hi: Y, need_pubkey: true, ...}
 
 t=2s: N receives P's Pulse:
-  - Different root_id (N ≠ R)
+  - Different root_hash
   - N.tree_size(1) < P.tree_size(500) → N joins P's tree
-  - N.parent = P, N.root_id = R
+  - N.parent = P, N.root = R
   - State changed → schedule proactive Pulse with pubkey
 
-t=4s: N → proactive Pulse{node_id: N, parent_id: P, root_id: R, tree_size: 500,
-          tree_addr: [],  // knows P's addr, not own ordinal yet
+t=4s: N → proactive Pulse{node_id: N, parent_hash: hash(P), root_hash: hash(R), tree_size: 500,
+          keyspace_lo: 0, keyspace_hi: 0,  // doesn't know range yet
           pubkey: pubkey_N, ...}
 
 t=4s: P receives N's Pulse:
   - N.pubkey present → cache it
-  - N claims parent_id = P → P.children.insert(N)
+  - N claims parent_hash = hash(P) → P.children.insert(N)
   - P.subtree_size += 1
   - State changed → schedule proactive Pulse
 
-t=6s: P → proactive Pulse{..., children: [(N_prefix, 1), ...], ...}
+t=6s: P → proactive Pulse{..., children: [(hash(N), 1), ...], ...}
 
 t=6s: N receives P's Pulse:
-  - N finds itself in P.children → computes tree_addr = [2, 0]
+  - N finds itself in P.children (by hash) → computes keyspace range from P's range
 ```
 
 **Total join time: ~6 seconds** (vs 50-75 seconds with periodic-only Pulses)
@@ -389,26 +428,26 @@ Tree A (900 nodes)              Tree B (100 nodes)
     .    X  ←— discover —→  Y         Py
 ```
 
-**Merge decision:** Larger tree_size wins. If equal, lower root_id wins.
+**Merge decision:** Larger tree_size wins. If equal, lower root_hash wins.
 
 ```
-X: root_id=Ra, tree_size=900
-Y: root_id=Rb, tree_size=100
+X: root_hash=hash(Ra), tree_size=900
+Y: root_hash=hash(Rb), tree_size=100
 
 t=0: X and Y exchange Pulses (or X's periodic Pulse reaches Y)
 
 t=0: Y receives X's Pulse:
   - Unknown node → schedule proactive Pulse
   - Y.tree_size(100) < X.tree_size(900) → Y dominated
-  - Y.parent = X, Y.root_id = Ra
+  - Y.parent = X, Y.root = Ra
   - State changed → schedule proactive Pulse
 
-t=2s: Y → proactive Pulse (claiming parent=X, root=Ra)
+t=2s: Y → proactive Pulse (claiming parent=X, root_hash=hash(Ra))
 
 t=2s: Py receives Y's Pulse:
   - Py.tree_size < Y's tree_size → Py dominated
   - INVERSION: Py.parent = Y (former child becomes parent!)
-  - Py.root_id = Ra
+  - Py.root = Ra
   - State changed → schedule proactive Pulse
 
 t=4s: Py → proactive Pulse (inversion propagates up tree B)
@@ -666,7 +705,7 @@ Before:
    /
   C (subtree_size=30)
 
-Link A-C breaks. After ~200s (8 missed Pulses):
+Link A-C breaks. After ~24τ (8 missed Pulses, ~160s for LoRa):
 
 C (no Pulse from parent A):
   C.parent = None
@@ -747,9 +786,9 @@ impl Node {
 
 | Relationship | Timeout | Effect |
 |--------------|---------|--------|
-| Parent | 8 × observed interval (~200s) | Become root of subtree |
-| Child | 8 × observed interval (~200s) | Remove from children |
-| Shortcut | 8 × observed interval (~200s) | Remove from shortcuts |
+| Parent | ~24τ (8 × ~3τ interval) | Become root of subtree |
+| Child | ~24τ (8 × ~3τ interval) | Remove from children |
+| Shortcut | ~24τ (8 × ~3τ interval) | Remove from shortcuts |
 
 ### Shortcuts
 
@@ -761,32 +800,27 @@ Shortcuts are non-tree neighbors that enable faster routing by skipping tree hop
 3. Shortcuts expire after 8 missed Pulses
 4. No additional bandwidth cost
 
-**Routing optimization:** When routing, use a shortcut S instead of the normal tree path if:
-
-```
-common_prefix_len(S.tree_addr, dest_addr) > common_prefix_len(my_addr, dest_addr)
-```
-
-In other words: use the shortcut if it's "closer" to the destination's branch than you are.
+**Routing optimization:** When routing, we check children and shortcuts whose range contains the destination, picking the tightest. If none contain it, we route up to parent (who can continue routing upward).
 
 **Example:**
 ```
-         []
-        /   \
-      [0]   [1]
-      /       \
-   [0,0]     [1,0]
-   /           \
-[0,0,0]     [1,0,0]
-   A            B
+         Root [0, 4B)
+           │ slice: [0, 40M)
+        ┌──┴──┐
+    L [40M, 2B)      R [2B, 4B)
+        │                │
+  LL [60M, 1B)    RR [2.5B, 3.5B)
+       A                 B
 ```
+(Numbers abbreviated: M=million, B=billion, 4B ≈ 2³²)
 
-A at `[0,0,0]` sends to B at `[1,0,0]`:
-- Normal route: A → [0,0] → [0] → [] → [1] → [1,0] → B = **6 hops**
-- Via shortcut at `[1]`: A → [1] → [1,0] → B = **3 hops**
-- Via shortcut at `[1,0]`: A → [1,0] → B = **2 hops**
+A owns range [60M, 1B) and has a shortcut to R (heard R's Pulse).
+A sends to dest_addr = 3B (in B's range):
 
-The shortcut at `[1,0]` has `common_prefix_len([1,0], [1,0,0]) = 2`, which is greater than A's `common_prefix_len([0,0,0], [1,0,0]) = 0`, so it's used.
+- Normal route: A → L → Root → R → B = **4 hops**
+- Via shortcut to R: A → R → B = **2 hops**
+
+R's range [2B, 4B) contains dest=3B, and is tighter than any other candidate, so we use the shortcut.
 
 ---
 
@@ -794,63 +828,72 @@ The shortcut at `[1,0]` has `common_prefix_len([1,0], [1,0,0]) = 2`, which is gr
 
 This part describes how messages travel through the tree.
 
-### Tree Addresses
+### Keyspace Ranges
 
-A tree address is a `Vec<u8>` representing the path from root to node. Each byte is the child's index among its siblings (sorted by node_id).
+Each node owns a range `[keyspace_lo, keyspace_hi)` of the 32-bit keyspace. A child computes its range from its parent's Pulse:
 
-- Root: `[]`
-- Root's 2nd child (by node_id order): `[1]`
-- That child's 1st child: `[1, 0]`
+1. Parent's Pulse contains `keyspace_lo`, `keyspace_hi`, `subtree_size`, and `children` list
+2. Parent keeps the first slice: `[lo, lo + range/subtree_size)` (weight 1 for itself)
+3. Children (sorted by hash) divide the remainder proportionally by their `subtree_size`
+4. Child finds its entry by matching `hash(node_id)[..4]`, computes its slice
 
-A child computes its tree address from the parent's Pulse:
-1. Parent's Pulse contains `tree_addr` and `children` list
-2. Child sorts children by node_id prefix, finds its index
-3. Child's address = `parent.tree_addr ++ [index]`
+A node's **keyspace address** is the center of its range: `(keyspace_lo + keyspace_hi) / 2`. This is what gets published to the location directory and used in `dest_addr` for routing.
 
-**Prefix-compressed children:**
-
-Children in a Pulse are identified by the minimum unique prefix of their node_id. A single `child_prefix_len` applies to all children:
-
-| Children | Typical prefix_len |
-|----------|--------------------|
-| 2-4 | 1 byte |
-| 5-8 | 1-2 bytes |
-| 9-16 | 2 bytes |
+See the Keyspace section in Part 3 for the precise `compute_my_range` algorithm.
 
 ### Routed Messages
 
-Unicast messages use tree addresses for routing:
+Unicast messages route through the tree using keyspace addresses:
 
 ```rust
 struct Routed {
-    dest_addr: TreeAddr,            // nibble-packed tree address (4 bits per level)
-    dest_node_id: Option<NodeId>,   // Some(id) for specific node, None for keyspace
-    src_addr: Option<TreeAddr>,     // for replies; None if no response expected
+    flags_and_type: u8,             // combined flags + message type (see below)
+    dest_addr: u32,                 // keyspace location to route toward
+    dest_hash: Option<[u8; 4]>,     // truncated hash(node_id) for recipient verification
+    src_addr: Option<u32>,          // sender's keyspace address for replies
     src_node_id: NodeId,            // sender identity
-    msg_type: u8,                   // message type (0-3)
+    src_pubkey: PublicKey,          // sender's public key (for signature verification)
     ttl: u8,                        // hop limit, decremented at each hop
     payload: Vec<u8>,               // type-specific content
     signature: Signature,           // Ed25519 signature (see below)
 }
 
-// Tree addresses are nibble-packed: 4 bits per level, 2 levels per byte.
-// Depth D uses ⌈D/2⌉ bytes. This enables deeper trees within MTU limits.
+// flags_and_type byte layout:
+// - bits 0-3: msg_type (0-15)
+// - bit 4: has_dest_hash (1 = dest_hash present for recipient verification)
+// - bit 5: has_src_addr (1 = src_addr present for replies)
+// - bits 6-7: reserved (must be 0)
 
-// msg_type values: 0=PUBLISH, 1=LOOKUP, 2=FOUND, 3=DATA
-// Messages with undefined msg_type (4-255) MUST be dropped silently (future extensions)
+// msg_type values: 0=PUBLISH, 1=LOOKUP, 2=FOUND, 3=DATA, 4=ACK
+// Messages with undefined msg_type MUST be dropped silently (future extensions)
 
-// src_addr is optional:
-// - PUBLISH: None (no response expected)
-// - LOOKUP: Some (FOUND needs to route back); MUST drop if None
-// - FOUND: None (no further response)
-// - DATA: application-dependent
+// dest_addr is a keyspace location (u32). All messages route uniformly toward dest_addr:
+// - PUBLISH/LOOKUP: dest_addr = hash(node_id || replica_index) (the key)
+// - DATA/FOUND: dest_addr = target node's published keyspace address
+
+// dest_hash verifies the intended recipient. Present for LOOKUP/DATA/FOUND, absent for PUBLISH.
+// Recipient verifies: hash(my_node_id)[..4] == dest_hash
+// Collision probability ~2.3×10⁻¹⁰ per message (negligible).
+
+// src_addr is the sender's keyspace address (center of their range) for replies.
+
+// src_pubkey enables signature verification for messages from far-away nodes
+// whose pubkey isn't cached from Pulses. Receivers MUST verify:
+//   src_node_id == hash(src_pubkey)[..16]
+
+// Typical flag combinations:
+// - PUBLISH: has_dest_hash=0, has_src_addr=1 (src_addr carries our location)
+// - LOOKUP:  has_dest_hash=1, has_src_addr=1 (dest_hash identifies target, src_addr for reply)
+// - FOUND:   has_dest_hash=1, has_src_addr=0 (no reply expected)
+// - DATA:    has_dest_hash=1, has_src_addr=0/1 (app decides)
 
 // Signature covers all fields EXCEPT ttl (forwarders must decrement it):
-// "ROUTE:" || dest_addr || dest_node_id || src_addr || src_node_id || msg_type || payload
+// "ROUTE:" || flags_and_type || dest_addr || dest_hash || src_addr || src_node_id || payload
+// Note: src_pubkey not signed (bound to src_node_id via hash)
 
 fn routed_sign_data(msg: &Routed) -> Vec<u8> {
-    encode(b"ROUTE:", &msg.dest_addr, &msg.dest_node_id,
-           &msg.src_addr, &msg.src_node_id, msg.msg_type, &msg.payload)
+    encode(b"ROUTE:", msg.flags_and_type, msg.dest_addr, &msg.dest_hash,
+           &msg.src_addr, &msg.src_node_id, &msg.payload)
 }
 ```
 
@@ -862,16 +905,16 @@ The signature covers all fields except `ttl` to prevent:
 
 The `ttl` field is not signed because forwarders must decrement it. An attacker could reset TTL to extend message lifetime, but cannot forge the message itself. TTL exists to prevent routing loops during tree restructuring.
 
-The `dest_node_id` field distinguishes:
-- `None` — route to whoever owns this tree address (keyspace routing)
-- `Some(id)` — route to a specific node (if address is stale, detect mismatch)
+The `dest_hash` field indicates recipient verification:
+- `None` — message is for whoever owns the keyspace location (PUBLISH)
+- `Some(hash)` — message is for a specific node/entry matching the hash (LOOKUP/DATA/FOUND)
 
 ### Routing Algorithm
 
-Messages route up to a common ancestor, then down to the destination:
+Messages route toward `dest_addr` using keyspace ranges. Each hop forwards to the neighbor with the tightest range containing the destination, or upward to parent:
 
 ```rust
-const DEFAULT_TTL: u8 = 255;  // max hops; theoretical max depth 127
+const DEFAULT_TTL: u8 = 255;  // max hops
 
 impl Node {
     fn route(&mut self, mut msg: Routed) {
@@ -881,31 +924,60 @@ impl Node {
         }
         msg.ttl -= 1;
 
-        let dest = &msg.dest_addr;
+        let dest = msg.dest_addr;
 
-        // Am I the destination?
-        if dest == &self.tree_addr {
-            match msg.dest_node_id {
-                Some(id) if id != self.node_id => {
-                    // Stale address - node moved
-                    return;
-                }
-                _ => {
-                    self.handle_locally(msg);
-                    return;
+        // Do I own this keyspace location?
+        if self.owns_key(dest) {
+            let msg_type = msg.flags_and_type & 0x0F;
+
+            // For DATA/FOUND: dest_hash must match my node_id (I'm the recipient)
+            // For PUBLISH/LOOKUP: always handle if I own the keyspace
+            if msg_type == DATA || msg_type == FOUND {
+                if let Some(h) = msg.dest_hash {
+                    if h != hash(&self.node_id)[..4] {
+                        // Stale address - intended recipient no longer owns this keyspace
+                        return;
+                    }
                 }
             }
-        }
-
-        // Destination in my subtree → route down
-        if dest.starts_with(&self.tree_addr) {
-            let next_ordinal = dest[self.tree_addr.len()];
-            self.send_to_child_by_ordinal(next_ordinal, msg);
+            self.handle_locally(msg);
             return;
         }
 
-        // Destination elsewhere → route up
-        self.send_to_parent(msg);
+        // Find best next hop among children and shortcuts whose range contains dest
+        if let Some(next) = self.best_downward_hop(dest) {
+            self.send_to(next, msg);
+        } else if let Some(parent) = self.parent {
+            // No child/shortcut contains dest → route up
+            self.send_to(parent, msg);
+        }
+        // else: we're root and no child contains dest - shouldn't happen
+    }
+
+    fn owns_key(&self, key: u32) -> bool {
+        key >= self.keyspace_lo && key < self.keyspace_hi
+    }
+
+    fn best_downward_hop(&self, dest: u32) -> Option<NodeId> {
+        // Collect children and shortcuts whose range contains dest
+        let mut candidates: Vec<(NodeId, u32)> = Vec::new();  // (id, range_size)
+
+        for (child_id, (lo, hi)) in &self.child_ranges {
+            if dest >= *lo && dest < *hi {
+                candidates.push((*child_id, hi - lo));
+            }
+        }
+
+        for (shortcut_id, (lo, hi)) in &self.shortcuts {
+            if dest >= *lo && dest < *hi {
+                candidates.push((*shortcut_id, hi - lo));
+            }
+        }
+
+        // Pick tightest range (smallest range_size)
+        candidates.into_iter()
+            .min_by_key(|(_, size)| *size)
+            .map(|(id, _)| id)
     }
 }
 ```
@@ -913,120 +985,109 @@ impl Node {
 **Routing example:**
 
 ```
-         []
-        / | \
-      [0] [1] [2]
-      /
-   [0,0]
+Root (subtree_size=201) owns [0, 2³²):
+  Root's slice: [0, ~21M)        weight 1 (itself)
+  A: [~21M, ~2.1B)               subtree_size=100
+  B: [~2.1B, ~3.2B)              subtree_size=50
+  C: [~3.2B, 2³²)                subtree_size=50
 
-Node [0,0] sends to [2]:
-  [0,0] → [0] (up)     not in subtree, route to parent
-  [0]   → []  (up)     not in subtree, route to parent
-  []    → [2] (down)   in subtree, route to child ordinal 2
+Node in A's subtree sends to dest_addr = 0xC0000000 (in C's range):
+  Sender → A (up)       dest not in sender's or children's range
+  A → Root (up)         dest not in A's range, route to parent
+  Root → C (down)       C's range contains dest, tightest match
 ```
 
 ---
 
 ## Part 3: Location Directory
 
-This part describes how nodes publish and discover each other's tree addresses.
+This part describes how nodes publish and discover each other's keyspace addresses.
 
 ### Keyspace
 
-The keyspace is `[0, 2³²)`. Each node owns a range proportional to its subtree_size:
+The keyspace is `[0, 2³²)`. Each node owns a range proportional to its subtree_size. The root owns the entire keyspace and divides it among itself and its children.
+
+**Keyspace division algorithm:**
+
+A node with range `[lo, hi)` and `subtree_size = S` divides its range:
+1. **Parent's own slice** (at the beginning): `[lo, lo + (hi-lo)/S)` — weight 1 for itself
+2. **Children's slices** (sorted by hash): each child gets `(hi-lo) × child_subtree_size / S`
 
 ```
-Root has range [0, 2³²), subtree_size=200
-Children (sorted by prefix): A (100), B (50), C (50)
+Root has range [0, 2³²), subtree_size = 201 (1 + 100 + 50 + 50)
+Children (sorted by hash): A (100), B (50), C (50)
 
-Assigned:
-  A: [0, 2³¹)           // 50% → tree_addr [0]
-  B: [2³¹, 3×2³⁰)       // 25% → tree_addr [1]
-  C: [3×2³⁰, 2³²)       // 25% → tree_addr [2]
+Division:
+  Root itself: [0, ~21M)                    // 1/201 of range
+  A: [~21M, ~2.1B)                          // 100/201 of range
+  B: [~2.1B, ~3.2B)                         // 50/201 of range
+  C: [~3.2B, 2³²)                           // 50/201 of range
 ```
 
-**Keyspace range calculation** (precise algorithm with integer math):
-
-```rust
-/// Calculate the keyspace range [start, end) owned by a node at the given tree address.
-/// Uses u64 intermediate values to avoid overflow when multiplying u32 × u32.
-fn range_for_addr(
-    addr: &[u8],                           // tree address (nibbles)
-    children_at_level: &[Vec<(u8, u32)>],  // children list at each level: (prefix, subtree_size)
-) -> (u32, u32) {
-    let mut start: u64 = 0;
-    let mut range_size: u64 = 1 << 32;  // 2³²
-
-    for (level, &child_index) in addr.iter().enumerate() {
-        let children = &children_at_level[level];
-        let total_subtree: u64 = children.iter().map(|(_, s)| *s as u64).sum();
-
-        // Find our position among siblings (sorted by prefix)
-        let mut offset: u64 = 0;
-        for (i, &(prefix, subtree_size)) in children.iter().enumerate() {
-            if prefix == child_index {
-                // This is us - calculate our range
-                let my_fraction = (range_size * subtree_size as u64) / total_subtree;
-                start += offset;
-                range_size = my_fraction;
-                break;
-            }
-            // Accumulate offset for siblings before us
-            offset += (range_size * subtree_size as u64) / total_subtree;
-        }
-    }
-
-    (start as u32, (start + range_size) as u32)
-}
-
-/// Check if this node owns the given key (for storage decisions)
-fn owns_key(&self, key: u32) -> bool {
-    let (start, end) = self.my_range();
-    if start <= end {
-        key >= start && key < end
-    } else {
-        // Range wraps around 2³² (only possible for root)
-        key >= start || key < end
-    }
-}
-```
-
-**Important precision notes:**
-- Use u64 for intermediate calculations to avoid overflow (u32 × u32 can exceed u32)
-- Division truncates, so the sum of children's ranges may be slightly less than parent's range
-- The "leftover" keyspace (due to truncation) goes to the parent node itself
-- Children are always sorted by prefix for consistent range assignment across all nodes
-
-To find which tree address owns a key:
+**Child computes its range from parent's Pulse:**
 
 ```rust
 impl Node {
-    fn addr_for_key(&self, key: u32) -> Vec<u8> {
-        // Walk down from root, narrowing range at each level
-        // At each level: find which child's range contains the key
-        // Append that child's prefix to the address
-        // Stop when we reach a leaf or the key falls in "leftover" space
+    /// Called when receiving parent's Pulse to compute own keyspace range
+    fn compute_my_range(&self, parent_pulse: &Pulse) -> (u32, u32) {
+        let parent_lo = parent_pulse.keyspace_lo as u64;
+        let parent_hi = parent_pulse.keyspace_hi as u64;
+        let parent_range = parent_hi - parent_lo;
+        let parent_subtree = parent_pulse.subtree_size as u64;
+
+        // Parent keeps first slice for itself (weight 1)
+        let parent_slice = parent_range / parent_subtree;
+        let mut cursor = parent_lo + parent_slice;
+
+        // Children sorted by hash get consecutive slices
+        for (child_hash, child_subtree) in &parent_pulse.children {
+            let child_range = (parent_range * *child_subtree as u64) / parent_subtree;
+            if *child_hash == hash(&self.node_id)[..4] {
+                return (cursor as u32, (cursor + child_range) as u32);
+            }
+            cursor += child_range;
+        }
+        // Not found in parent's children - shouldn't happen
+        (0, 0)
     }
 }
 ```
 
+**A node's "address"** is the center of its keyspace range:
+```rust
+fn my_address(&self) -> u32 {
+    (self.keyspace_lo / 2) + (self.keyspace_hi / 2)  // avoid overflow
+}
+```
+
+This address is what gets published to the location directory and used in `dest_addr` for routing.
+
 ### Location Entries
 
-The directory stores node locations (`node_id → tree_addr`). Each entry is signed by its owner:
+The directory stores node locations (`node_id → keyspace_addr`). Each entry is signed by its owner:
 
 ```rust
 struct LocationEntry {
-    node_id: NodeId,
-    tree_addr: TreeAddr,        // nibble-packed
-    seq: varint,                // monotonic sequence number (1-5 bytes)
-    signature: Signature,       // sign("LOC:" || node_id || tree_addr || seq)
+    node_id: NodeId,            // from src_node_id
+    pubkey: PublicKey,          // from src_pubkey
+    keyspace_addr: u32,         // from src_addr (center of node's keyspace range)
+    seq: u32,                   // from payload
+    replica_index: u8,          // from payload, for rebalancing
+    signature: Signature,       // original Routed signature
     received_at: Instant,       // local timestamp for expiry
 }
 ```
 
+For rebalancing, the storage node reconstructs the Routed message:
+- `dest_addr = hash_to_u32(node_id || replica_index)` (the key)
+- `flags_and_type = PUBLISH | HAS_SRC_ADDR`
+- `src_addr = keyspace_addr`
+- `src_node_id`, `src_pubkey`, `signature` from stored entry
+- `payload = encode(replica_index, seq)`
+
 **Varint encoding:** All varint fields (seq, subtree_size, tree_size) use LEB128 encoding. Implementations MUST use canonical (minimal) encoding: the shortest byte sequence that represents the value. Non-minimal encodings (e.g., `0x80 0x00` for 0 instead of `0x00`) MUST be rejected during decoding to prevent signature ambiguity attacks. Standard libraries like `integer-encoding` or `postcard` handle this correctly.
 
-The signature includes a sequence number for replay protection. Storage nodes reject entries with `seq <= current_seq` for the same node_id. The `"LOC:"` prefix provides domain separation (prevents signature reuse across message types).
+The Routed signature authenticates the entire PUBLISH message (including `src_addr` which carries the keyspace address). Storage nodes reject entries with `seq <= current_seq` for the same node_id. The `"ROUTE:"` prefix provides domain separation from Pulse signatures.
 
 **Sequence number recovery after reboot:**
 
@@ -1056,24 +1117,21 @@ struct Node {
 impl Node {
     fn publish_location(&mut self) {
         self.location_seq += 1;
-        let sig = sign(&self.secret,
-            &encode(b"LOC:", &self.node_id, &self.tree_addr, self.location_seq));
 
-        for i in 0..K_REPLICAS {
-            let key = hash_to_u32(&[&self.node_id[..], &[i as u8]].concat());
-            let dest_addr = self.addr_for_key(key);
-
+        for replica in 0..K_REPLICAS {
+            let key = hash_to_u32(&[&self.node_id[..], &[replica as u8]].concat());
             self.send_routed(Routed {
-                dest_addr,
-                dest_node_id: None,  // keyspace routing
-                msg_type: PUBLISH,
-                payload: encode(&self.tree_addr, self.location_seq, &sig),
+                flags_and_type: PUBLISH | HAS_SRC_ADDR,  // has_dest_hash=0, has_src_addr=1
+                dest_addr: key,                          // route toward this key
+                dest_hash: None,
+                src_addr: Some(self.my_address()),       // our keyspace address (the location)
+                payload: encode(replica as u8, self.location_seq),
                 ...
             });
         }
     }
 
-    fn on_tree_addr_changed(&mut self) {
+    fn on_keyspace_changed(&mut self) {
         // Jitter prevents publish storms during tree reshuffles
         let jitter_ms = self.random.gen_range(0, self.tau().as_millis() as u64);
         self.schedule_publish_after(Duration::from_millis(jitter_ms));
@@ -1081,27 +1139,23 @@ impl Node {
 }
 ```
 
-**PUBLISH payload:** `owner_node_id (16) || tree_addr (1+⌈D/2⌉) || seq (varint, 1-5) || location_signature (65)`
+**PUBLISH payload:** `replica_index (1 byte) || seq (varint, 1-5)`
 
-Typical size: 83 + ⌈D/2⌉ to 87 + ⌈D/2⌉ bytes (seq usually 1-2 bytes at normal publish rates).
+Typical size: 2-6 bytes. The published keyspace address comes from `src_addr` in the Routed header.
 
-The `owner_node_id` is included explicitly (not inferred from Routed `src_node_id`) so that:
-- Forwarders can re-publish entries during keyspace rebalancing with their own Routed signature
-- Receivers can always verify the location signature against the correct owner
+The owner's identity comes from `src_node_id` in the Routed header, and `src_pubkey` is the owner's public key. The Routed signature authenticates the entire message including `src_addr`.
 
-**Routing behavior:** Routed messages are forwarded as-is during normal routing (only TTL decremented). For keyspace rebalancing, a node creates a new Routed message (signed with their own key) containing the original PUBLISH payload.
+Storage nodes store: `src_node_id` (owner), `src_pubkey`, `src_addr` (keyspace address), `replica_index`, `seq`, `payload`, and `signature` (for rebalancing).
+
+**Rebalancing:** When keyspace ownership changes (e.g., a new child joins), the storage node reconstructs and re-routes stored PUBLISH messages. The signature remains valid because it covers `dest_addr` (the key), which doesn't change.
 
 **PUBLISH verification order** (storage node receiving a PUBLISH):
-1. Verify Routed signature against `src_node_id` (authenticates sender)
-   - If pubkey not cached: queue message, request via next Pulse (need_pubkey)
-2. Parse PUBLISH payload to extract `owner_node_id`, `tree_addr`, `seq`, `location_signature`
-3. Verify location signature against `owner_node_id` (covers `"LOC:" || owner_node_id || tree_addr || seq`)
-   - If pubkey not cached: queue message, request via next Pulse (need_pubkey)
-4. Verify keyspace ownership: at least one of `hash(owner_node_id || 0)`, `hash(owner_node_id || 1)`, `hash(owner_node_id || 2)` falls in my range
-5. Verify `seq > existing_seq` for this `owner_node_id` (replay protection)
+1. Verify `src_node_id == hash(src_pubkey)[..16]` (pubkey bound to node_id)
+2. Verify Routed signature against `src_pubkey`
+3. Parse PUBLISH payload to extract `replica_index`, `seq`
+4. Verify keyspace ownership: `dest_addr` falls in my range
+5. Verify `seq > existing_seq` for this `src_node_id` (replay protection)
 6. Store entry with current timestamp for expiry tracking
-
-**Pubkey queue:** Messages awaiting pubkey verification are held in a small bounded queue (e.g., 16 entries). When a pubkey arrives via Pulse, queued messages for that node_id are re-processed. When the queue is full, oldest entries are evicted. This reduces retransmission overhead.
 
 ### Lookup (LOOKUP / FOUND)
 
@@ -1127,26 +1181,36 @@ impl Node {
 
     fn send_lookup(&self, target: NodeId, replica: usize) {
         let key = hash_to_u32(&[&target[..], &[replica as u8]].concat());
-
         self.send_routed(Routed {
-            dest_addr: self.addr_for_key(key),
-            dest_node_id: None,
-            msg_type: LOOKUP,
-            payload: target.to_vec(),
+            flags_and_type: LOOKUP | HAS_DEST_HASH | HAS_SRC_ADDR,
+            dest_addr: key,                           // route toward this key
+            dest_hash: Some(hash(&target)[..4]),      // identifies who we're looking for
+            src_addr: Some(self.my_address()),        // for FOUND reply
+            payload: encode(replica as u8),           // just replica_index
             ...
         });
     }
 
     fn handle_lookup(&self, msg: Routed) {
-        let target: NodeId = msg.payload.try_into().unwrap();
+        let replica: u8 = decode(&msg.payload);
+        let dest_hash = msg.dest_hash.unwrap();
 
-        if let Some(entry) = self.location_store.get(&target) {
+        // Find entry matching dest_hash
+        if let Some(entry) = self.location_store.values()
+            .find(|e| hash(&e.node_id)[..4] == dest_hash)
+        {
+            // Verify key matches (dest_addr should equal hash(node_id || replica))
+            let expected_key = hash_to_u32(&[&entry.node_id[..], &[replica]].concat());
+            if expected_key != msg.dest_addr {
+                return;  // key mismatch, wrong replica
+            }
+
             self.send_routed(Routed {
-                dest_addr: msg.src_addr,
-                dest_node_id: Some(msg.src_node_id),
-                msg_type: FOUND,
-                payload: encode(&entry.node_id, &entry.tree_addr,
-                               entry.seq, &entry.signature),
+                flags_and_type: FOUND | HAS_DEST_HASH,
+                dest_addr: msg.src_addr.unwrap(),     // route back to requester
+                dest_hash: Some(hash(&msg.src_node_id)[..4]),
+                src_addr: None,  // no reply expected
+                payload: encode(&entry.pubkey, entry.keyspace_addr, entry.seq),
                 ...
             });
         }
@@ -1154,30 +1218,33 @@ impl Node {
     }
 
     fn handle_found(&mut self, msg: Routed) {
-        let (node_id, tree_addr, seq, signature) = decode(&msg.payload);
+        let (pubkey, keyspace_addr, seq): (PublicKey, u32, u32) = decode(&msg.payload);
 
-        if self.pending_lookups.remove(&node_id).is_none() {
-            return;  // Unexpected
+        // Find which pending lookup this matches (by pubkey → node_id)
+        let node_id: NodeId = hash(&pubkey)[..16].try_into().unwrap();
+        if !self.pending_lookups.contains_key(&node_id) {
+            return;  // no matching pending lookup
         }
+        self.pending_lookups.remove(&node_id);
 
-        // Verify the location signature
-        let pubkey = self.pubkey_cache.get(&node_id)?;
-        if !verify(pubkey, &signature, &encode(b"LOC:", &node_id, &tree_addr, seq)) {
-            return;
-        }
-
-        self.location_cache.insert(node_id, tree_addr);
+        // Cache both location and pubkey
+        self.location_cache.insert(node_id, keyspace_addr);
+        self.pubkey_cache.insert(node_id, pubkey);
     }
 }
 ```
 
-**LOOKUP payload:** `target_node_id` (16 bytes)
+**LOOKUP payload:** `replica_index (1)` = 1 byte
 
-**FOUND payload:** `target_node_id (16) || tree_addr (1+⌈D/2⌉) || seq (varint, 1-5) || location_signature (65)`
+The target is identified by `dest_hash`. The storage node finds an entry matching that hash and verifies the key.
+
+**FOUND payload:** `target_pubkey (32) || keyspace_addr (4) || seq (varint, 1-5)` = 37-41 bytes
+
+FOUND includes the target's pubkey so the requester can derive the node_id and immediately verify signatures from that node.
 
 **Lookup process:**
-1. Send LOOKUP to replica 0
-2. If no FOUND within 30s, try replica 1
+1. Send LOOKUP for replica 0
+2. If no FOUND within 32τ, try replica 1
 3. If still no response, try replica 2
 4. After all replicas timeout, lookup fails
 
@@ -1201,7 +1268,7 @@ Expiry is handled entirely by storage nodes using local clocks:
 |-----------|-------|
 | Storage TTL | 12 hours |
 | Refresh interval | 8 hours |
-| Republish trigger | Tree address change |
+| Republish trigger | Published address no longer in our keyspace range |
 
 ```rust
 fn cleanup_expired(&mut self) {
@@ -1217,10 +1284,11 @@ Dead nodes stop refreshing → entries expire → no stale data.
 When subtree sizes change, keyspace ranges shift. Storage nodes push entries to new owners:
 
 ```rust
-fn on_range_change(&mut self, old_range: Range, new_range: Range) {
+fn on_range_change(&mut self, old_range: (u32, u32), new_range: (u32, u32)) {
     for entry in self.location_store.values() {
-        let key = hash_to_u32(&entry.node_id);
-        if !new_range.contains(key) {
+        let key = hash_to_u32(&[&entry.node_id[..], &[entry.replica_index]].concat());
+        if key < new_range.0 || key >= new_range.1 {
+            // Entry's key is no longer in our range - forward it
             self.forward_entry_to_new_owner(entry);
         }
     }
@@ -1235,31 +1303,30 @@ This part shows how to find and message any node in the network.
 
 ### Complete Example
 
-Node A (at `[1, 2]`) wants to send data to node B:
+Node A wants to send data to node B:
 
 **Step 1: A looks up B's location**
 ```
-A computes: hash(B.node_id) → key 0x7A3F0000
-A determines: key maps to tree address [0, 3]
-A sends: LOOKUP to [0, 3] with payload B.node_id
+A computes: key = hash(B.node_id || 0x00) → 0x7A3F0000
+A sends: LOOKUP with dest_addr=0x7A3F0000, dest_hash=hash(B)[..4]
 ```
 
 **Step 2: Storage node responds**
 ```
-Node [0,3] finds B's entry, sends FOUND to A
-Payload: B.node_id || B.tree_addr || B's signature
+Storage node finds B's entry, sends FOUND to A
+Payload: B.pubkey || B.keyspace_addr || B.seq
 ```
 
 **Step 3: A verifies and sends DATA**
 ```
-A verifies B's signature using B's cached pubkey
-A sends: DATA to B.tree_addr with dest_node_id = Some(B)
+A derives B.node_id from B.pubkey, caches both
+A sends: DATA with dest_addr=B.keyspace_addr, dest_hash=hash(B)[..4]
 ```
 
 **Step 4: B receives DATA**
 ```
-B receives message at its tree address
-B verifies dest_node_id matches its own node_id
+B's keyspace range contains dest_addr
+B verifies dest_hash matches hash(B.node_id)[..4]
 B processes payload
 ```
 
@@ -1267,11 +1334,12 @@ B processes payload
 
 ```rust
 impl Node {
-    fn send_data(&self, target_id: NodeId, target_addr: Vec<u8>, data: Vec<u8>) {
+    fn send_data(&self, target_id: NodeId, target_addr: u32, data: Vec<u8>) {
         self.send_routed(Routed {
+            flags_and_type: DATA | HAS_DEST_HASH | HAS_SRC_ADDR,
             dest_addr: target_addr,
-            dest_node_id: Some(target_id),
-            msg_type: DATA,
+            dest_hash: Some(hash(&target_id)[..4]),
+            src_addr: Some(self.my_address()),
             payload: data,
             ...
         });
@@ -1281,7 +1349,7 @@ impl Node {
 
 ### Stale Address Handling
 
-During tree reshuffles, cached addresses may become stale.
+During tree reshuffles, cached keyspace addresses may become stale.
 
 **For request-response patterns:** Timeout triggers re-lookup and retry:
 
@@ -1289,7 +1357,7 @@ During tree reshuffles, cached addresses may become stale.
 impl Node {
     fn send_request(&mut self, target_id: NodeId, data: Vec<u8>) {
         if let Some(addr) = self.location_cache.get(&target_id) {
-            self.send_data(target_id, addr.clone(), data.clone());
+            self.send_data(target_id, *addr, data.clone());
             self.pending_requests.insert(target_id, PendingRequest {
                 data,
                 sent_at: now(),
@@ -1469,43 +1537,44 @@ Applications needing stronger guarantees should implement their own ack/retry at
 | Field | Size |
 |-------|------|
 | node_id | 16 |
-| parent_id | 1 or 17 |
-| root_id | 16 |
+| flags | 1 (bits 0-2: has_parent, need_pubkey, has_pubkey; bits 3-7: child_count) |
+| parent_hash | 0 or 4 |
+| root_hash | 4 |
 | subtree_size | 1-3 (varint) |
 | tree_size | 1-3 (varint) |
-| tree_addr | 1 + ⌈D/2⌉ (nibble-packed) |
-| need_pubkey | 1 |
+| keyspace_lo | 4 |
+| keyspace_hi | 4 |
 | pubkey | 0 or 32 |
-| child_prefix_len | 1 |
-| children | variable |
+| children | N × (4 + varint) — 4-byte hash + subtree_size, sorted by hash |
 | signature | 65 |
 
 **Routed (unicast):**
 
 | Field | Size |
 |-------|------|
-| dest_addr | 1 + ⌈D/2⌉ (nibble-packed) |
-| dest_node_id | 1 or 17 |
-| src_addr | 1 or 1 + ⌈D/2⌉ (optional, nibble-packed) |
+| flags_and_type | 1 (bits 0-3: msg_type; bit 4: has_dest_hash; bit 5: has_src_addr) |
+| dest_addr | 4 (u32 keyspace location) |
+| dest_hash | 0 or 4 |
+| src_addr | 0 or 4 (u32 keyspace location) |
 | src_node_id | 16 |
-| msg_type | 1 |
+| src_pubkey | 32 |
 | ttl | 1 |
 | payload | variable |
 | signature | 65 |
 
-*Tree addresses are nibble-packed: 1 byte depth + ⌈depth/2⌉ bytes of nibbles. Signature is 65 bytes: 1 byte algorithm + 64 bytes Ed25519.*
+*Keyspace addresses are fixed 4-byte u32 values. Signature is 65 bytes: 1 byte algorithm + 64 bytes Ed25519.*
 
 **Message types:**
 
-| Type | Value | dest_node_id | Payload |
-|------|-------|--------------|---------|
-| PUBLISH | 0 | None | owner_node_id, tree_addr, seq (varint), location_signature |
-| LOOKUP | 1 | None | target_node_id |
-| FOUND | 2 | Some | target_node_id, tree_addr, seq (varint), location_signature |
-| DATA | 3 | Some | application data |
-| ACK | 4 | — | hash (8 bytes) |
+| Type | Value | dest_hash | src_addr | Payload |
+|------|-------|-----------|----------|---------|
+| PUBLISH | 0 | None | Some | replica_index (1), seq (varint) |
+| LOOKUP | 1 | Some | Some | replica_index (1) |
+| FOUND | 2 | Some | None | target_pubkey (32), keyspace_addr (4), seq (varint) |
+| DATA | 3 | Some | 0/1 | application data |
+| ACK | 4 | — | — | hash (8 bytes) |
 
-*Location signature covers `"LOC:" || owner_node_id || tree_addr || seq`. Routed signature covers all fields except ttl. src_addr is None for PUBLISH and FOUND (no response expected).*
+*Routed signature covers all fields except ttl. For PUBLISH, src_node_id is the owner, src_addr is their published location, and src_pubkey enables immediate signature verification.*
 
 ### Bandwidth
 
@@ -1677,7 +1746,7 @@ E[hop] = Σ P^k × (1-P) × time(k)   where time(k) ≈ 2^k τ for k retries
 
 *Note: Exponential backoff (1τ, 2τ, 4τ, 8τ...) makes repeated failures very costly. At 50% loss, P(need 3+ retries) = 12.5%. At 70% loss, P(need 3+ retries) = 34%.*
 
-**With prefetched tree address (DATA only):**
+**With prefetched keyspace address (DATA only):**
 
 | Network | Congestion | Hops | Per-Hop | Total | LoRa Time |
 |---------|------------|------|---------|-------|-----------|
@@ -1723,7 +1792,7 @@ Total hops ≈ 3 × depth (LOOKUP to storage node + FOUND back + DATA to destina
 | Large network (1K), lookup | ~20s | ~64s | ~4 min | ~16 min |
 
 **Key takeaways:**
-1. **Prefetching cuts latency by ~3×** — Cache tree addresses when possible
+1. **Prefetching cuts latency by ~3×** — Cache keyspace addresses when possible
 2. **Congestion has dramatic impact** — 50× between light and severe loss
 3. **Network size has modest impact** — Logarithmic scaling (4 vs 12 hops for 10 vs 1000 nodes)
 4. **For LoRa, expect seconds to minutes** — This is a low-bandwidth, high-latency network
