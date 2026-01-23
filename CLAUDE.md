@@ -44,3 +44,13 @@ README.md and CLAUDE.md should refer to docs/* files when useful.
   the project directory.
 - Never use Rust unsafe code unless it's really necessary, and very well motivated
   in comments.
+
+### Embedded-Friendly Code
+
+This project targets embedded devices. Follow these rules:
+
+- **No recursion** - use iterative algorithms instead
+- **No large stack allocations** - use heap (`Vec`, `Box`) for buffers >64 bytes
+- **Limit call depth** - avoid deeply nested function calls (>8 levels)
+- **Prefer bounded collections** - validate sizes at decode time, use MAX_* constants
+- **No floating point in hot paths** - integer arithmetic preferred (libm only for fraud detection)

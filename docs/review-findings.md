@@ -105,16 +105,6 @@ Allow compile-time tuning of MAX_NEIGHBORS, MAX_PUBKEY_CACHE, etc. for different
 
 Design doc: `MAX_RETRIES = 8`, Implementation: `MAX_RETRIES = 3`. Not currently used since link-layer reliability isn't implemented.
 
-### Stack overflow protection needed
-**Source:** 2026-01-22 discussion
-
-For embedded targets with limited stack, consider:
-- Stack probes or canaries
-- Bounded recursion analysis
-- Static stack usage analysis (e.g., `cargo call-stack`)
-
-Currently no recursion in the codebase, but message handling depth should be verified.
-
 ---
 
 ## Verified Working Correctly
