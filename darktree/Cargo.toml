@@ -8,6 +8,7 @@ description = "Tree-based DHT protocol for LoRa mesh networks"
 
 [features]
 default = []
+std = ["critical-section/std", "hashbrown/default"]
 default-crypto = ["dep:ed25519-dalek", "dep:sha2"]
 
 [dependencies]
@@ -15,7 +16,9 @@ ed25519-dalek = { version = "2", features = ["rand_core"], optional = true }
 sha2 = { version = "0.10", optional = true }
 embassy-sync = "0.6"
 embassy-futures = "0.1"
-critical-section = { version = "1.1", features = ["std"] }
+critical-section = "1.1"
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
+libm = "0.2"
 
 [dev-dependencies]
 ed25519-dalek = { version = "2", features = ["rand_core"] }

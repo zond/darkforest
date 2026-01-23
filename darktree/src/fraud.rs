@@ -3,6 +3,8 @@
 //! This module implements statistical detection of inflated tree sizes
 //! based on PUBLISH traffic analysis.
 
+use alloc::vec::Vec;
+
 use crate::node::Node;
 use crate::time::Timestamp;
 use crate::traits::{Clock, Crypto, Random, Transport};
@@ -111,7 +113,7 @@ where
 
         // Z-score: how many standard deviations below expected
         // For Poisson distribution, variance = expected, so std_dev = sqrt(expected)
-        let z = (expected - observed) / expected.sqrt();
+        let z = (expected - observed) / libm::sqrt(expected);
 
         z > FRAUD_Z_THRESHOLD
     }

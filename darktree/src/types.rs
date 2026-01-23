@@ -1,5 +1,6 @@
 //! Core types and constants for the darktree protocol.
 
+use alloc::vec::Vec;
 use core::fmt;
 
 use crate::time::{Duration, Timestamp};

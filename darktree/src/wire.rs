@@ -14,6 +14,8 @@
 //!   → 0x05 0x37 0x2F 0x10
 //! ```
 
+use alloc::vec::Vec;
+
 use crate::types::{ChildrenList, LocationEntry, Pulse, Routed, Signature, MAX_TREE_DEPTH};
 
 /// Decoding error types.
@@ -640,6 +642,8 @@ pub fn location_sign_data(node_id: &[u8; 16], tree_addr: &[u8], seq: u32) -> Wri
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     use crate::types::ALGORITHM_ED25519;
 

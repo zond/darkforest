@@ -23,7 +23,9 @@
 //! let data = node.incoming().receive().await;
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::vec::Vec;
+use hashbrown::HashMap;
 
 use embassy_sync::channel::Channel;
 

@@ -6,7 +6,9 @@
 //! - Child management
 //! - Neighbor timeouts
 
-use std::cmp::Ordering;
+use core::cmp::Ordering;
+
+use alloc::vec::Vec;
 
 use crate::node::{JoinContext, NeighborTiming, Node};
 use crate::time::{Duration, Timestamp};
@@ -473,28 +475,28 @@ where
             return 0;
         }
 
-        // Collect child node IDs
-        let ids: Vec<[u8; 16]> = self.children().keys().copied().collect();
+        // Collect and sort child node IDs
+        let mut ids: Vec<[u8; 16]> = self.children().keys().copied().collect();
+        ids.sort();
 
-        // Find minimum prefix length that distinguishes all
-        for prefix_len in 1..=16u8 {
-            let mut prefixes = std::collections::HashSet::new();
-            let mut unique = true;
-
-            for id in &ids {
-                let prefix = &id[..prefix_len as usize];
-                if !prefixes.insert(prefix.to_vec()) {
-                    unique = false;
-                    break;
-                }
+        // Find minimum prefix length needed to distinguish adjacent sorted IDs.
+        // After sorting, if any two IDs share a prefix, they will be adjacent.
+        let mut min_len: u8 = 1;
+        for pair in ids.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            // Find first differing byte
+            let mut diff_pos = 0;
+            while diff_pos < 16 && a[diff_pos] == b[diff_pos] {
+                diff_pos += 1;
             }
-
-            if unique {
-                return prefix_len;
+            // Need prefix_len = diff_pos + 1 to distinguish these two
+            let needed = (diff_pos + 1).min(16) as u8;
+            if needed > min_len {
+                min_len = needed;
             }
         }
 
-        16 // Worst case: need full node ID
+        min_len
     }
 
     /// Build and send a Pulse message.

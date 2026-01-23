@@ -6,6 +6,7 @@
 //! - Time sources (real hardware time, simulated time)
 //! - Random number generators
 
+use alloc::vec::Vec;
 use core::future::Future;
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -268,6 +269,9 @@ pub trait Random {
 pub mod test_impls {
     //! Test implementations of traits for unit testing.
 
+    use core::cell::Cell;
+    use core::future::{ready, Ready};
+
     use super::*;
     use crate::types::ALGORITHM_ED25519;
 
@@ -377,13 +381,13 @@ pub mod test_impls {
 
     /// Mock clock for testing (synchronous, time advances manually).
     pub struct MockClock {
-        current: std::cell::Cell<Timestamp>,
+        current: Cell<Timestamp>,
     }
 
     impl Default for MockClock {
         fn default() -> Self {
             Self {
-                current: std::cell::Cell::new(Timestamp::ZERO),
+                current: Cell::new(Timestamp::ZERO),
             }
         }
     }
@@ -395,7 +399,7 @@ pub mod test_impls {
 
         pub fn at(time: Timestamp) -> Self {
             Self {
-                current: std::cell::Cell::new(time),
+                current: Cell::new(time),
             }
         }
 
@@ -411,7 +415,7 @@ pub mod test_impls {
     }
 
     impl Clock for MockClock {
-        type SleepFuture<'a> = std::future::Ready<()>;
+        type SleepFuture<'a> = Ready<()>;
 
         fn now(&self) -> Timestamp {
             self.current.get()
@@ -420,7 +424,7 @@ pub mod test_impls {
         fn sleep_until(&self, _time: Timestamp) -> Self::SleepFuture<'_> {
             // In synchronous tests, sleep completes immediately.
             // The test code should advance time manually.
-            std::future::ready(())
+            ready(())
         }
     }
 

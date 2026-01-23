@@ -5,6 +5,8 @@
 //! - Looking up node locations
 //! - Storing and retrieving location entries
 
+use alloc::vec::Vec;
+
 use crate::node::Node;
 use crate::time::Timestamp;
 use crate::traits::{Clock, Crypto, Random, Transport};

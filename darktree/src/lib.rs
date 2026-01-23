@@ -2,6 +2,9 @@
 //!
 //! A protocol for building mesh networks over LoRa radios with O(log N) routing.
 //!
+//! This crate is `no_std` compatible. Use the `std` feature (enabled by default)
+//! for std environments, or disable default features for embedded targets.
+//!
 //! # Key Properties
 //!
 //! - Nodes form a spanning tree via periodic broadcasts
@@ -44,6 +47,10 @@
 //! - [`fraud`] - Fraud detection
 //! - [`time`] - Timestamp and Duration types
 
+#![no_std]
+
+extern crate alloc;
+
 pub mod dht;
 pub mod fraud;
 pub mod node;
@@ -72,6 +79,8 @@ pub use types::{
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     use crate::node::JoinContext;
     use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};

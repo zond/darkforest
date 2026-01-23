@@ -17,18 +17,6 @@ The entire link-layer reliability system is missing:
 
 **Impact:** Without hop-by-hop reliability, multi-hop message delivery degrades severely. With 50% loss per hop and 6 hops, only ~1.5% of messages arrive.
 
-### No-std incompatible
-**Source:** Embedded reviewer
-**Location:** `node.rs:26`
-
-```rust
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-```
-
-Cannot compile for `#![no_std]` targets (Cortex-M, etc.).
-
-**Fix:** Use `hashbrown::HashMap` or `heapless` collections, change to `alloc::collections` for BTreeMap/BTreeSet.
-
 ### Keyspace calculation broken outside subtree
 **Source:** Protocol reviewer
 **Location:** `routing.rs:195-263`
@@ -117,6 +105,16 @@ Allow compile-time tuning of MAX_NEIGHBORS, MAX_PUBKEY_CACHE, etc. for different
 
 Design doc: `MAX_RETRIES = 8`, Implementation: `MAX_RETRIES = 3`. Not currently used since link-layer reliability isn't implemented.
 
+### Stack overflow protection needed
+**Source:** 2026-01-22 discussion
+
+For embedded targets with limited stack, consider:
+- Stack probes or canaries
+- Bounded recursion analysis
+- Static stack usage analysis (e.g., `cargo call-stack`)
+
+Currently no recursion in the codebase, but message handling depth should be verified.
+
 ---
 
 ## Verified Working Correctly
@@ -137,3 +135,4 @@ Design doc: `MAX_RETRIES = 8`, Implementation: `MAX_RETRIES = 3`. Not currently 
 - Fraud detection wired up and tested
 - RSSI-based parent selection with discovery phase
 - Shortcut routing optimization
+- no_std compatible (uses alloc, hashbrown for HashMap)
