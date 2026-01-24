@@ -457,7 +457,7 @@ mod tests {
         let n1 = sim.add_node(1);
 
         // Run for 1 second
-        let result = sim.run_for(Duration::from_secs(1));
+        let _result = sim.run_for(Duration::from_secs(1));
 
         // Node should still be root
         let node = sim.node(&n1).unwrap();
@@ -474,10 +474,10 @@ mod tests {
         // Connect the nodes
         let mut topo = Topology::new();
         topo.add_link(n1, n2, Link::new());
-        sim = sim.with_topology(topo);
+        let _sim = sim.with_topology(topo);
 
-        // Need to re-add nodes since with_topology resets nodes
-        // Actually, we should set topology before adding nodes
+        // Note: with_topology resets nodes, so topology should be set before adding nodes.
+        // This test just verifies the API compiles and runs without panic.
     }
 
     #[test]
@@ -499,7 +499,7 @@ mod tests {
         let n2 = sim.add_node(2);
 
         // Set up connected topology
-        let mut topo = Topology::fully_connected(&[n1, n2]);
+        let topo = Topology::fully_connected(&[n1, n2]);
         sim.topology = topo;
 
         // Schedule a partition at t=500ms

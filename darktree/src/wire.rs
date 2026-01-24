@@ -1083,4 +1083,293 @@ mod tests {
         let decoded = r.read_child_hash().unwrap();
         assert_eq!(hash, decoded);
     }
+
+    // ========================================================================
+    // Property-based fuzz tests using arbtest
+    // ========================================================================
+    //
+    // These tests use arbtest for property-based testing. By default they run
+    // a limited number of iterations suitable for CI. For deeper fuzzing, run:
+    //   ARBTEST_BUDGET_MS=10000 cargo test fuzz_
+    //
+    // The budget is in milliseconds (default ~100ms per test).
+
+    /// Arbitrary bytes must not panic the Message decoder.
+    #[test]
+    fn fuzz_message_decode_no_panic() {
+        arbtest::arbtest(|u| {
+            let len: usize = u.int_in_range(0..=300)?;
+            let data: Vec<u8> = (0..len).map(|_| u.arbitrary()).collect::<Result<_, _>>()?;
+            let _ = Message::decode_from_slice(&data);
+            Ok(())
+        });
+    }
+
+    /// Arbitrary bytes must not panic the Pulse decoder.
+    #[test]
+    fn fuzz_pulse_decode_no_panic() {
+        arbtest::arbtest(|u| {
+            let len: usize = u.int_in_range(0..=300)?;
+            let data: Vec<u8> = (0..len).map(|_| u.arbitrary()).collect::<Result<_, _>>()?;
+            let _ = Pulse::decode_from_slice(&data);
+            Ok(())
+        });
+    }
+
+    /// Arbitrary bytes must not panic the Routed decoder.
+    #[test]
+    fn fuzz_routed_decode_no_panic() {
+        arbtest::arbtest(|u| {
+            let len: usize = u.int_in_range(0..=300)?;
+            let data: Vec<u8> = (0..len).map(|_| u.arbitrary()).collect::<Result<_, _>>()?;
+            let _ = Routed::decode_from_slice(&data);
+            Ok(())
+        });
+    }
+
+    /// Arbitrary bytes must not panic the varint decoder.
+    #[test]
+    fn fuzz_varint_decode_no_panic() {
+        arbtest::arbtest(|u| {
+            let len: usize = u.int_in_range(0..=10)?;
+            let data: Vec<u8> = (0..len).map(|_| u.arbitrary()).collect::<Result<_, _>>()?;
+            let mut r = Reader::new(&data);
+            let _ = r.read_varint();
+            Ok(())
+        });
+    }
+
+    /// Valid varints round-trip correctly.
+    #[test]
+    fn fuzz_varint_roundtrip() {
+        arbtest::arbtest(|u| {
+            let val: u32 = u.arbitrary()?;
+            let mut w = Writer::new();
+            w.write_varint(val);
+            let encoded = w.finish();
+            let mut r = Reader::new(&encoded);
+            let decoded = r.read_varint().unwrap();
+            assert_eq!(val, decoded);
+            assert!(r.is_empty());
+            Ok(())
+        });
+    }
+
+    /// Valid Pulse messages round-trip correctly.
+    #[test]
+    fn fuzz_pulse_roundtrip() {
+        arbtest::arbtest(|u| {
+            let node_id: [u8; 16] = u.arbitrary()?;
+            let has_parent: bool = u.arbitrary()?;
+            let need_pubkey: bool = u.arbitrary()?;
+            let has_pubkey: bool = u.arbitrary()?;
+            let child_count: u8 = u.int_in_range(0..=12)?;
+
+            let parent_hash: Option<[u8; 4]> = if has_parent {
+                Some(u.arbitrary()?)
+            } else {
+                None
+            };
+            let root_hash: [u8; 4] = u.arbitrary()?;
+
+            // subtree_size >= 1, tree_size >= subtree_size
+            let subtree_size: u32 = u.int_in_range(1..=1_000_000)?;
+            let tree_size: u32 = u.int_in_range(subtree_size..=1_000_000)?;
+
+            // keyspace_lo <= keyspace_hi
+            let keyspace_lo: u32 = u.arbitrary()?;
+            let keyspace_hi: u32 = u.int_in_range(keyspace_lo..=u32::MAX)?;
+
+            let pubkey: Option<[u8; 32]> = if has_pubkey {
+                Some(u.arbitrary()?)
+            } else {
+                None
+            };
+
+            // Generate unique child hashes by using index as part of hash
+            let mut children: ChildrenList = vec![];
+            for i in 0..child_count {
+                let base: [u8; 4] = u.arbitrary()?;
+                // Make unique by XORing with index
+                let hash = [base[0], base[1], base[2], base[3] ^ i];
+                let size: u32 = u.int_in_range(1..=1_000_000)?;
+                children.push((hash, size));
+            }
+            children.sort_by(|a, b| a.0.cmp(&b.0));
+            // Deduplicate (unlikely but possible)
+            children.dedup_by(|a, b| a.0 == b.0);
+
+            let sig: [u8; 64] = u.arbitrary()?;
+            let pulse = Pulse {
+                node_id,
+                flags: Pulse::build_flags(
+                    has_parent,
+                    need_pubkey,
+                    has_pubkey,
+                    children.len() as u8,
+                ),
+                parent_hash,
+                root_hash,
+                subtree_size,
+                tree_size,
+                keyspace_lo,
+                keyspace_hi,
+                pubkey,
+                children,
+                signature: Signature {
+                    algorithm: ALGORITHM_ED25519,
+                    sig,
+                },
+            };
+
+            let encoded = pulse.encode_to_vec();
+            let decoded = Pulse::decode_from_slice(&encoded).expect("valid pulse should decode");
+            assert_eq!(pulse.node_id, decoded.node_id);
+            assert_eq!(pulse.flags, decoded.flags);
+            assert_eq!(pulse.root_hash, decoded.root_hash);
+            Ok(())
+        });
+    }
+
+    /// Valid Routed messages round-trip correctly.
+    #[test]
+    fn fuzz_routed_roundtrip() {
+        arbtest::arbtest(|u| {
+            let msg_type: u8 = u.int_in_range(0..=3)?;
+            let has_dest_hash: bool = u.arbitrary()?;
+            let has_src_addr: bool = u.arbitrary()?;
+            let has_src_pubkey: bool = u.arbitrary()?;
+
+            let dest_addr: u32 = u.arbitrary()?;
+            let dest_hash: Option<[u8; 4]> = if has_dest_hash {
+                Some(u.arbitrary()?)
+            } else {
+                None
+            };
+            let src_addr: Option<u32> = if has_src_addr {
+                Some(u.arbitrary()?)
+            } else {
+                None
+            };
+            let src_node_id: [u8; 16] = u.arbitrary()?;
+            let src_pubkey: Option<[u8; 32]> = if has_src_pubkey {
+                Some(u.arbitrary()?)
+            } else {
+                None
+            };
+            let ttl: u8 = u.arbitrary()?;
+
+            // Limit payload size
+            let payload_len: usize = u.int_in_range(0..=100)?;
+            let payload: Vec<u8> = (0..payload_len)
+                .map(|_| u.arbitrary())
+                .collect::<Result<_, _>>()?;
+
+            let sig: [u8; 64] = u.arbitrary()?;
+            let routed = Routed {
+                flags_and_type: Routed::build_flags_and_type(
+                    msg_type,
+                    has_dest_hash,
+                    has_src_addr,
+                    has_src_pubkey,
+                ),
+                dest_addr,
+                dest_hash,
+                src_addr,
+                src_node_id,
+                src_pubkey,
+                ttl,
+                payload,
+                signature: Signature {
+                    algorithm: ALGORITHM_ED25519,
+                    sig,
+                },
+            };
+
+            let encoded = routed.encode_to_vec();
+            let decoded = Routed::decode_from_slice(&encoded).expect("valid routed should decode");
+            assert_eq!(routed.dest_addr, decoded.dest_addr);
+            assert_eq!(routed.src_node_id, decoded.src_node_id);
+            assert_eq!(routed.ttl, decoded.ttl);
+            assert_eq!(routed.payload, decoded.payload);
+            Ok(())
+        });
+    }
+
+    /// Invalid wire types are rejected.
+    #[test]
+    fn fuzz_invalid_wire_type_rejected() {
+        arbtest::arbtest(|u| {
+            let wire_type: u8 = u.int_in_range(0x04..=0xFF)?;
+            let extra_len: usize = u.int_in_range(0..=50)?;
+            let mut data = vec![wire_type];
+            for _ in 0..extra_len {
+                data.push(u.arbitrary()?);
+            }
+            assert!(Message::decode_from_slice(&data).is_err());
+            Ok(())
+        });
+    }
+
+    /// Messages with trailing bytes are rejected.
+    #[test]
+    fn test_trailing_bytes_rejected() {
+        // Valid Ack + trailing byte
+        let ack = Ack {
+            hash: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let mut encoded = Message::Ack(ack).encode_to_vec();
+        encoded.push(0xFF); // Add trailing byte
+
+        let result = Message::decode_from_slice(&encoded);
+        assert!(
+            matches!(result, Err(DecodeError::InvalidLength)),
+            "trailing bytes should be rejected"
+        );
+    }
+
+    /// Pulse with unsorted children is rejected.
+    #[test]
+    fn test_unsorted_children_rejected() {
+        // Manually construct a pulse with unsorted children
+        let mut w = Writer::new();
+
+        // Wire type
+        w.write_u8(0x01);
+
+        // node_id
+        w.write_node_id(&[1u8; 16]);
+
+        // flags: has_parent=false, need_pubkey=false, has_pubkey=false, child_count=2
+        let flags = 2 << 3; // 2 children, no other flags
+        w.write_u8(flags);
+
+        // root_hash
+        w.write_child_hash(&[0xAA; 4]);
+
+        // subtree_size, tree_size
+        w.write_varint(3);
+        w.write_varint(3);
+
+        // keyspace_lo, keyspace_hi
+        w.write_u32_be(0);
+        w.write_u32_be(u32::MAX);
+
+        // Children in WRONG order (0xBB > 0xAA, so should be AA first)
+        w.write_child_hash(&[0xBB; 4]);
+        w.write_varint(1);
+        w.write_child_hash(&[0xAA; 4]);
+        w.write_varint(1);
+
+        // signature
+        w.write_u8(ALGORITHM_ED25519);
+        w.write_bytes(&[0u8; 64]);
+
+        let encoded = w.finish();
+        let result = Pulse::decode_from_slice(&encoded);
+        assert!(
+            matches!(result, Err(DecodeError::InvalidValue)),
+            "unsorted children should be rejected with InvalidValue"
+        );
+    }
 }

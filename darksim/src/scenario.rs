@@ -199,7 +199,7 @@ impl ScenarioBuilder {
 
         // Now create nodes (they will use the correct topology)
         let mut node_ids = Vec::with_capacity(self.num_nodes);
-        for i in 0..self.num_nodes {
+        for (i, &predicted_id) in predicted_node_ids.iter().enumerate().take(self.num_nodes) {
             let node_seed = self.seed.wrapping_add(i as u64 * 1000);
             let node_id = if let Some(bw) = self.bandwidth {
                 sim.add_node_with_bandwidth(node_seed, bw)
@@ -208,9 +208,9 @@ impl ScenarioBuilder {
             };
             // Verify prediction matches actual
             debug_assert_eq!(
-                node_id, predicted_node_ids[i],
+                node_id, predicted_id,
                 "Node ID prediction mismatch for node {}: predicted {:?} vs actual {:?}",
-                i, predicted_node_ids[i], node_id
+                i, predicted_id, node_id
             );
             node_ids.push(node_id);
         }
@@ -282,7 +282,7 @@ mod tests {
         let result = simple_scenario(2).run_for(Duration::from_secs(1));
 
         assert!(result.end_time >= Timestamp::from_secs(1));
-        assert!(result.metrics.snapshots.len() > 0);
+        assert!(!result.metrics.snapshots.is_empty());
     }
 
     #[test]

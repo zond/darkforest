@@ -429,16 +429,9 @@ pub mod test_impls {
     }
 
     /// Mock crypto for testing (deterministic, NOT cryptographically secure).
+    #[derive(Default)]
     pub struct MockCrypto {
         pub next_keypair_seed: u8,
-    }
-
-    impl Default for MockCrypto {
-        fn default() -> Self {
-            Self {
-                next_keypair_seed: 0,
-            }
-        }
     }
 
     impl MockCrypto {
@@ -469,11 +462,10 @@ pub mod test_impls {
                 return false;
             }
             // For testing, we can't verify without the secret key,
-            // so we just check the format
-            let hash = self.hash(&[pubkey.as_slice(), message].concat());
-            // In real impl this would verify the signature
-            // For mock, just check non-zero
-            sig.sig[..32] != [0u8; 32] && hash[0] == hash[0]
+            // so we just check the format is valid (non-zero signature)
+            // Real impl would verify cryptographically
+            let _ = (pubkey, message); // Acknowledge inputs are intentionally unused
+            sig.sig[..32] != [0u8; 32]
         }
 
         fn generate_keypair(&mut self) -> (PublicKey, SecretKey) {

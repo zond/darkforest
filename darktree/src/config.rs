@@ -160,6 +160,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_small_config_smaller_than_default() {
         assert!(SmallConfig::MAX_NEIGHBORS < DefaultConfig::MAX_NEIGHBORS);
         assert!(SmallConfig::MAX_PUBKEY_CACHE < DefaultConfig::MAX_PUBKEY_CACHE);
@@ -178,6 +179,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_configs_are_nonzero() {
         // DefaultConfig
         assert!(DefaultConfig::MAX_NEIGHBORS > 0);
