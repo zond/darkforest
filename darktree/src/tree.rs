@@ -180,7 +180,7 @@ where
     }
 
     /// Handle a pulse from our current parent.
-    fn handle_parent_pulse(&mut self, pulse: &Pulse, sender_hash: &ChildHash, now: Timestamp) {
+    fn handle_parent_pulse(&mut self, pulse: &Pulse, _sender_hash: &ChildHash, now: Timestamp) {
         // Find ourselves in parent's children list (by hash)
         let my_hash = self.compute_node_hash(self.node_id());
         if let Some(my_idx) = self.find_child_index(pulse, &my_hash) {
@@ -195,8 +195,9 @@ where
             self.set_root_hash(pulse.root_hash);
             self.set_tree_size(pulse.tree_size);
 
-            // Clear pending parent since we're acknowledged
+            // Clear pending state since we're acknowledged
             self.set_pending_parent(None);
+            self.set_parent_rejection_count(0);
 
             // If keyspace changed, schedule republish and rebalance
             if keyspace_changed {
@@ -210,23 +211,15 @@ where
                 self.schedule_proactive_pulse(now);
             }
         } else {
-            // Parent didn't include us - we might have been rejected
-            // Increment pending parent counter (reuse for rejection tracking)
-            if let Some((parent, count)) = self.pending_parent() {
-                let parent_hash = self.compute_node_hash(&parent);
-                if *sender_hash == parent_hash {
-                    if count >= PARENT_ACK_PULSES {
-                        // Parent rejected us, find new parent
-                        self.set_parent(None);
-                        self.set_pending_parent(None);
-                        self.become_root();
-                    } else {
-                        self.set_pending_parent(Some((parent, count + 1)));
-                    }
-                }
+            // Parent didn't include us - track consecutive rejections
+            let count = self.parent_rejection_count() + 1;
+            if count >= PARENT_ACK_PULSES {
+                // Parent rejected us, find new parent
+                self.set_parent(None);
+                self.set_parent_rejection_count(0);
+                self.become_root();
             } else {
-                // Start tracking rejection
-                self.set_pending_parent(Some((pulse.node_id, 1)));
+                self.set_parent_rejection_count(count);
             }
         }
     }
@@ -502,6 +495,7 @@ where
     /// Become root of our own subtree.
     fn become_root(&mut self) {
         self.set_parent(None);
+        self.set_parent_rejection_count(0);
         let my_hash = self.compute_node_hash(self.node_id());
         self.set_root_hash(my_hash);
         self.set_keyspace_range(0, u32::MAX);

@@ -158,6 +158,7 @@ where
 
         // Become root of own subtree
         self.set_parent(None);
+        self.set_parent_rejection_count(0);
         let my_hash = self.compute_node_hash(self.node_id());
         self.set_root_hash(my_hash);
         self.set_tree_size(self.subtree_size());

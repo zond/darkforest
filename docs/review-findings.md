@@ -21,16 +21,6 @@ The entire link-layer reliability system is missing:
 
 ## Medium Priority Issues
 
-### Parent rejection tracking logic confusing
-**Source:** Protocol reviewer
-**Location:** `tree.rs:215-234`
-
-The `pending_parent` field is used both for:
-- Tracking nodes we're trying to join (its intended purpose)
-- Tracking rejection by our current parent (line 230-232)
-
-This overloading is confusing and may cause edge case bugs.
-
 ### Missing radio power control in Transport trait
 **Source:** Embedded reviewer
 **Location:** `traits.rs`

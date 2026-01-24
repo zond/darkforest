@@ -129,6 +129,7 @@ pub struct Node<T, Cr, R, Clk> {
     // Tree position (keyspace-based)
     parent: Option<NodeId>,
     pending_parent: Option<(NodeId, u8)>, // (candidate, pulses_waited)
+    parent_rejection_count: u8,           // consecutive pulses from parent not including us
     root_hash: ChildHash,
     tree_size: u32,
     subtree_size: u32,
@@ -214,6 +215,7 @@ where
 
             parent: None,
             pending_parent: None,
+            parent_rejection_count: 0,
             root_hash,
             tree_size: 1,
             subtree_size: 1,
@@ -750,6 +752,14 @@ where
 
     pub(crate) fn set_pending_parent(&mut self, pending: Option<(NodeId, u8)>) {
         self.pending_parent = pending;
+    }
+
+    pub(crate) fn parent_rejection_count(&self) -> u8 {
+        self.parent_rejection_count
+    }
+
+    pub(crate) fn set_parent_rejection_count(&mut self, count: u8) {
+        self.parent_rejection_count = count;
     }
 
     pub(crate) fn set_root_hash(&mut self, root: ChildHash) {
