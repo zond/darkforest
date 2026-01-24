@@ -4,20 +4,7 @@ Open issues from protocol-security-architect and embedded-rust-engineer review (
 
 ## Critical Issues
 
-### Link-layer reliability not implemented
-**Source:** Both reviewers
-**Design doc:** Part 5 (lines 1428-1563)
-
-The entire link-layer reliability system is missing:
-- No implicit ACK via overhearing
-- No `pending_acks` tracking
-- No `recently_forwarded` duplicate detection
-- No exponential backoff retransmission
-- Missing constants: MAX_PENDING_ACKS, MAX_RECENTLY_FORWARDED, ACK_HASH_SIZE
-
-**Impact:** Without hop-by-hop reliability, multi-hop message delivery degrades severely. With 50% loss per hop and 6 hops, only ~1.5% of messages arrive.
-
----
+*None remaining.*
 
 ## Low Priority / Future Work
 
