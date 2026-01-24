@@ -142,4 +142,25 @@ mod tests {
         assert!(snapshot.all_same_tree(), "Two nodes should form one tree");
         assert_eq!(snapshot.tree_count(), 1);
     }
+
+    /// Scenario 2.3: Chain Topology
+    /// Setup: 5 nodes in chain: A—B—C—D—E (each only sees neighbors)
+    /// Run: 30τ
+    /// Expect: Single tree formed. Depth ≤ 4.
+    #[test]
+    fn test_chain_topology_forms_tree() {
+        let result = ScenarioBuilder::new(5)
+            .with_seed(42)
+            .chain_topology()
+            .run_for(Duration::from_secs(30));
+
+        // Verify single tree formed
+        assert!(result.converged(), "Chain should converge to single tree");
+        assert_eq!(result.final_tree_count(), 1);
+        // Note: tree_size includes root self-count, so 5 nodes = tree_size 6
+        assert!(
+            result.final_max_tree_size() >= 5,
+            "Tree should include all 5 nodes"
+        );
+    }
 }

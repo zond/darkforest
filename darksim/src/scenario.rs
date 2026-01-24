@@ -7,14 +7,28 @@ use crate::metrics::SimulationResult;
 use crate::sim::Simulator;
 use crate::topology::Topology;
 
+/// Type of topology to generate.
+#[derive(Debug, Clone, Default)]
+enum TopologyType {
+    /// Fully connected (default).
+    #[default]
+    FullyConnected,
+    /// Chain topology (each node connected only to neighbors).
+    Chain,
+    /// Star topology (first node is hub).
+    Star,
+    /// Custom topology provided by user.
+    Custom(Topology),
+}
+
 /// Builder for simulation scenarios.
 pub struct ScenarioBuilder {
     /// Number of nodes to create.
     num_nodes: usize,
     /// RNG seed for determinism.
     seed: u64,
-    /// Network topology (None = fully connected).
-    topology: Option<Topology>,
+    /// Topology type to generate.
+    topology_type: TopologyType,
     /// Global packet loss rate.
     loss_rate: f64,
     /// Link delay.
@@ -39,7 +53,7 @@ impl ScenarioBuilder {
         Self {
             num_nodes,
             seed: 42,
-            topology: None,
+            topology_type: TopologyType::FullyConnected,
             loss_rate: 0.0,
             delay: Duration::from_millis(1),
             bandwidth: None,
@@ -54,29 +68,27 @@ impl ScenarioBuilder {
         self
     }
 
-    /// Set the network topology.
+    /// Set a custom network topology.
     pub fn topology(mut self, topo: Topology) -> Self {
-        self.topology = Some(topo);
+        self.topology_type = TopologyType::Custom(topo);
         self
     }
 
     /// Use fully connected topology (default).
     pub fn fully_connected(mut self) -> Self {
-        self.topology = None; // Will be generated from nodes
+        self.topology_type = TopologyType::FullyConnected;
         self
     }
 
-    /// Use chain topology.
+    /// Use chain topology (each node connected only to neighbors).
     pub fn chain_topology(mut self) -> Self {
-        // Marker - actual topology generated when nodes are known
-        // For now, store as special marker
-        self.topology = Some(Topology::new()); // Empty, will be replaced
+        self.topology_type = TopologyType::Chain;
         self
     }
 
-    /// Use star topology.
+    /// Use star topology (first node is hub).
     pub fn star_topology(mut self) -> Self {
-        self.topology = Some(Topology::new()); // Empty, will be replaced
+        self.topology_type = TopologyType::Star;
         self
     }
 
@@ -171,12 +183,12 @@ impl ScenarioBuilder {
             predicted_node_ids.push(node_id);
         }
 
-        // Build topology FIRST with predicted node IDs
-        let mut topo = if self.topology.is_some() {
-            self.topology.unwrap()
-        } else {
-            // Default to fully connected
-            Topology::fully_connected(&predicted_node_ids)
+        // Build topology with predicted node IDs
+        let mut topo = match self.topology_type {
+            TopologyType::FullyConnected => Topology::fully_connected(&predicted_node_ids),
+            TopologyType::Chain => Topology::chain(&predicted_node_ids),
+            TopologyType::Star => Topology::star(&predicted_node_ids),
+            TopologyType::Custom(t) => t,
         };
 
         // Apply global settings
