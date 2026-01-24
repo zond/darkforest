@@ -628,7 +628,7 @@ where
     pub(crate) fn schedule_proactive_pulse(&mut self, now: Timestamp) {
         let tau = self.tau();
         let tau_ms = tau.as_millis();
-        // 1.5τ ± 0.5τ = range [1τ, 2τ]
+        // τ + uniform(0, τ) = range [τ, 2τ]
         let delay_ms = tau_ms + self.random_mut().gen_range(0, tau_ms);
         let new_time = now + Duration::from_millis(delay_ms);
 
