@@ -393,32 +393,32 @@ t=0: N → Pulse{node_id: N, parent_hash: None, root_hash: hash(N), tree_size: 1
 t=0: P receives N's Pulse:
   - Unknown node_id → schedule proactive Pulse, need_pubkey=true
 
-t=2s: P → proactive Pulse{node_id: P, parent_hash: hash(G), root_hash: hash(R), tree_size: 500,
-          keyspace_lo: X, keyspace_hi: Y, need_pubkey: true, ...}
+t≈1.5τ: P → proactive Pulse{node_id: P, parent_hash: hash(G), root_hash: hash(R), tree_size: 500,
+            keyspace_lo: X, keyspace_hi: Y, need_pubkey: true, ...}
 
-t=2s: N receives P's Pulse:
+t≈1.5τ: N receives P's Pulse:
   - Different root_hash
   - N.tree_size(1) < P.tree_size(500) → N joins P's tree
   - N.parent = P, N.root = R
   - State changed → schedule proactive Pulse with pubkey
 
-t=4s: N → proactive Pulse{node_id: N, parent_hash: hash(P), root_hash: hash(R), tree_size: 500,
+t≈3τ: N → proactive Pulse{node_id: N, parent_hash: hash(P), root_hash: hash(R), tree_size: 500,
           keyspace_lo: 0, keyspace_hi: 0,  // doesn't know range yet
           pubkey: pubkey_N, ...}
 
-t=4s: P receives N's Pulse:
+t≈3τ: P receives N's Pulse:
   - N.pubkey present → cache it
   - N claims parent_hash = hash(P) → P.children.insert(N)
   - P.subtree_size += 1
   - State changed → schedule proactive Pulse
 
-t=6s: P → proactive Pulse{..., children: [(hash(N), 1), ...], ...}
+t≈4.5τ: P → proactive Pulse{..., children: [(hash(N), 1), ...], ...}
 
-t=6s: N receives P's Pulse:
+t≈4.5τ: N receives P's Pulse:
   - N finds itself in P.children (by hash) → computes keyspace range from P's range
 ```
 
-**Total join time: ~6 seconds** (vs 50-75 seconds with periodic-only Pulses)
+**Total join time: ~4.5τ** (for LoRa with τ≈1s, this is ~4.5 seconds vs 50-75 seconds with periodic-only Pulses)
 
 ### Tree Merging
 
@@ -445,26 +445,26 @@ t=0: Y receives X's Pulse:
   - Y.parent = X, Y.root = Ra
   - State changed → schedule proactive Pulse
 
-t=2s: Y → proactive Pulse (claiming parent=X, root_hash=hash(Ra))
+t≈1.5τ: Y → proactive Pulse (claiming parent=X, root_hash=hash(Ra))
 
-t=2s: Py receives Y's Pulse:
+t≈1.5τ: Py receives Y's Pulse:
   - Py.tree_size < Y's tree_size → Py dominated
   - INVERSION: Py.parent = Y (former child becomes parent!)
   - Py.root = Ra
   - State changed → schedule proactive Pulse
 
-t=4s: Py → proactive Pulse (inversion propagates up tree B)
+t≈3τ: Py → proactive Pulse (inversion propagates up tree B)
 
-(proactive Pulses propagate inversion to Rb in seconds, not minutes)
+(proactive Pulses propagate inversion to Rb in ~1.5τ per hop)
 ```
 
-**Merge time:** With proactive Pulses, the entire tree B inverts in ~2 seconds per hop. A 10-hop deep tree merges in ~20 seconds instead of 4-8 minutes.
+**Merge time:** With proactive Pulses, the entire tree B inverts in ~1.5τ per hop. A 10-hop deep tree merges in ~15τ (for LoRa: ~15 seconds) instead of 4-8 minutes.
 
 **Visual sequence:**
 
 ```
-Step 1: Initial state
-═══════════════════════
+Step 1 (t=0): Initial state - X and Y discover each other
+═════════════════════════════════════════════════════════
 
 Tree A (900 nodes)              Tree B (100 nodes)
      Ra                              Rb
@@ -473,16 +473,16 @@ Tree A (900 nodes)              Tree B (100 nodes)
                                     / \
 
 
-Step 2: Y switches parent to X
-══════════════════════════════
+Step 2 (t≈1.5τ): Y switches parent to X
+═══════════════════════════════════════
 
      Ra                              Rb
     /  \                             |
    .    X─────────────────────Y     Py (orphaned)
 
 
-Step 3: Py inverts, claims Y as parent
-══════════════════════════════════════
+Step 3 (t≈3τ): Py inverts, claims Y as parent
+═════════════════════════════════════════════
 
      Ra
     /  \
@@ -492,8 +492,8 @@ Step 3: Py inverts, claims Y as parent
                             / \
 
 
-Step 4: Inversion propagates to Rb
-══════════════════════════════════
+Step 4 (t≈4.5τ): Inversion propagates to Rb
+═══════════════════════════════════════════
 
            Ra (root, 1000 nodes)
           /  \
