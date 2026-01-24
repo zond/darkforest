@@ -39,7 +39,6 @@ const _: () = assert!(
 );
 
 /// Number of missed pulses before timeout.
-#[allow(dead_code)]
 const MISSED_PULSES_TIMEOUT: u64 = 8;
 
 /// Number of pulses to wait for parent acknowledgment.
@@ -693,8 +692,7 @@ where
     }
 
     /// Handle timeouts for neighbors, pending operations, etc.
-    #[allow(dead_code)]
-    fn handle_neighbor_timeouts(&mut self, now: Timestamp) {
+    pub(crate) fn handle_neighbor_timeouts(&mut self, now: Timestamp) {
         // Collect timed out neighbors
         let mut timed_out: Vec<[u8; 16]> = Vec::new();
 
@@ -741,8 +739,7 @@ where
     }
 
     /// Handle location entry expiration.
-    #[allow(dead_code)]
-    fn handle_location_expiry(&mut self, now: Timestamp) {
+    pub(crate) fn handle_location_expiry(&mut self, now: Timestamp) {
         // Entries older than LOCATION_TTL are expired.
         let cutoff = now - LOCATION_TTL;
 

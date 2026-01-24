@@ -541,6 +541,8 @@ where
 
         // Handle various timeouts
         self.handle_timeouts(now);
+        self.handle_neighbor_timeouts(now);
+        self.handle_location_expiry(now);
 
         // Check for tree size fraud
         self.handle_fraud_check(now);

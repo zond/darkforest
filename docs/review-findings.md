@@ -18,29 +18,6 @@ The entire link-layer reliability system is missing:
 
 **Impact:** Without hop-by-hop reliability, multi-hop message delivery degrades severely. With 50% loss per hop and 6 hops, only ~1.5% of messages arrive.
 
-### Neighbor timeout handling - dead code
-**Source:** Both reviewers
-**Location:** `tree.rs:696-741`
-
-`handle_neighbor_timeouts()` exists and is complete, but is marked `#[allow(dead_code)]` and never called from the main event loop (`handle_timer()`).
-
-**Impact:** Tree cannot recover from node failures:
-- Dead neighbors remain in tables indefinitely
-- Parent timeout never triggers `become_root()`
-- Children of dead parents never become roots
-- Shortcuts to dead nodes never cleaned up
-
-### Location expiry - dead code
-**Source:** Both reviewers
-**Location:** `tree.rs:744-761`
-
-`handle_location_expiry()` exists and is complete, but is marked `#[allow(dead_code)]` and never called.
-
-**Impact:** DHT accumulates stale location entries that never expire:
-- Memory usage grows toward MAX_LOCATION_STORE (256 entries)
-- LOOKUP may return outdated keyspace addresses for dead nodes
-- Location TTL (12 hours) specified in design is not enforced
-
 ---
 
 ## High Priority Issues
