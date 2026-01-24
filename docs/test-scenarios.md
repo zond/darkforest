@@ -78,10 +78,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Expect:** Single tree with A's root. tree_size = A + B.
 - **Status:** Implemented in `test_larger_tree_wins_merge` (uses 10+5 nodes for efficiency)
 
-### 3.2 Equal Size: Lower Root Hash Wins
-- **Setup:** Tree A (50 nodes), Tree B (50 nodes), hash(A_root) < hash(B_root)
-- **Link:** Connect at t=10τ
-- **Expect:** Single tree with A's root.
+### 3.2 Equal Size: Lower Root Hash Wins ✓
+- **Setup:** Tree A and Tree B with equal size, different root hashes.
+- **Link:** Connect them.
+- **Expect:** Single tree with root whose hash is lexicographically lower.
+- **Status:** Implemented in `test_equal_size_lower_root_hash_wins` (uses 5+5 nodes for efficiency)
 
 ### 3.3 Tree Inversion Propagation
 - **Setup:** Tree B with depth 5 (chain). Tree A (larger) connects to leaf of B.

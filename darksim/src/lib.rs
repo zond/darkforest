@@ -824,4 +824,123 @@ mod tests {
             "Merged tree should have 15 nodes (10 + 5)"
         );
     }
+
+    /// Scenario 3.2: Equal Size - Lower Root Hash Wins
+    /// Setup: Tree A and Tree B with equal size.
+    /// Link: Connect them.
+    /// Expect: Single tree with root whose hash is lexicographically lower.
+    ///
+    /// We create two equal-sized trees, connect them, and verify that the
+    /// winning root is the one with the lower root_hash.
+    #[test]
+    fn test_equal_size_lower_root_hash_wins() {
+        use crate::topology::Link;
+
+        // Create simulator
+        let mut sim = Simulator::new(42);
+
+        // Create Group A: 5 nodes, fully connected within group
+        let mut group_a = Vec::with_capacity(5);
+        for i in 0..5 {
+            group_a.push(sim.add_node(1000 + i));
+        }
+        for i in 0..group_a.len() {
+            for j in (i + 1)..group_a.len() {
+                sim.topology_mut()
+                    .add_link(group_a[i], group_a[j], Link::default());
+            }
+        }
+
+        // Create Group B: 5 nodes, fully connected within group (same size as A)
+        let mut group_b = Vec::with_capacity(5);
+        for i in 0..5 {
+            group_b.push(sim.add_node(2000 + i));
+        }
+        for i in 0..group_b.len() {
+            for j in (i + 1)..group_b.len() {
+                sim.topology_mut()
+                    .add_link(group_b[i], group_b[j], Link::default());
+            }
+        }
+
+        // Run to let each group form its own tree
+        sim.run_for(Duration::from_secs(5));
+
+        // Verify two separate trees of equal size formed
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(snapshot.tree_count(), 2, "Should have 2 separate trees");
+
+        // Find roots and their hashes
+        let group_a_root = group_a
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Group A should have a root");
+        let group_b_root = group_b
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Group B should have a root");
+
+        // Verify equal sizes
+        let a_size = sim.node(&group_a_root).unwrap().tree_size();
+        let b_size = sim.node(&group_b_root).unwrap().tree_size();
+        assert_eq!(a_size, 5, "Group A tree size should be 5");
+        assert_eq!(b_size, 5, "Group B tree size should be 5");
+
+        // Get root hashes before merge
+        let a_hash = sim.node(&group_a_root).unwrap().root_hash();
+        let b_hash = sim.node(&group_b_root).unwrap().root_hash();
+
+        // Ensure hashes are different (if equal, no merge would occur)
+        assert_ne!(
+            a_hash, b_hash,
+            "Test requires different root hashes to validate tie-breaking"
+        );
+
+        // Determine which should win (lower hash wins when sizes equal)
+        let expected_winner = if a_hash < b_hash {
+            group_a_root
+        } else {
+            group_b_root
+        };
+
+        // Connect the groups
+        sim.topology_mut()
+            .add_link(group_a[0], group_b[0], Link::default());
+
+        // Run for merge to complete
+        sim.run_for(Duration::from_secs(10));
+
+        // Verify single tree formed
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(
+            snapshot.tree_count(),
+            1,
+            "Should have merged to 1 tree after linking"
+        );
+
+        // Find the final root
+        let final_root = group_a
+            .iter()
+            .chain(group_b.iter())
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Should have a root");
+
+        // Verify the expected winner won (lower hash wins)
+        assert_eq!(
+            final_root, expected_winner,
+            "Root with lower hash should win when sizes are equal"
+        );
+
+        // Verify tree size is now 10
+        let final_tree_size = sim.node(&final_root).unwrap().tree_size();
+        assert_eq!(
+            final_tree_size, 10,
+            "Merged tree should have 10 nodes (5 + 5)"
+        );
+    }
 }
