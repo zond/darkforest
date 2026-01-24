@@ -55,14 +55,6 @@ The `pending_parent` field is used both for:
 
 This overloading is confusing and may cause edge case bugs.
 
-### No FraudDetected event emitted
-**Source:** Code review
-**Location:** `fraud.rs:168-177`, `types.rs:358-365`
-
-When fraud is detected, the node silently adds the parent to distrusted and calls `leave_and_rejoin()`. No event is emitted to notify the application.
-
-**Fix:** Add `FraudDetected { parent: NodeId, z_score: f32, observed: u32, expected: u32 }` to the `Event` enum and emit it from `handle_fraud_check()`.
-
 ### Missing radio power control in Transport trait
 **Source:** Embedded reviewer
 **Location:** `traits.rs`
@@ -188,6 +180,8 @@ Basic tests exist but routing logic is untested.
 - Children sorted order validation
 - Pulse sanity: subtree_size >= 1, tree_size >= subtree_size, keyspace_lo <= keyspace_hi
 - Trailing bytes rejection
+
+**TODO:** Have embedded-rust-engineer agent verify strict parsing implementation for correctness and efficiency on constrained devices.
 
 ### Embedded Compatibility
 - no_std compatible (uses alloc, hashbrown for HashMap)

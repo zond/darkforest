@@ -363,6 +363,15 @@ pub enum Event {
     LookupFailed { node_id: NodeId },
     /// Tree structure changed.
     TreeChanged { new_root: ChildHash, new_size: u32 },
+    /// Fraud detected: parent claimed inflated tree size.
+    FraudDetected {
+        /// The parent node that was distrusted.
+        parent: NodeId,
+        /// Observed unique publishers.
+        observed: u32,
+        /// Expected unique publishers based on claimed subtree size.
+        expected: u32,
+    },
 }
 
 /// Error type for node operations.

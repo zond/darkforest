@@ -175,7 +175,17 @@ where
         if self.check_tree_size_fraud(now) {
             // Add the parent we joined through to distrusted
             if let Some(ctx) = self.join_context().clone() {
+                let observed = self.fraud_detection().unique_publisher_count() as u32;
+                let expected = self.fraud_detection().subtree_size_at_start();
+
                 self.add_distrust(ctx.parent_at_join, now);
+
+                // Emit event to notify application
+                self.push_event(crate::types::Event::FraudDetected {
+                    parent: ctx.parent_at_join,
+                    observed,
+                    expected,
+                });
             }
 
             // Leave and rejoin
