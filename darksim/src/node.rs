@@ -305,6 +305,16 @@ impl SimNode {
         self.inner.keyspace_range()
     }
 
+    /// Get the parent node ID, if any.
+    pub fn parent_id(&self) -> Option<NodeId> {
+        self.inner.parent_id()
+    }
+
+    /// Get the number of children.
+    pub fn children_count(&self) -> usize {
+        self.inner.children_count()
+    }
+
     /// Get tau (bandwidth-aware time unit).
     pub fn tau(&self) -> Duration {
         self.inner.tau()

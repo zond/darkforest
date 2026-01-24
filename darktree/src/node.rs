@@ -389,6 +389,16 @@ where
         self.parent.is_none()
     }
 
+    /// Get the parent node ID, if any.
+    pub fn parent_id(&self) -> Option<NodeId> {
+        self.parent
+    }
+
+    /// Get the number of children.
+    pub fn children_count(&self) -> usize {
+        self.children.len()
+    }
+
     /// Channel for receiving data from other nodes.
     ///
     /// Application reads DATA messages from here.

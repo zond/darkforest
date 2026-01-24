@@ -58,6 +58,50 @@ pub use topology::{Link, Topology};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hashbrown::HashMap;
+
+    /// Compute the depth of each node in the tree (root = 0).
+    /// Returns a map from node_id to depth.
+    fn compute_depths(sim: &Simulator, nodes: &[NodeId]) -> HashMap<NodeId, usize> {
+        let mut depths = HashMap::new();
+
+        // First pass: find all roots (depth 0)
+        for &node_id in nodes {
+            let node = sim.node(&node_id).unwrap();
+            if node.is_root() {
+                depths.insert(node_id, 0);
+            }
+        }
+
+        // Iteratively compute depths until all nodes have depths
+        // (max iterations = tree depth, bounded by node count)
+        for _ in 0..nodes.len() {
+            let mut progress = false;
+            for &node_id in nodes {
+                if depths.contains_key(&node_id) {
+                    continue;
+                }
+                let node = sim.node(&node_id).unwrap();
+                if let Some(parent_id) = node.parent_id() {
+                    if let Some(&parent_depth) = depths.get(&parent_id) {
+                        depths.insert(node_id, parent_depth + 1);
+                        progress = true;
+                    }
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+
+        depths
+    }
+
+    /// Get the maximum tree depth (root = depth 0, so max depth = tree height - 1).
+    fn max_tree_depth(sim: &Simulator, nodes: &[NodeId]) -> usize {
+        let depths = compute_depths(sim, nodes);
+        depths.values().copied().max().unwrap_or(0)
+    }
 
     #[test]
     fn test_single_node_becomes_root() {
@@ -149,10 +193,12 @@ mod tests {
     /// Expect: Single tree formed. Depth ≤ 4.
     #[test]
     fn test_chain_topology_forms_tree() {
-        let result = ScenarioBuilder::new(5)
+        let (mut sim, nodes) = ScenarioBuilder::new(5)
             .with_seed(42)
             .chain_topology()
-            .run_for(Duration::from_secs(30));
+            .build();
+
+        let result = sim.run_for(Duration::from_secs(30));
 
         // Verify single tree formed
         assert!(result.converged(), "Chain should converge to single tree");
@@ -162,6 +208,10 @@ mod tests {
             5,
             "Tree should have exactly 5 nodes"
         );
+
+        // Verify depth ≤ 4 (root at depth 0, max depth 4 means 5 levels)
+        let depth = max_tree_depth(&sim, &nodes);
+        assert!(depth <= 4, "Chain tree depth should be ≤ 4, got {}", depth);
     }
 
     /// Scenario 2.4: Star Topology
@@ -202,5 +252,45 @@ mod tests {
         let snapshot = result.metrics.latest_snapshot().unwrap();
         let hub_is_root = snapshot.is_root.get(&hub).copied().unwrap_or(false);
         assert!(hub_is_root, "Central hub should be the root");
+
+        // Verify hub has 10 children (all spokes attached)
+        let hub_node = sim.node(&hub).unwrap();
+        assert_eq!(hub_node.children_count(), 10, "Hub should have 10 children");
+    }
+
+    /// Scenario 2.5: Fully Connected Small Network
+    /// Setup: 10 nodes, all in range
+    /// Run: 20τ
+    /// Expect: Single tree, wide and shallow (depth ≤ 3).
+    #[test]
+    fn test_fully_connected_10_nodes() {
+        let (mut sim, nodes) = ScenarioBuilder::new(10)
+            .with_seed(42)
+            .fully_connected()
+            .build();
+
+        let result = sim.run_for(Duration::from_secs(20));
+
+        // Verify single tree formed
+        assert!(
+            result.converged(),
+            "Fully connected network should converge to single tree"
+        );
+        assert_eq!(result.final_tree_count(), 1);
+        assert_eq!(
+            result.final_max_tree_size(),
+            10,
+            "Tree should have exactly 10 nodes"
+        );
+
+        // Verify tree is shallow (depth ≤ 3)
+        // With fully connected topology, nodes may all join root directly (depth 1)
+        // which is actually the shallowest possible - meets "wide and shallow" goal
+        let depth = max_tree_depth(&sim, &nodes);
+        assert!(
+            depth <= 3,
+            "Fully connected tree depth should be ≤ 3, got {}",
+            depth
+        );
     }
 }
