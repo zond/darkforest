@@ -56,10 +56,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Expect:** Single tree, wide and shallow (depth ≤3). May achieve depth 1 if all nodes join root directly.
 - **Status:** Implemented in `test_fully_connected_10_nodes`
 
-### 2.6 Parent Selection Prefers Shallow
+### 2.6 Parent Selection Prefers Shallow ✓
 - **Setup:** 3 nodes A, B, C all in range. A boots first (root). B joins A. C boots.
 - **Run:** 15τ
 - **Expect:** C joins A (larger keyspace), not B.
+- **Status:** Implemented in `test_parent_selection_prefers_shallow`
 
 ### 2.7 Rejected by Full Parent
 - **Setup:** P has 12 children. N attempts to join P.

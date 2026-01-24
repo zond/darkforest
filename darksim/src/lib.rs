@@ -561,4 +561,79 @@ mod tests {
             "After discovery, one node should be root and one child"
         );
     }
+
+    /// Scenario 2.6: Parent Selection Prefers Shallow
+    /// Setup: 3 nodes A, B, C all in range. A boots first (root). B joins A. C boots.
+    /// Run: 15τ
+    /// Expect: C joins A (larger keyspace), not B.
+    ///
+    /// The "prefer shallow" behavior is in select_best_parent(), which is called
+    /// when discovery ends. C must see both A and B during its discovery phase.
+    /// We achieve this by adding C to the simulation after A-B form a tree.
+    #[test]
+    fn test_parent_selection_prefers_shallow() {
+        use crate::topology::Link;
+
+        // Create simulator with 2 nodes (A and B) that can see each other
+        let mut sim = Simulator::new(42);
+        let node_a = sim.add_node(1);
+        let node_b = sim.add_node(2);
+
+        // Connect A and B
+        sim.topology_mut().add_link(node_a, node_b, Link::default());
+
+        // Run to let A and B form a tree
+        sim.run_for(Duration::from_secs(2));
+
+        // Verify A-B tree formed
+        let a_is_root = sim.node(&node_a).unwrap().is_root();
+        let b_is_root = sim.node(&node_b).unwrap().is_root();
+        assert!(
+            (a_is_root && !b_is_root) || (!a_is_root && b_is_root),
+            "One of A,B should be root, the other child"
+        );
+
+        let (root_node, _child_node) = if a_is_root {
+            (node_a, node_b)
+        } else {
+            (node_b, node_a)
+        };
+
+        // Verify tree size is 2
+        assert_eq!(
+            sim.node(&root_node).unwrap().tree_size(),
+            2,
+            "Root should have tree_size=2"
+        );
+
+        // Now add C - it will start discovery and see both A and B
+        let node_c = sim.add_node(3);
+
+        // Connect C to both A and B
+        sim.topology_mut().add_link(node_c, node_a, Link::default());
+        sim.topology_mut().add_link(node_c, node_b, Link::default());
+
+        // Run to let C complete discovery and join the tree
+        // C's discovery is 3τ = 300ms, plus some time for pulse exchange
+        sim.run_for(Duration::from_secs(2));
+
+        // C should have joined the root (prefers larger keyspace)
+        let c_node = sim.node(&node_c).unwrap();
+        assert!(!c_node.is_root(), "C should have joined the larger tree");
+
+        // Verify C's parent is the root node (larger keyspace)
+        let c_parent = c_node.parent_id();
+        assert_eq!(
+            c_parent,
+            Some(root_node),
+            "C should join the root (larger keyspace), not the child"
+        );
+
+        // Verify tree size is now 3
+        assert_eq!(
+            sim.node(&root_node).unwrap().tree_size(),
+            3,
+            "Root should have tree_size=3"
+        );
+    }
 }
