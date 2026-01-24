@@ -166,6 +166,12 @@ where
 
     /// Handle potential fraud detection and response.
     pub fn handle_fraud_check(&mut self, now: Timestamp) {
+        // Reset counters if subtree size changed significantly (2x either way)
+        let current_subtree = self.subtree_size();
+        if self.fraud_detection().should_reset(current_subtree) {
+            self.fraud_detection_mut().reset(now, current_subtree);
+        }
+
         if self.check_tree_size_fraud(now) {
             // Add the parent we joined through to distrusted
             if let Some(ctx) = self.join_context().clone() {

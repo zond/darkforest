@@ -56,14 +56,6 @@ The `pending_parent` field is used both for:
 
 This overloading is confusing and may cause edge case bugs.
 
-### Fraud detection subtree reset never called
-**Source:** Protocol reviewer
-**Location:** `fraud.rs:62-65`
-
-The `should_reset()` method exists to check if subtree_size changed 2x (per design doc), but it's never called. Fraud detection counters don't reset when subtree dramatically changes.
-
-**Impact:** False positives/negatives in fraud detection after significant tree restructuring.
-
 ### No FraudDetected event emitted
 **Source:** Code review
 **Location:** `fraud.rs:168-177`, `types.rs:358-365`
