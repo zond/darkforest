@@ -104,6 +104,41 @@ Keyspace calculation and tau calculation use u64 division. On 32-bit MCUs this i
 
 ---
 
+## Test Coverage Gaps
+
+### tree.rs has no tests
+**Location:** `tree.rs`
+
+The entire tree.rs module (tree operations, pulse handling, parent selection, merge logic) has zero tests. This is a critical gap.
+
+**Straightforward tests to add:**
+1. `handle_neighbor_timeouts()` - parent timeout → become root, child timeout → removal
+2. `handle_location_expiry()` - entries older than LOCATION_TTL are removed
+3. `compute_child_keyspace()` - keyspace division algorithm
+4. `select_best_parent()` - candidate filtering, RSSI selection
+5. `consider_merge()` - merge decision (larger tree wins, root_hash tiebreak)
+
+### dht.rs has minimal tests
+**Location:** `dht.rs`
+
+Only 1 test (`test_publish_stores_locally_when_owner`).
+
+**Tests to add:**
+1. `rebalance_keyspace()` - entries forwarded when keyspace changes
+2. `handle_lookup_msg()` - lookup returns correct entry
+3. `handle_found()` - validates and caches location
+
+### routing.rs missing routing tests
+**Location:** `routing.rs`
+
+Basic tests exist but routing logic is untested.
+
+**Tests to add:**
+1. `best_next_hop()` - selects tightest range, uses shortcuts
+2. `forward_routed()` - TTL decrement, signature verification
+
+---
+
 ## Verified Working Correctly
 
 ### Protocol Implementation
