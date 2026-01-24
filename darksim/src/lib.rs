@@ -369,4 +369,76 @@ mod tests {
             "Parent's tree should have size 1"
         );
     }
+
+    /// Scenario 5.2: Child Timeout
+    /// Setup: Tree with P—C. Stop C's pulses at t=10τ.
+    /// Run: 40τ
+    /// Expect: P removes C from children after ~24τ. P.subtree_size decreases.
+    #[test]
+    fn test_child_timeout_parent_removes_child() {
+        use crate::event::ScenarioAction;
+
+        // Create 2-node network
+        let (mut sim, nodes) = ScenarioBuilder::new(2)
+            .with_seed(42)
+            .fully_connected()
+            .build();
+
+        // Run until tree forms
+        sim.run_for(Duration::from_secs(2));
+
+        // Find which node is root (parent) and which is child
+        let (parent_id, child_id) = if sim.node(&nodes[0]).unwrap().is_root() {
+            (nodes[0], nodes[1])
+        } else {
+            (nodes[1], nodes[0])
+        };
+
+        // Verify initial state: parent has 1 child, tree_size=2
+        let parent_node = sim.node(&parent_id).unwrap();
+        assert_eq!(
+            parent_node.children_count(),
+            1,
+            "Parent should have 1 child"
+        );
+        assert_eq!(parent_node.tree_size(), 2, "Tree size should be 2");
+        assert_eq!(parent_node.subtree_size(), 2, "Subtree size should be 2");
+
+        // Disable links (stop child's pulses from reaching parent)
+        sim.schedule_action(
+            sim.current_time(),
+            ScenarioAction::DisableLink {
+                from: child_id,
+                to: parent_id,
+            },
+        );
+        sim.schedule_action(
+            sim.current_time(),
+            ScenarioAction::DisableLink {
+                from: parent_id,
+                to: child_id,
+            },
+        );
+
+        // Run for timeout period
+        sim.run_for(Duration::from_secs(30));
+
+        // Parent should have removed the timed-out child
+        let parent_node = sim.node(&parent_id).unwrap();
+        assert_eq!(
+            parent_node.children_count(),
+            0,
+            "Parent should have removed timed-out child"
+        );
+        assert_eq!(
+            parent_node.subtree_size(),
+            1,
+            "Parent's subtree_size should be 1 after child removal"
+        );
+        assert_eq!(
+            parent_node.tree_size(),
+            1,
+            "Parent's tree_size should be 1 after child removal"
+        );
+    }
 }

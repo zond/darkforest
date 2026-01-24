@@ -127,10 +127,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Expect:** C becomes root after ~24τ (8 missed pulses × ~3τ interval).
 - **Status:** Implemented in `test_parent_timeout_child_becomes_root`
 
-### 5.2 Child Timeout
+### 5.2 Child Timeout ✓
 - **Setup:** Tree with P—C. Stop C's pulses at t=10τ.
 - **Run:** 40τ
 - **Expect:** P removes C from children after ~24τ. P.subtree_size decreases.
+- **Status:** Implemented in `test_child_timeout_parent_removes_child`
 
 ### 5.3 Neighbor Expiry
 - **Setup:** Two nodes exchange pulses. One goes silent at t=10τ.
