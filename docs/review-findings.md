@@ -87,14 +87,6 @@ The `should_reset()` method exists to check if subtree_size changed 2x (per desi
 
 **Impact:** False positives/negatives in fraud detection after significant tree restructuring.
 
-### MAX_RETRIES constant mismatch
-**Source:** Protocol reviewer
-**Location:** `types.rs:29`
-
-Design doc specifies `MAX_RETRIES = 8` for link-layer reliability. Implementation has `MAX_RETRIES = 3`.
-
-**Impact:** Currently unused since link-layer reliability isn't implemented. Should be updated when implementing Part 5.
-
 ### Missing radio power control in Transport trait
 **Source:** Embedded reviewer
 **Location:** `traits.rs`
@@ -132,22 +124,6 @@ Allow compile-time tuning of MAX_NEIGHBORS, MAX_PUBKEY_CACHE, etc. for different
 Keyspace calculation and tau calculation use u64 division. On 32-bit MCUs this is ~100-1000 cycles per operation.
 
 **Impact:** Minor performance concern. Called during pulse processing (~every 20s for LoRa), not truly hot.
-
-### Proactive pulse scheduling comment mismatch
-**Source:** Embedded reviewer
-**Location:** `tree.rs:631-632`
-
-Code comment says "1.5τ ± 0.5τ = range [1τ, 2τ]" but formula is `τ + random(0, τ)`. Both produce [τ, 2τ] but via different semantics.
-
-**Impact:** Documentation clarity only.
-
-### pending_requests field unused
-**Source:** Embedded reviewer
-**Location:** `node.rs:164-165`
-
-HashMap field declared with `#[allow(dead_code)]` but never used. Related `MAX_PENDING_REQUESTS` constant also unused.
-
-**Fix:** Remove or implement request-response tracking feature.
 
 ---
 
@@ -224,6 +200,6 @@ HashMap field declared with `#[allow(dead_code)]` but never used. Related `MAX_P
 | MIN_EXPECTED | 5.0 | 5.0 | Match |
 | LOOKUP_TIMEOUT | 32τ | 32τ | Match |
 | PULSE_BW_DIVISOR | 5 | 5 | Match |
-| MAX_RETRIES | 8 | **3** | Mismatch |
+| MAX_RETRIES | 8 | 8 | Match |
 | MAX_PENDING_ACKS | 32 | N/A | Not implemented |
 | MAX_RECENTLY_FORWARDED | 256 | N/A | Not implemented |

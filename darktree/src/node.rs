@@ -71,17 +71,6 @@ pub struct PendingLookup {
     pub last_query_at: Timestamp,
 }
 
-/// Pending request state (for request-response patterns).
-#[derive(Clone, Debug)]
-pub struct PendingRequest {
-    /// Data to send.
-    pub data: Vec<u8>,
-    /// When the request was sent.
-    pub sent_at: Timestamp,
-    /// Number of retries so far.
-    pub retries: u8,
-}
-
 /// Context for fraud detection when joining a tree.
 #[derive(Clone, Debug)]
 pub struct JoinContext {
@@ -105,7 +94,6 @@ pub type LocationStore = HashMap<NodeId, LocationEntry>;
 /// Location cache: node_id -> keyspace_addr.
 pub type LocationCache = HashMap<NodeId, u32>;
 pub type PendingLookupMap = HashMap<NodeId, PendingLookup>;
-pub type PendingRequestMap = HashMap<NodeId, PendingRequest>;
 pub type PendingDataMap = HashMap<NodeId, Vec<u8>>;
 pub type DistrustedMap = HashMap<NodeId, Timestamp>;
 /// Messages awaiting pubkey for a specific node_id (keyed by the node whose pubkey is needed).
@@ -161,8 +149,6 @@ pub struct Node<T, Cr, R, Clk> {
 
     // Pending operations
     pending_lookups: PendingLookupMap,
-    #[allow(dead_code)]
-    pending_requests: PendingRequestMap,
     pending_data: PendingDataMap,
     pending_pubkey: PendingPubkeyMap,
 
@@ -245,7 +231,6 @@ where
             location_cache: HashMap::new(),
 
             pending_lookups: HashMap::new(),
-            pending_requests: HashMap::new(),
             pending_data: HashMap::new(),
             pending_pubkey: HashMap::new(),
 
