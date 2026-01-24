@@ -72,10 +72,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 
 ## 3. Tree Merging
 
-### 3.1 Larger Tree Wins
-- **Setup:** Tree A (100 nodes), Tree B (50 nodes). Link them at t=10τ.
+### 3.1 Larger Tree Wins ✓
+- **Setup:** Tree A (larger), Tree B (smaller). Link them.
 - **Run:** 40τ
-- **Expect:** Single tree with A's root. tree_size=150.
+- **Expect:** Single tree with A's root. tree_size = A + B.
+- **Status:** Implemented in `test_larger_tree_wins_merge` (uses 10+5 nodes for efficiency)
 
 ### 3.2 Equal Size: Lower Root Hash Wins
 - **Setup:** Tree A (50 nodes), Tree B (50 nodes), hash(A_root) < hash(B_root)

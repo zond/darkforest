@@ -712,4 +712,116 @@ mod tests {
             "Hub's tree size should still be MAX_CHILDREN + 1"
         );
     }
+
+    /// Scenario 3.1: Larger Tree Wins
+    /// Setup: Tree A (larger), Tree B (smaller). Link them at t=10τ.
+    /// Run: 40τ
+    /// Expect: Single tree with A's root. tree_size = A + B.
+    ///
+    /// We use smaller counts (10+5=15) for test efficiency while validating
+    /// the same merge behavior as the scenario's 100+50=150.
+    #[test]
+    fn test_larger_tree_wins_merge() {
+        use crate::topology::Link;
+
+        // Create simulator
+        let mut sim = Simulator::new(42);
+
+        // Create Group A: 10 nodes, fully connected within group
+        let mut group_a = Vec::with_capacity(10);
+        for i in 0..10 {
+            group_a.push(sim.add_node(1000 + i));
+        }
+        for i in 0..group_a.len() {
+            for j in (i + 1)..group_a.len() {
+                sim.topology_mut()
+                    .add_link(group_a[i], group_a[j], Link::default());
+            }
+        }
+
+        // Create Group B: 5 nodes, fully connected within group
+        let mut group_b = Vec::with_capacity(5);
+        for i in 0..5 {
+            group_b.push(sim.add_node(2000 + i));
+        }
+        for i in 0..group_b.len() {
+            for j in (i + 1)..group_b.len() {
+                sim.topology_mut()
+                    .add_link(group_b[i], group_b[j], Link::default());
+            }
+        }
+
+        // No links between groups initially (partitioned)
+
+        // Run to let each group form its own tree
+        sim.run_for(Duration::from_secs(5));
+
+        // Verify two separate trees formed
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(snapshot.tree_count(), 2, "Should have 2 separate trees");
+
+        // Find the root of group A (the larger tree)
+        let group_a_root = group_a
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Group A should have a root");
+        let group_a_tree_size = sim.node(&group_a_root).unwrap().tree_size();
+        assert_eq!(group_a_tree_size, 10, "Group A tree should have 10 nodes");
+
+        // Find the root of group B
+        let group_b_root = group_b
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Group B should have a root");
+        let group_b_tree_size = sim.node(&group_b_root).unwrap().tree_size();
+        assert_eq!(group_b_tree_size, 5, "Group B tree should have 5 nodes");
+
+        // Connect the groups: add link between one node from each group
+        // (simulates "link them at t=10τ")
+        sim.topology_mut()
+            .add_link(group_a[0], group_b[0], Link::default());
+
+        // Run for merge to complete
+        sim.run_for(Duration::from_secs(10));
+
+        // Verify single tree formed
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(
+            snapshot.tree_count(),
+            1,
+            "Should have merged to 1 tree after linking"
+        );
+
+        // Verify the larger tree (A) won - its root should be the final root
+        let final_root = group_a
+            .iter()
+            .chain(group_b.iter())
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Should have a root");
+
+        // The root should be from group A (the larger tree)
+        assert!(
+            group_a.contains(&final_root),
+            "Final root should be from larger group A"
+        );
+
+        // Verify Group B's former root is no longer a root (inversion completed)
+        let group_b_former_root = sim.node(&group_b_root).unwrap();
+        assert!(
+            !group_b_former_root.is_root(),
+            "Group B's former root should have been inverted"
+        );
+
+        // Verify tree size is now 15
+        let final_tree_size = sim.node(&final_root).unwrap().tree_size();
+        assert_eq!(
+            final_tree_size, 15,
+            "Merged tree should have 15 nodes (10 + 5)"
+        );
+    }
 }
