@@ -33,6 +33,12 @@ Added memory footprint table, MCU recommendations, and memory formulas to config
 Documented the implicit bound: pending_data is bounded by MAX_PENDING_LOOKUPS since entries
 are only added when a lookup starts and removed when it completes or times out.
 
+### No SmallConfig test coverage
+**Source:** Code simplifier (2026-01-24)
+**Completed:** 2026-01-24
+
+Added test_small_config_eviction to verify bounded collections work correctly with SmallConfig.
+
 ## Low Priority / Future Work
 
 ### u64 division in hot paths
@@ -51,9 +57,3 @@ Hardcoded to 512. On 64KB devices using `SmallConfig`, tracking 512 publishers (
 
 **Recommendation:** Consider adding to `NodeConfig` or document why it's intentionally fixed.
 
-### No SmallConfig test coverage
-**Source:** Code simplifier (2026-01-24)
-
-Tests only use `DefaultConfig`. No tests verify `SmallConfig` behavior when hitting smaller bounds.
-
-**Recommendation:** Add at least one test using `SmallConfig` to verify eviction works correctly at smaller capacities.

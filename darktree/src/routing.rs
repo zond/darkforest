@@ -465,13 +465,24 @@ mod tests {
     use alloc::vec;
 
     use super::*;
-    use crate::config::DefaultConfig;
+    use crate::config::{DefaultConfig, SmallConfig};
     use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
 
     /// Type alias for test nodes using default config.
     type TestNode = Node<MockTransport, MockCrypto, MockRandom, MockClock, DefaultConfig>;
 
+    /// Type alias for test nodes using small config (64KB RAM).
+    type SmallTestNode = Node<MockTransport, MockCrypto, MockRandom, MockClock, SmallConfig>;
+
     fn make_node() -> TestNode {
+        let transport = MockTransport::new();
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+        Node::new(transport, crypto, random, clock)
+    }
+
+    fn make_small_node() -> SmallTestNode {
         let transport = MockTransport::new();
         let crypto = MockCrypto::new();
         let random = MockRandom::new();
@@ -948,5 +959,41 @@ mod tests {
         assert_eq!(sent.len(), 1, "Should send one ACK message");
         assert_eq!(sent[0].len(), 9, "ACK should be 9 bytes");
         assert_eq!(sent[0][0], 0x03, "ACK wire type should be 0x03");
+    }
+
+    #[test]
+    fn test_small_config_eviction() {
+        use crate::time::Timestamp;
+
+        let mut node = make_small_node();
+        let now = Timestamp::from_secs(1000);
+
+        // SmallConfig::MAX_PENDING_ACKS = 8 (vs DefaultConfig = 32)
+        // Fill to capacity
+        for i in 0..SmallConfig::MAX_PENDING_ACKS {
+            let hash: [u8; 8] = [i as u8; 8];
+            node.insert_pending_ack(hash, vec![i as u8], now);
+        }
+
+        assert_eq!(
+            node.pending_acks().len(),
+            SmallConfig::MAX_PENDING_ACKS,
+            "Should be at SmallConfig capacity (8)"
+        );
+
+        // Insert one more - should evict oldest
+        let new_hash: [u8; 8] = [0xFF; 8];
+        node.insert_pending_ack(new_hash, vec![0xFF], now);
+
+        // Should still be at SmallConfig capacity
+        assert_eq!(
+            node.pending_acks().len(),
+            SmallConfig::MAX_PENDING_ACKS,
+            "SmallConfig should evict to stay at capacity (8)"
+        );
+        assert!(
+            node.pending_acks().contains_key(&new_hash),
+            "New entry should be present"
+        );
     }
 }
