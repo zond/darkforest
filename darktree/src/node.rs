@@ -31,7 +31,7 @@ use hashbrown::HashMap;
 use embassy_sync::channel::Channel;
 
 use crate::config::{DefaultConfig, NodeConfig};
-use crate::fraud::FraudDetection;
+use crate::fraud::{FraudDetection, HllSecretKey};
 use crate::time::{Duration, Timestamp};
 use crate::traits::{
     AppInChannel, AppOutChannel, Clock, Crypto, EventChannel, IncomingData, OutgoingData, Random,
@@ -188,6 +188,7 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     join_context: Option<JoinContext>,
     distrusted: DistrustedMap,
     fraud_detection: FraudDetection,
+    hll_secret_key: HllSecretKey,
 
     // Link-layer reliability
     pending_acks: PendingAckMap,
@@ -248,6 +249,18 @@ where
             _ => crate::types::MIN_TAU_MS,
         };
 
+        // Derive HLL secret key from identity for deterministic behavior.
+        // Hash(secret || "hll_key") ensures uniqueness per identity.
+        let hll_secret_key = {
+            let mut data = [0u8; 39]; // 32 + 7
+            data[..32].copy_from_slice(&secret);
+            data[32..].copy_from_slice(b"hll_key");
+            let hash = crypto.hash(&data);
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&hash[..16]);
+            key
+        };
+
         Self {
             transport,
             crypto,
@@ -291,6 +304,7 @@ where
             join_context: None,
             distrusted: HashMap::new(),
             fraud_detection: FraudDetection::new(),
+            hll_secret_key,
 
             pending_acks: HashMap::new(),
             recently_forwarded: HashMap::new(),
@@ -888,6 +902,10 @@ where
 
     pub(crate) fn fraud_detection_mut(&mut self) -> &mut FraudDetection {
         &mut self.fraud_detection
+    }
+
+    pub(crate) fn hll_secret_key(&self) -> &HllSecretKey {
+        &self.hll_secret_key
     }
 
     pub(crate) fn join_context(&self) -> &Option<JoinContext> {

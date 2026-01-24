@@ -19,6 +19,7 @@ embassy-futures = "0.1"
 critical-section = "1.1"
 hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
 libm = "0.2"
+siphasher = { version = "1", default-features = false }
 
 [dev-dependencies]
 ed25519-dalek = { version = "2", features = ["rand_core"] }

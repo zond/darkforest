@@ -1,9 +1,22 @@
 //! Fraud detection for tree size verification.
 //!
 //! This module implements statistical detection of inflated tree sizes
-//! based on PUBLISH traffic analysis using unique publisher tracking.
+//! based on PUBLISH traffic analysis using HyperLogLog cardinality estimation.
+//!
+//! ## HyperLogLog Overview
+//!
+//! HyperLogLog (HLL) is a probabilistic algorithm that estimates the cardinality
+//! (unique count) of a set using fixed memory. Key properties:
+//! - **Fixed memory:** 256 bytes regardless of set size
+//! - **Supports billions of items** with same memory footprint
+//! - **~6.5% standard error** for 256 registers
+//!
+//! For fraud detection, 6.5% error is acceptable since we're detecting 2× or
+//! larger fraud, not subtle differences.
 
-use hashbrown::HashSet;
+use core::hash::Hasher;
+
+use siphasher::sip::SipHasher24;
 
 use crate::config::NodeConfig;
 use crate::node::Node;
@@ -11,22 +24,29 @@ use crate::time::Timestamp;
 use crate::traits::{Clock, Crypto, Random, Transport};
 use crate::types::NodeId;
 
-/// Maximum unique publishers to track (memory bound).
-const MAX_UNIQUE_PUBLISHERS: usize = 512;
+/// Number of HyperLogLog registers (256 = ~6.5% standard error).
+const HLL_REGISTERS: usize = 256;
 
 /// Minimum interval between fraud detection resets (1 hour).
 /// Prevents attackers from manipulating subtree_size to repeatedly reset
 /// the detection window and delay fraud detection indefinitely.
 const MIN_RESET_INTERVAL_SECS: u64 = 3600;
 
-/// Fraud detection state.
+/// Secret key size for SipHash.
+pub const HLL_SECRET_KEY_SIZE: usize = 16;
+
+/// HyperLogLog secret key type.
+pub type HllSecretKey = [u8; HLL_SECRET_KEY_SIZE];
+
+/// Fraud detection state using HyperLogLog.
 ///
-/// Uses PUBLISH traffic to verify claimed tree sizes by tracking unique publishers.
+/// Uses PUBLISH traffic to verify claimed tree sizes by estimating unique publishers.
 /// See docs/design.md "Tree Size Verification" for the statistical model.
 #[derive(Clone, Debug)]
 pub struct FraudDetection {
-    /// Set of unique node_ids that have published.
-    unique_publishers: HashSet<NodeId>,
+    /// HyperLogLog registers for cardinality estimation.
+    /// Each register stores the maximum leading zeros seen (0-64, fits in u8).
+    hll_registers: [u8; HLL_REGISTERS],
     /// Time when counting started (milliseconds).
     count_start: Timestamp,
     /// Subtree size when counting started.
@@ -45,7 +65,7 @@ impl FraudDetection {
     /// Create new fraud detection state.
     pub fn new() -> Self {
         Self {
-            unique_publishers: HashSet::new(),
+            hll_registers: [0u8; HLL_REGISTERS],
             count_start: Timestamp::ZERO,
             subtree_size_at_start: 1,
             last_reset: Timestamp::ZERO,
@@ -54,7 +74,7 @@ impl FraudDetection {
 
     /// Reset fraud detection counters.
     pub fn reset(&mut self, now: Timestamp, subtree_size: u32) {
-        self.unique_publishers.clear();
+        self.hll_registers = [0u8; HLL_REGISTERS];
         self.count_start = now;
         self.subtree_size_at_start = subtree_size;
         self.last_reset = now;
@@ -67,22 +87,66 @@ impl FraudDetection {
     }
 
     /// Record a received PUBLISH message from a specific node.
-    pub fn on_publish_received(&mut self, publisher: &NodeId) {
-        // Only track if we're under the memory limit
-        if self.unique_publishers.len() < MAX_UNIQUE_PUBLISHERS {
-            self.unique_publishers.insert(*publisher);
+    ///
+    /// Uses keyed SipHash to prevent adversarial bucket manipulation.
+    pub fn add_publisher(&mut self, publisher: &NodeId, secret_key: &HllSecretKey) {
+        // Create SipHasher with the secret key (k0 from bytes 0-7, k1 from bytes 8-15)
+        // unwrap() is safe: HllSecretKey is [u8; 16], so slices are exactly 8 bytes
+        let k0 = u64::from_le_bytes(secret_key[0..8].try_into().unwrap());
+        let k1 = u64::from_le_bytes(secret_key[8..16].try_into().unwrap());
+        let mut hasher = SipHasher24::new_with_keys(k0, k1);
+        hasher.write(publisher);
+        let hash = hasher.finish();
+
+        // Use lower 8 bits for bucket index (256 buckets)
+        let bucket = (hash as usize) & (HLL_REGISTERS - 1);
+
+        // Count leading zeros in upper 56 bits, +1 for rank (so rank is always >= 1)
+        // Shift right 8 to get 56-bit value in lower bits, then count leading zeros
+        // and subtract 8 (since we're working with 56 bits in a 64-bit container)
+        let upper_bits = hash >> 8;
+        let leading_zeros = if upper_bits == 0 {
+            56 // All 56 bits are zero
+        } else {
+            (upper_bits.leading_zeros() as u8).saturating_sub(8)
+        };
+        let rank = leading_zeros + 1;
+
+        // Update register if this is a new maximum
+        if rank > self.hll_registers[bucket] {
+            self.hll_registers[bucket] = rank;
         }
+    }
+
+    /// Estimate the cardinality (unique count) using HyperLogLog formula.
+    pub fn estimate_cardinality(&self) -> f64 {
+        let m = HLL_REGISTERS as f64;
+        // Bias correction factor for 256 registers
+        let alpha = 0.7213 / (1.0 + 1.079 / m);
+
+        // Harmonic mean of 2^(-register)
+        let sum: f64 = self
+            .hll_registers
+            .iter()
+            .map(|&r| libm::pow(2.0, -(r as f64)))
+            .sum();
+
+        let estimate = alpha * m * m / sum;
+
+        // Small range correction using linear counting
+        let zeros = self.hll_registers.iter().filter(|&&r| r == 0).count();
+        if estimate < 2.5 * m && zeros > 0 {
+            return m * libm::log(m / zeros as f64);
+        }
+
+        estimate
     }
 
     /// Check if subtree size changed significantly (requires counter reset).
     pub fn should_reset(&self, new_subtree_size: u32) -> bool {
         let old = self.subtree_size_at_start;
-        new_subtree_size > old * 2 || new_subtree_size < old / 2
-    }
-
-    /// Get count of unique publishers.
-    pub fn unique_publisher_count(&self) -> usize {
-        self.unique_publishers.len()
+        // Use saturating_mul to avoid overflow when old > u32::MAX / 2
+        new_subtree_size > old.saturating_mul(2) || new_subtree_size < old / 2
     }
 
     /// Get count start time.
@@ -101,6 +165,9 @@ const FRAUD_Z_THRESHOLD: f64 = 2.33; // 99% confidence
 
 /// Minimum expected unique publishers for valid statistics.
 const MIN_EXPECTED: f64 = 5.0;
+
+/// HyperLogLog standard error for 256 registers (~6.5%).
+const HLL_STD_ERROR: f64 = 0.065;
 
 impl<T, Cr, R, Clk, Cfg> Node<T, Cr, R, Clk, Cfg>
 where
@@ -147,13 +214,17 @@ where
             return false;
         }
 
-        let observed = fd.unique_publisher_count() as f64;
+        // Use HyperLogLog estimate instead of exact count
+        let observed = fd.estimate_cardinality();
 
-        // Z-score: how many standard deviations below expected
-        // Model: unique publishers as binomial with p = 1 - (1-1/8)^t for t hours
-        // For t >= 8, p approaches 1, so variance approaches subtree_size * p * (1-p)
-        // Simplified: use Poisson approximation, variance ~ expected
-        let z = (expected - observed) / libm::sqrt(expected);
+        // Combined variance accounts for both:
+        // 1. Poisson variance of expected arrivals: Var(Poisson) = λ = expected
+        // 2. HLL estimation error: ~6.5% std error for 256 registers
+        let poisson_variance = expected;
+        let hll_variance = (HLL_STD_ERROR * observed) * (HLL_STD_ERROR * observed);
+        let combined_std = libm::sqrt(poisson_variance + hll_variance);
+
+        let z = (expected - observed) / combined_std;
 
         z > FRAUD_Z_THRESHOLD
     }
@@ -197,7 +268,7 @@ where
         if self.check_tree_size_fraud(now) {
             // Add the parent we joined through to distrusted
             if let Some(ctx) = self.join_context().as_ref().copied() {
-                let observed = self.fraud_detection().unique_publisher_count() as u32;
+                let observed = self.fraud_detection().estimate_cardinality() as u32;
                 let expected = self.fraud_detection().subtree_size_at_start();
 
                 self.add_distrust(ctx.parent_at_join, now);
@@ -221,24 +292,34 @@ mod tests {
     use super::*;
     use crate::time::Timestamp;
 
+    /// Test secret key for deterministic tests.
+    const TEST_KEY: HllSecretKey = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+
     #[test]
     fn test_fraud_detection_reset() {
         let mut fd = FraudDetection::new();
 
-        // Initial state
-        assert_eq!(fd.unique_publisher_count(), 0);
+        // Initial state - empty HLL should estimate ~0
+        assert!(fd.estimate_cardinality() < 1.0);
 
-        // Receive some publishes
+        // Add some publishers
         let node1 = [1u8; 16];
         let node2 = [2u8; 16];
-        fd.on_publish_received(&node1);
-        fd.on_publish_received(&node2);
-        fd.on_publish_received(&node1); // Duplicate - should not increase count
-        assert_eq!(fd.unique_publisher_count(), 2);
+        fd.add_publisher(&node1, &TEST_KEY);
+        fd.add_publisher(&node2, &TEST_KEY);
+        fd.add_publisher(&node1, &TEST_KEY); // Duplicate - HLL handles naturally
+
+        // Should estimate approximately 2
+        let estimate = fd.estimate_cardinality();
+        assert!(
+            estimate > 1.0 && estimate < 4.0,
+            "estimate was {}",
+            estimate
+        );
 
         // Reset
         fd.reset(Timestamp::from_secs(100), 10);
-        assert_eq!(fd.unique_publisher_count(), 0);
+        assert!(fd.estimate_cardinality() < 1.0);
         assert_eq!(fd.count_start(), Timestamp::from_secs(100));
         assert_eq!(fd.subtree_size_at_start(), 10);
     }
@@ -258,17 +339,45 @@ mod tests {
     }
 
     #[test]
-    fn test_unique_publishers_deduplication() {
+    fn test_hll_duplicate_handling() {
         let mut fd = FraudDetection::new();
-
         let node = [42u8; 16];
 
-        // Same node publishing multiple times should only count once
-        for _ in 0..10 {
-            fd.on_publish_received(&node);
+        // Same node publishing multiple times - HLL naturally deduplicates
+        // (same hash goes to same bucket, max doesn't change)
+        for _ in 0..100 {
+            fd.add_publisher(&node, &TEST_KEY);
         }
 
-        assert_eq!(fd.unique_publisher_count(), 1);
+        // Should estimate approximately 1
+        let estimate = fd.estimate_cardinality();
+        assert!(
+            estimate > 0.5 && estimate < 3.0,
+            "estimate was {}",
+            estimate
+        );
+    }
+
+    #[test]
+    fn test_hll_many_unique_publishers() {
+        let mut fd = FraudDetection::new();
+
+        // Add 100 unique publishers
+        for i in 0u8..100 {
+            let mut node = [0u8; 16];
+            node[0] = i;
+            node[1] = (i as u16 * 7) as u8; // Add variation
+            fd.add_publisher(&node, &TEST_KEY);
+        }
+
+        // HLL with 256 registers has ~6.5% std error
+        // For 100 publishers, expect estimate within ~80-120 (generous bounds for test)
+        let estimate = fd.estimate_cardinality();
+        assert!(
+            estimate > 70.0 && estimate < 140.0,
+            "estimate was {} for 100 unique publishers",
+            estimate
+        );
     }
 
     #[test]
@@ -318,5 +427,33 @@ mod tests {
         // This is safe behavior - don't allow reset if time seems wrong
         assert!(!fd.can_reset(Timestamp::from_secs(5000))); // Time went backwards
         assert!(!fd.can_reset(Timestamp::from_secs(0))); // Time at zero
+    }
+
+    #[test]
+    fn test_estimate_cardinality_empty() {
+        let fd = FraudDetection::new();
+        // Empty HLL uses linear counting and should estimate near 0
+        let estimate = fd.estimate_cardinality();
+        assert!(estimate < 1.0, "empty HLL estimated {}", estimate);
+    }
+
+    #[test]
+    fn test_estimate_cardinality_small_range_correction() {
+        let mut fd = FraudDetection::new();
+
+        // Add just a few publishers - should trigger linear counting correction
+        for i in 0u8..5 {
+            let mut node = [i; 16];
+            node[0] = i;
+            fd.add_publisher(&node, &TEST_KEY);
+        }
+
+        let estimate = fd.estimate_cardinality();
+        // With linear counting for small ranges, estimate should be reasonable
+        assert!(
+            estimate > 2.0 && estimate < 15.0,
+            "estimate was {}",
+            estimate
+        );
     }
 }

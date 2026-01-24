@@ -239,12 +239,13 @@ mod tests {
         assert!(node.check_tree_size_fraud(now));
 
         // Now record enough unique PUBLISH messages to avoid fraud detection
-        // Need observed close to expected (10), let's do 8
-        for i in 0..8 {
+        // Need HLL estimate close to expected (10), let's add 10 unique publishers
+        let key = *node.hll_secret_key();
+        for i in 0..10 {
             let publisher = [i; 16];
-            node.fraud_detection_mut().on_publish_received(&publisher);
+            node.fraud_detection_mut().add_publisher(&publisher, &key);
         }
-        // z = (10 - 8) / sqrt(10) = 0.63 < 2.33
+        // With ~10 observed and expected=10, z ≈ 0 < 2.33 threshold
         assert!(!node.check_tree_size_fraud(now));
     }
 

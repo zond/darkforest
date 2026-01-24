@@ -147,9 +147,10 @@ where
 
         self.insert_location_store(owner_node_id, entry);
 
-        // Update fraud detection counters
+        // Update fraud detection counters (HyperLogLog cardinality estimation)
+        let key = *self.hll_secret_key();
         self.fraud_detection_mut()
-            .on_publish_received(&owner_node_id);
+            .add_publisher(&owner_node_id, &key);
     }
 
     /// Send a LOOKUP message.
