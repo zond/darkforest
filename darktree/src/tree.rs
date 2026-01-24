@@ -352,11 +352,24 @@ where
     }
 
     /// Handle a pulse from a node claiming us as parent.
-    fn handle_child_pulse(&mut self, pulse: &Pulse, _sender_hash: &ChildHash, now: Timestamp) {
+    fn handle_child_pulse(&mut self, pulse: &Pulse, sender_hash: &ChildHash, now: Timestamp) {
         // Check if we can accept this child
         if self.children().len() >= MAX_CHILDREN {
             // At capacity, silently reject
             return;
+        }
+
+        // Check for hash collision with existing children.
+        // Two different NodeIds could have the same 4-byte hash, which would
+        // cause keyspace allocation conflicts. Reject if collision detected.
+        for existing_id in self.children().keys() {
+            if *existing_id != pulse.node_id {
+                let existing_hash = self.compute_node_hash(existing_id);
+                if existing_hash == *sender_hash {
+                    // Hash collision - reject this child
+                    return;
+                }
+            }
         }
 
         // Check if adding child would exceed MTU
@@ -1201,5 +1214,78 @@ mod tests {
         // Child with 30 nodes
         let child_range = fast.div(range * 30);
         assert_eq!(child_range, (range * 30) / total);
+    }
+
+    #[test]
+    fn test_child_hash_collision_rejected() {
+        // MockCrypto's hash: first 4 bytes of hash depend only on first 4 bytes of input.
+        // Two NodeIds with same first 4 bytes will have the same 4-byte child hash.
+        let mut node = make_node();
+        let now = Timestamp::from_secs(1000);
+
+        // Create two NodeIds with same first 4 bytes (will have same child hash)
+        let child1: NodeId = [1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let child2: NodeId = [1, 2, 3, 4, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // Same prefix, different node
+
+        // Verify they have the same hash
+        let hash1 = node.compute_node_hash(&child1);
+        let hash2 = node.compute_node_hash(&child2);
+        assert_eq!(
+            hash1, hash2,
+            "Test setup: NodeIds should have same child hash"
+        );
+        assert_ne!(child1, child2, "Test setup: NodeIds should be different");
+
+        // Manually add first child to the children map
+        node.children_mut().insert(child1, 1);
+        assert_eq!(node.children().len(), 1);
+
+        // Create a pulse from the second child claiming us as parent
+        let my_hash = node.compute_node_hash(node.node_id());
+        let pulse = Pulse {
+            node_id: child2,
+            flags: Pulse::build_flags(false, false, false, 0),
+            parent_hash: Some(my_hash), // Claims us as parent
+            root_hash: hash2,
+            subtree_size: 1,
+            tree_size: 1,
+            keyspace_lo: 0,
+            keyspace_hi: u32::MAX,
+            pubkey: None,
+            children: vec![],
+            signature: Signature::default(),
+        };
+
+        // Add neighbor timing (required for pulse processing)
+        node.insert_neighbor_time(
+            child2,
+            NeighborTiming {
+                last_seen: now,
+                prev_seen: None,
+                rssi: Some(-70),
+                root_hash: hash2,
+                tree_size: 1,
+                keyspace_range: (0, u32::MAX),
+                children_count: 0,
+            },
+        );
+
+        // Process the pulse - should be rejected due to hash collision
+        node.handle_pulse(pulse, Some(-70), now);
+
+        // Child count should still be 1 (collision rejected)
+        assert_eq!(
+            node.children().len(),
+            1,
+            "Second child with colliding hash should be rejected"
+        );
+        assert!(
+            node.children().contains_key(&child1),
+            "Original child should still be present"
+        );
+        assert!(
+            !node.children().contains_key(&child2),
+            "Colliding child should not be added"
+        );
     }
 }

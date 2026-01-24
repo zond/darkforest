@@ -14,6 +14,11 @@ use crate::types::NodeId;
 /// Maximum unique publishers to track (memory bound).
 const MAX_UNIQUE_PUBLISHERS: usize = 512;
 
+/// Minimum interval between fraud detection resets (1 hour).
+/// Prevents attackers from manipulating subtree_size to repeatedly reset
+/// the detection window and delay fraud detection indefinitely.
+const MIN_RESET_INTERVAL_SECS: u64 = 3600;
+
 /// Fraud detection state.
 ///
 /// Uses PUBLISH traffic to verify claimed tree sizes by tracking unique publishers.
@@ -26,6 +31,8 @@ pub struct FraudDetection {
     count_start: Timestamp,
     /// Subtree size when counting started.
     subtree_size_at_start: u32,
+    /// Time of last reset (for rate limiting).
+    last_reset: Timestamp,
 }
 
 impl Default for FraudDetection {
@@ -41,6 +48,7 @@ impl FraudDetection {
             unique_publishers: HashSet::new(),
             count_start: Timestamp::ZERO,
             subtree_size_at_start: 1,
+            last_reset: Timestamp::ZERO,
         }
     }
 
@@ -49,6 +57,13 @@ impl FraudDetection {
         self.unique_publishers.clear();
         self.count_start = now;
         self.subtree_size_at_start = subtree_size;
+        self.last_reset = now;
+    }
+
+    /// Check if enough time has passed since last reset (rate limiting).
+    pub fn can_reset(&self, now: Timestamp) -> bool {
+        let elapsed = now.saturating_sub(self.last_reset);
+        elapsed.as_secs() >= MIN_RESET_INTERVAL_SECS
     }
 
     /// Record a received PUBLISH message from a specific node.
@@ -170,8 +185,12 @@ where
     /// Handle potential fraud detection and response.
     pub fn handle_fraud_check(&mut self, now: Timestamp) {
         // Reset counters if subtree size changed significantly (2x either way)
+        // Rate-limited to prevent attackers from manipulating subtree_size
+        // to repeatedly reset the detection window.
         let current_subtree = self.subtree_size();
-        if self.fraud_detection().should_reset(current_subtree) {
+        if self.fraud_detection().should_reset(current_subtree)
+            && self.fraud_detection().can_reset(now)
+        {
             self.fraud_detection_mut().reset(now, current_subtree);
         }
 
@@ -250,5 +269,54 @@ mod tests {
         }
 
         assert_eq!(fd.unique_publisher_count(), 1);
+    }
+
+    #[test]
+    fn test_reset_rate_limiting() {
+        let mut fd = FraudDetection::new();
+        fd.reset(Timestamp::from_secs(1000), 10);
+
+        // Immediately after reset, can_reset should be false
+        assert!(!fd.can_reset(Timestamp::from_secs(1000)));
+        assert!(!fd.can_reset(Timestamp::from_secs(1000 + 1800))); // 30 min later
+
+        // After MIN_RESET_INTERVAL_SECS (1 hour), can_reset should be true
+        assert!(fd.can_reset(Timestamp::from_secs(1000 + 3600))); // Exactly 1 hour
+        assert!(fd.can_reset(Timestamp::from_secs(1000 + 7200))); // 2 hours later
+    }
+
+    #[test]
+    fn test_reset_rate_limiting_boundary() {
+        let mut fd = FraudDetection::new();
+        fd.reset(Timestamp::from_secs(10000), 10);
+
+        // One second before the interval - should not allow reset
+        assert!(!fd.can_reset(Timestamp::from_secs(10000 + 3599)));
+
+        // Exactly at the interval - should allow reset
+        assert!(fd.can_reset(Timestamp::from_secs(10000 + 3600)));
+    }
+
+    #[test]
+    fn test_reset_rate_limiting_initial_state() {
+        // New FraudDetection has last_reset = ZERO
+        let fd = FraudDetection::new();
+
+        // Any reasonable timestamp should allow initial reset
+        // (since elapsed from ZERO will exceed 1 hour for any real timestamp)
+        assert!(fd.can_reset(Timestamp::from_secs(3600))); // 1 hour from epoch
+        assert!(fd.can_reset(Timestamp::from_secs(1000000))); // Much later
+    }
+
+    #[test]
+    fn test_reset_rate_limiting_clock_skew() {
+        let mut fd = FraudDetection::new();
+        fd.reset(Timestamp::from_secs(10000), 10);
+
+        // If clock goes backwards (now < last_reset), saturating_sub returns ZERO
+        // which means elapsed.as_secs() = 0, so can_reset returns false
+        // This is safe behavior - don't allow reset if time seems wrong
+        assert!(!fd.can_reset(Timestamp::from_secs(5000))); // Time went backwards
+        assert!(!fd.can_reset(Timestamp::from_secs(0))); // Time at zero
     }
 }
