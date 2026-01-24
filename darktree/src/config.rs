@@ -169,7 +169,9 @@ mod tests {
         assert!(SmallConfig::MAX_DISTRUSTED < DefaultConfig::MAX_DISTRUSTED);
         assert!(SmallConfig::MAX_SHORTCUTS < DefaultConfig::MAX_SHORTCUTS);
         assert!(SmallConfig::MAX_PENDING_DATA < DefaultConfig::MAX_PENDING_DATA);
-        assert!(SmallConfig::MAX_MSGS_PER_PENDING_PUBKEY < DefaultConfig::MAX_MSGS_PER_PENDING_PUBKEY);
+        assert!(
+            SmallConfig::MAX_MSGS_PER_PENDING_PUBKEY < DefaultConfig::MAX_MSGS_PER_PENDING_PUBKEY
+        );
         assert!(SmallConfig::MAX_PENDING_PUBKEY_NODES < DefaultConfig::MAX_PENDING_PUBKEY_NODES);
         assert!(SmallConfig::MAX_PENDING_ACKS < DefaultConfig::MAX_PENDING_ACKS);
         assert!(SmallConfig::MAX_RECENTLY_FORWARDED < DefaultConfig::MAX_RECENTLY_FORWARDED);

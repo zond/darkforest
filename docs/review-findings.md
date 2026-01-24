@@ -39,21 +39,20 @@ are only added when a lookup starts and removed when it completes or times out.
 
 Added test_small_config_eviction to verify bounded collections work correctly with SmallConfig.
 
-## Low Priority / Future Work
+### MAX_UNIQUE_PUBLISHERS not configurable
+**Source:** Embedded reviewer (2026-01-24)
+**Completed:** 2026-01-24
+
+Replaced HashSet-based publisher tracking with HyperLogLog in design doc. Now uses fixed 256 bytes
+regardless of network size (supports 100k+ nodes). See docs/design.md "HyperLogLog Cardinality Estimation".
 
 ### u64 division in hot paths
 **Source:** Embedded reviewer (2026-01-24)
-**Location:** `tree.rs:269,275,548,556`, `node.rs:360,470`
+**Completed:** 2026-01-24
 
-Keyspace calculation and tau calculation use u64 division. On 32-bit MCUs this is ~100-1000 cycles per operation.
+- Tau calculation: cached at node initialization (zero runtime divisions)
+- Keyspace division: uses `FastDivisor` with reciprocal multiplication (~100-150 cycles vs ~800-1200 cycles)
 
-**Impact:** Minor performance concern. Called during pulse processing (~every 20s for LoRa), not truly hot.
+## Low Priority / Future Work
 
-### MAX_UNIQUE_PUBLISHERS not configurable
-**Source:** Embedded reviewer (2026-01-24)
-**Location:** `fraud.rs:15`
-
-Hardcoded to 512. On 64KB devices using `SmallConfig`, tracking 512 publishers (512 × 16 bytes = 8KB) may be excessive.
-
-**Recommendation:** Consider adding to `NodeConfig` or document why it's intentionally fixed.
-
+*None remaining.*

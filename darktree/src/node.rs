@@ -203,6 +203,9 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
 
     // Metrics
     metrics: TransportMetrics,
+
+    // Cached computations (avoid u64 division on 32-bit MCUs)
+    cached_tau_ms: u64,
 }
 
 impl<T, Cr, R, Clk, Cfg> Node<T, Cr, R, Clk, Cfg>
@@ -233,6 +236,15 @@ where
     ) -> Self {
         // Compute root_hash from our node_id (we are initially root of our own tree)
         let root_hash = Self::compute_node_hash_static(&crypto, &node_id);
+
+        // Cache tau to avoid u64 division on 32-bit MCUs at runtime
+        let cached_tau_ms = match transport.bw() {
+            Some(bw) if bw > 0 => {
+                let ms = (transport.mtu() as u64 * 1000) / bw as u64;
+                ms.max(crate::types::MIN_TAU_MS)
+            }
+            _ => crate::types::MIN_TAU_MS,
+        };
 
         Self {
             transport,
@@ -289,6 +301,8 @@ where
             discovery_deadline: None,
 
             metrics: TransportMetrics::new(),
+
+            cached_tau_ms,
         }
     }
 
@@ -379,17 +393,11 @@ where
         &self.transport
     }
 
-    /// Calculate tau: the bandwidth-aware time unit.
+    /// Get tau: the bandwidth-aware time unit.
     /// tau = MTU / bandwidth (with MIN_TAU_MS floor)
+    /// Cached at initialization to avoid u64 division on 32-bit MCUs.
     pub fn tau(&self) -> Duration {
-        use crate::types::MIN_TAU_MS;
-        match self.transport.bw() {
-            Some(bw) if bw > 0 => {
-                let ms = (self.transport.mtu() as u64 * 1000) / bw as u64;
-                Duration::from_millis(ms.max(MIN_TAU_MS))
-            }
-            _ => Duration::from_millis(MIN_TAU_MS),
-        }
+        Duration::from_millis(self.cached_tau_ms)
     }
 
     /// Lookup timeout: 32τ per replica
