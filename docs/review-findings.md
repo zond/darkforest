@@ -21,11 +21,6 @@ The entire link-layer reliability system is missing:
 
 ## Low Priority / Future Work
 
-### Unbounded Vec allocations
-**Source:** Embedded reviewer
-
-`ChildrenList`, `Payload` use `Vec<u8>`. While validated at decode time, consider `heapless::Vec` for compile-time bounds on memory-constrained targets.
-
 ### Const generics for memory bounds
 **Source:** Embedded reviewer
 
