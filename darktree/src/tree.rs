@@ -759,6 +759,10 @@ where
             self.child_ranges_mut().remove(child_id);
             self.recalculate_subtree_size();
             self.recompute_child_ranges();
+            // If we are root, update tree_size to match subtree_size
+            if self.is_root() {
+                self.set_tree_size(self.subtree_size());
+            }
             true
         } else {
             false

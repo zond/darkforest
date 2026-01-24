@@ -293,4 +293,80 @@ mod tests {
             depth
         );
     }
+
+    /// Scenario 5.1: Parent Timeout (8 Pulses)
+    /// Setup: Tree with parent P and child C. Stop P's pulses at t=10τ.
+    /// Run: 40τ
+    /// Expect: C becomes root after ~24τ (8 missed pulses × ~3τ interval).
+    #[test]
+    fn test_parent_timeout_child_becomes_root() {
+        use crate::event::ScenarioAction;
+
+        // Create 2-node network
+        let (mut sim, nodes) = ScenarioBuilder::new(2)
+            .with_seed(42)
+            .fully_connected()
+            .build();
+
+        // First, run until tree forms (should happen within 2 seconds)
+        sim.run_for(Duration::from_secs(2));
+
+        // Find which node is root and which is child
+        let (parent_id, child_id) = if sim.node(&nodes[0]).unwrap().is_root() {
+            (nodes[0], nodes[1])
+        } else {
+            (nodes[1], nodes[0])
+        };
+
+        // Verify we have a proper tree
+        let child_node = sim.node(&child_id).unwrap();
+        assert!(!child_node.is_root(), "Child should not be root initially");
+        assert_eq!(
+            child_node.parent_id(),
+            Some(parent_id),
+            "Child should have parent"
+        );
+
+        // Disable link from parent to child (child won't receive parent's pulses)
+        // Also disable child to parent (to fully isolate)
+        sim.schedule_action(
+            sim.current_time(),
+            ScenarioAction::DisableLink {
+                from: parent_id,
+                to: child_id,
+            },
+        );
+        sim.schedule_action(
+            sim.current_time(),
+            ScenarioAction::DisableLink {
+                from: child_id,
+                to: parent_id,
+            },
+        );
+
+        // Run for 30 seconds - timeout should occur within ~24τ = 2.4s at default τ=100ms
+        // Using 30s to be safe
+        sim.run_for(Duration::from_secs(30));
+
+        // Child should now be root (parent timed out)
+        let child_node = sim.node(&child_id).unwrap();
+        assert!(
+            child_node.is_root(),
+            "Child should become root after parent timeout"
+        );
+        assert_eq!(child_node.tree_size(), 1, "Child's tree should have size 1");
+
+        // Parent should have removed the timed-out child
+        let parent_node = sim.node(&parent_id).unwrap();
+        assert_eq!(
+            parent_node.children_count(),
+            0,
+            "Parent should have removed timed-out child"
+        );
+        assert_eq!(
+            parent_node.tree_size(),
+            1,
+            "Parent's tree should have size 1"
+        );
+    }
 }

@@ -6,10 +6,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 
 ## 1. Bootstrap & Discovery
 
-### 1.1 Single Node Bootstrap
+### 1.1 Single Node Bootstrap ✓
 - **Setup:** 1 node, no neighbors
 - **Run:** 5τ
 - **Expect:** Node is root, tree_size=1, subtree_size=1, keyspace=[0, 2³²)
+- **Status:** Implemented in `test_single_node_becomes_root`
 
 ### 1.2 Discovery Phase Timing
 - **Setup:** 1 node boots, neighbors appear at t=2τ
@@ -25,30 +26,34 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 
 ## 2. Tree Formation & Joining
 
-### 2.1 Two Nodes Form Tree
+### 2.1 Two Nodes Form Tree ✓
 - **Setup:** 2 nodes (A, B) in range
 - **Run:** 10τ
 - **Expect:** Single tree, one root, one child. tree_size=2.
+- **Status:** Implemented in `test_two_nodes_form_tree`
 
 ### 2.2 Join Latency
 - **Setup:** Existing tree (P as root). N boots at t=0.
 - **Measure:** Time until N appears in P's children list
 - **Expect:** ~6-7τ with discovery (3τ discovery + ~3-4τ exchange), or ~4.5τ if N already has neighbor info cached
 
-### 2.3 Chain Topology
+### 2.3 Chain Topology ✓
 - **Setup:** 5 nodes in chain: A—B—C—D—E (each only sees neighbors)
 - **Run:** 30τ
 - **Expect:** Single tree formed. Depth ≤ 4.
+- **Status:** Implemented in `test_chain_topology_forms_tree`
 
-### 2.4 Star Topology
+### 2.4 Star Topology ✓
 - **Setup:** 1 central node, 10 edge nodes (edges only see center)
 - **Run:** 20τ
 - **Expect:** Central node is root with 10 children.
+- **Status:** Implemented in `test_star_topology_central_becomes_root`
 
-### 2.5 Fully Connected Small Network
+### 2.5 Fully Connected Small Network ✓
 - **Setup:** 10 nodes, all in range
 - **Run:** 20τ
 - **Expect:** Single tree, wide and shallow (depth ≤3). May achieve depth 1 if all nodes join root directly.
+- **Status:** Implemented in `test_fully_connected_10_nodes`
 
 ### 2.6 Parent Selection Prefers Shallow
 - **Setup:** 3 nodes A, B, C all in range. A boots first (root). B joins A. C boots.
@@ -116,10 +121,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 
 ## 5. Liveness & Timeouts
 
-### 5.1 Parent Timeout (8 Pulses)
+### 5.1 Parent Timeout (8 Pulses) ✓
 - **Setup:** Tree with parent P and child C. Stop P's pulses at t=10τ.
 - **Run:** 40τ
 - **Expect:** C becomes root after ~24τ (8 missed pulses × ~3τ interval).
+- **Status:** Implemented in `test_parent_timeout_child_becomes_root`
 
 ### 5.2 Child Timeout
 - **Setup:** Tree with P—C. Stop C's pulses at t=10τ.
