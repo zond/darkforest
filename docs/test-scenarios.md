@@ -30,10 +30,10 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Run:** 10τ
 - **Expect:** Single tree, one root, one child. tree_size=2.
 
-### 2.2 Join Latency (~4.5τ)
+### 2.2 Join Latency
 - **Setup:** Existing tree (P as root). N boots at t=0.
 - **Measure:** Time until N appears in P's children list
-- **Expect:** ~4.5τ (discovery 3τ + exchange ~1.5τ)
+- **Expect:** ~6-7τ with discovery (3τ discovery + ~3-4τ exchange), or ~4.5τ if N already has neighbor info cached
 
 ### 2.3 Chain Topology
 - **Setup:** 5 nodes in chain: A—B—C—D—E (each only sees neighbors)
@@ -142,7 +142,7 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 
 ### 6.2 LOOKUP Finds Published
 - **Setup:** After 6.1, node M does lookup for N.
-- **Run:** 40τ (LOOKUP_TIMEOUT = 32τ per replica)
+- **Run:** 70τ (allows timeout + retry if first replica slow)
 - **Expect:** M receives FOUND with N's keyspace address.
 
 ### 6.3 DATA Delivery End-to-End
@@ -304,6 +304,154 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 ### 13.3 Tree Depth Bounded
 - **Setup:** 100 nodes in various topologies
 - **Expect:** Tree depth ≤ O(log N) due to shallow preference.
+
+---
+
+## 14. Memory Bounds Stress Tests
+
+These scenarios validate behavior when bounded collections reach capacity. Run with both `DefaultConfig` and `SmallConfig`.
+
+### 14.1 MAX_NEIGHBORS Exhaustion
+- **Setup:** SmallConfig (MAX_NEIGHBORS=16). Node N with 20 neighbors sending pulses.
+- **Run:** 30τ
+- **Expect:** N tracks only 16 neighbors. LRU eviction drops oldest. No panic, no unbounded growth.
+
+### 14.2 MAX_PUBKEY_CACHE Saturation
+- **Setup:** SmallConfig. Node receives pulses from 20 unique nodes (all with pubkeys).
+- **Run:** 30τ
+- **Expect:** Cache stays at 16 entries. Evicted pubkeys re-requested on next pulse.
+
+### 14.3 MAX_LOCATION_STORE Saturation
+- **Setup:** SmallConfig. Storage node receives PUBLISH from 50 unique nodes.
+- **Run:** 20τ
+- **Expect:** Store capped at 32. Oldest entries evicted. New entries accepted.
+
+### 14.4 MAX_PENDING_ACKS Under Load
+- **Setup:** SmallConfig. Node sends 20 Routed messages to unreachable destinations.
+- **Run:** 300τ
+- **Expect:** Only 8 pending ACKs tracked. Oldest dropped when full.
+
+### 14.5 MAX_RECENTLY_FORWARDED Flood
+- **Setup:** SmallConfig. Node forwards 100 unique messages rapidly.
+- **Run:** 10τ
+- **Expect:** Recently forwarded set capped at 32. Duplicate detection still works for recent messages.
+
+### 14.6 MAX_DISTRUSTED Overflow
+- **Setup:** SmallConfig. Trigger fraud detection for 20 different nodes.
+- **Run:** 10τ
+- **Expect:** Distrusted set capped at 8. Oldest entries evicted.
+
+---
+
+## 15. Eviction Behavior Tests
+
+Verify LRU eviction preserves protocol invariants.
+
+### 15.1 Parent Never Evicted from Neighbors
+- **Setup:** SmallConfig. Node N has parent P and 15 other neighbors (at MAX_NEIGHBORS=16).
+- **Action:** 17th neighbor appears with pulse.
+- **Expect:** Parent P is NOT evicted. Some other neighbor evicted instead.
+
+### 15.2 Children Never Evicted from Neighbors
+- **Setup:** SmallConfig. Node N has 3 children and 13 other neighbors.
+- **Action:** 17th neighbor appears.
+- **Expect:** Children not evicted. Non-child neighbor evicted.
+
+### 15.3 Pubkey Eviction Recovery
+- **Setup:** SmallConfig. Node N has 16 cached pubkeys. 17th node sends pulse.
+- **Run:** 10τ
+- **Expect:** Oldest pubkey evicted. N requests it again via need_pubkey flag. No permanent signature failure.
+
+### 15.4 Location Store Eviction Prefers Stale
+- **Setup:** SmallConfig. Storage node at capacity. Mix of fresh and stale entries.
+- **Action:** New PUBLISH arrives.
+- **Expect:** Stalest entry (oldest last_seen) evicted, not random.
+
+---
+
+## 16. SmallConfig Validation
+
+Verify protocol works correctly with constrained resources.
+
+### 16.1 SmallConfig Tree Formation
+- **Setup:** 20 nodes, SmallConfig, mesh topology.
+- **Run:** 100τ
+- **Expect:** Single tree forms despite smaller bounds.
+
+### 16.2 SmallConfig DHT Operations
+- **Setup:** 20 nodes, SmallConfig. PUBLISH and LOOKUP cycle.
+- **Run:** 100τ
+- **Expect:** DHT operations succeed with smaller caches.
+
+### 16.3 SmallConfig Under Churn
+- **Setup:** 30 nodes, SmallConfig. 10 nodes leave/join repeatedly.
+- **Run:** 200τ
+- **Expect:** Tree recovers. No resource exhaustion panic.
+
+---
+
+## 17. Robustness & Malformed Input
+
+### 17.1 Oversized Child Count
+- **Setup:** Attacker sends pulse with child_count=20 (exceeds MAX_CHILDREN=12).
+- **Expect:** Rejected at decode. No allocation attempted.
+
+### 17.2 Non-Canonical Varint
+- **Setup:** Message with non-canonical varint (0x80 0x00 for zero).
+- **Expect:** Rejected with decode error.
+
+### 17.3 Truncated Message
+- **Setup:** Valid message header but truncated before signature.
+- **Expect:** Rejected at decode. No partial processing.
+
+### 17.4 Invalid Wire Type
+- **Setup:** Message with wire_type=0x99 (unknown).
+- **Expect:** Rejected immediately.
+
+### 17.5 Invalid Signature Algorithm
+- **Setup:** Pulse with signature algorithm=0x99 (not Ed25519).
+- **Expect:** Rejected at decode or signature verification.
+
+### 17.6 Children Not Sorted
+- **Setup:** Pulse with children in non-ascending hash order.
+- **Expect:** Rejected at decode (invalid children order).
+
+---
+
+## 18. Race Conditions
+
+### 18.1 Simultaneous Three-Way Merge
+- **Setup:** Three separate trees (A: 100, B: 80, C: 60 nodes) all connect simultaneously.
+- **Run:** 50τ
+- **Expect:** Single tree with A's root. No oscillation or split-brain.
+
+### 18.2 Simultaneous Child Joins
+- **Setup:** Parent P with 10 children. 5 new nodes try to join P simultaneously.
+- **Run:** 20τ
+- **Expect:** P accepts up to MAX_CHILDREN (12). Others find different parents or stay root.
+
+### 18.3 Parent Switch During Message Transit
+- **Setup:** Node N sending Routed. N's parent changes mid-flight.
+- **Expect:** Message either delivered via old path or retransmitted via new path.
+
+---
+
+## 19. Recovery Scenarios
+
+### 19.1 Node Restart (State Loss)
+- **Setup:** Tree with 20 nodes. Node N power cycles at t=50τ (loses all state).
+- **Run:** 50τ after restart
+- **Expect:** N rejoins tree via normal discovery. Old N entry expires from neighbors.
+
+### 19.2 Storage Node Restart
+- **Setup:** Storage node S holds 10 location entries. S restarts.
+- **Run:** 50τ
+- **Expect:** Entries lost. Publishers republish within 8 hours. Lookups may fail temporarily.
+
+### 19.3 Root Node Restart
+- **Setup:** Tree with root R. R restarts at t=50τ.
+- **Run:** 100τ
+- **Expect:** Children timeout, become roots, remerge. R rejoins (may or may not become root again).
 
 ---
 
