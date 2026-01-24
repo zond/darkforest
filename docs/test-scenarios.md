@@ -62,10 +62,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Expect:** C joins A (larger keyspace), not B.
 - **Status:** Implemented in `test_parent_selection_prefers_shallow`
 
-### 2.7 Rejected by Full Parent
-- **Setup:** P has 12 children. N attempts to join P.
+### 2.7 Rejected by Full Parent ✓
+- **Setup:** P has 12 children (MAX_CHILDREN). N boots, sees only P.
 - **Run:** 15τ
-- **Expect:** After 3 failed pulses, N tries another parent or stays root.
+- **Expect:** N sees P has MAX_CHILDREN via Pulse and excludes P from parent candidates. N stays root.
+- **Status:** Implemented in `test_rejected_by_full_parent`
 
 ---
 

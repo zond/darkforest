@@ -636,4 +636,80 @@ mod tests {
             "Root should have tree_size=3"
         );
     }
+
+    /// Scenario 2.7: Rejected by Full Parent
+    /// Setup: P has 12 children. N attempts to join P.
+    /// Run: 15τ
+    /// Expect: N sees P has MAX_CHILDREN via Pulse, excludes P from candidates, stays root.
+    ///
+    /// We create a star topology with 13 nodes (1 hub + 12 spokes).
+    /// The hub becomes root with 12 children (MAX_CHILDREN).
+    /// Then we add a 14th node that only sees the hub.
+    /// The newcomer's select_best_parent() filters out full parents proactively,
+    /// so it never attempts to join and stays as root.
+    #[test]
+    fn test_rejected_by_full_parent() {
+        use crate::topology::Link;
+        use darktree::MAX_CHILDREN;
+
+        // Create simulator
+        let mut sim = Simulator::new(42);
+
+        // Create hub and MAX_CHILDREN spokes in a star topology
+        let hub = sim.add_node(1);
+        for i in 0..MAX_CHILDREN {
+            let spoke = sim.add_node(100 + i as u64);
+            sim.topology_mut().add_link(hub, spoke, Link::default());
+        }
+
+        // Run to form the tree - hub should become root with MAX_CHILDREN children
+        sim.run_for(Duration::from_secs(5));
+
+        // Verify hub is root with MAX_CHILDREN children
+        let hub_node = sim.node(&hub).unwrap();
+        assert!(hub_node.is_root(), "Hub should be root");
+        assert_eq!(
+            hub_node.children_count(),
+            MAX_CHILDREN,
+            "Hub should have MAX_CHILDREN children"
+        );
+        assert_eq!(
+            hub_node.tree_size(),
+            MAX_CHILDREN as u32 + 1,
+            "Tree size should be MAX_CHILDREN + 1"
+        );
+
+        // Now add a 14th node that only sees the hub
+        let newcomer = sim.add_node(999);
+        sim.topology_mut().add_link(hub, newcomer, Link::default());
+
+        // Run for the newcomer to complete discovery and attempt to join
+        // Discovery is 3τ = 300ms, plus some time for pulse exchange
+        sim.run_for(Duration::from_secs(5));
+
+        // Newcomer should NOT have joined the full hub - should stay root
+        let newcomer_node = sim.node(&newcomer).unwrap();
+        assert!(
+            newcomer_node.is_root(),
+            "Newcomer should stay root (hub is full)"
+        );
+        assert_eq!(
+            newcomer_node.tree_size(),
+            1,
+            "Newcomer's tree size should be 1"
+        );
+
+        // Hub should still have only MAX_CHILDREN children
+        let hub_node = sim.node(&hub).unwrap();
+        assert_eq!(
+            hub_node.children_count(),
+            MAX_CHILDREN,
+            "Hub should still have MAX_CHILDREN children"
+        );
+        assert_eq!(
+            hub_node.tree_size(),
+            MAX_CHILDREN as u32 + 1,
+            "Hub's tree size should still be MAX_CHILDREN + 1"
+        );
+    }
 }
