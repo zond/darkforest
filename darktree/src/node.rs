@@ -38,7 +38,7 @@ use crate::traits::{
 use crate::types::{
     ChildHash, Event, LocationEntry, NodeId, PublicKey, Routed, SecretKey, TransportMetrics,
     MAX_DISTRUSTED, MAX_LOCATION_CACHE, MAX_LOCATION_STORE, MAX_NEIGHBORS, MAX_PENDING_LOOKUPS,
-    MAX_PENDING_PUBKEY, MAX_PUBKEY_CACHE, MIN_PULSE_INTERVAL,
+    MAX_PENDING_PUBKEY, MAX_PUBKEY_CACHE, MAX_SHORTCUTS, MIN_PULSE_INTERVAL,
 };
 
 /// Timing, signal, and tree information for a neighbor.
@@ -881,5 +881,26 @@ where
             }
         }
         self.distrusted.insert(node_id, timestamp);
+    }
+
+    pub(crate) fn insert_shortcut(&mut self, node_id: NodeId, keyspace: (u32, u32)) {
+        if self.shortcuts.len() >= MAX_SHORTCUTS && !self.shortcuts.contains_key(&node_id) {
+            // Evict the shortcut we haven't heard from in the longest time
+            // Cross-reference with neighbor_times for last_seen
+            if let Some(oldest_key) = self
+                .shortcuts
+                .keys()
+                .min_by_key(|id| {
+                    self.neighbor_times
+                        .get(*id)
+                        .map(|t| t.last_seen)
+                        .unwrap_or(crate::time::Timestamp::ZERO)
+                })
+                .copied()
+            {
+                self.shortcuts.remove(&oldest_key);
+            }
+        }
+        self.shortcuts.insert(node_id, keyspace);
     }
 }

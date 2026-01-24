@@ -21,16 +21,6 @@ The entire link-layer reliability system is missing:
 
 ## High Priority Issues
 
-### Shortcuts HashMap unbounded
-**Source:** Embedded reviewer
-**Location:** `node.rs:152`
-
-The `shortcuts: HashMap<NodeId, (u32, u32)>` collection has no explicit MAX_SHORTCUTS bound. Unlike other collections (neighbors, pubkey_cache, etc.), shortcuts are not bounded.
-
-**Impact:** In dense networks with many non-parent/child neighbors in radio range, memory usage can grow unbounded.
-
-**Fix:** Add `MAX_SHORTCUTS` constant and bounded insertion helper.
-
 ### Memory pressure from pending_pubkey
 **Source:** Embedded reviewer
 **Location:** `node.rs:167`

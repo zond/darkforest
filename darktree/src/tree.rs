@@ -157,8 +157,7 @@ where
 
         // Track as shortcut if not parent/child
         if self.parent() != Some(pulse.node_id) && !self.children().contains_key(&pulse.node_id) {
-            self.shortcuts_mut()
-                .insert(pulse.node_id, (pulse.keyspace_lo, pulse.keyspace_hi));
+            self.insert_shortcut(pulse.node_id, (pulse.keyspace_lo, pulse.keyspace_hi));
         }
     }
 
