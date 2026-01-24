@@ -876,8 +876,9 @@ struct Routed {
 // - bit 6: has_src_pubkey (1 = src_pubkey present for signature verification)
 // - bit 7: reserved (must be 0)
 
-// msg_type values: 0=PUBLISH, 1=LOOKUP, 2=FOUND, 3=DATA, 4=ACK
+// msg_type values: 0=PUBLISH, 1=LOOKUP, 2=FOUND, 3=DATA
 // Messages with undefined msg_type MUST be dropped silently (future extensions)
+// Note: ACK is a separate top-level message type (0x03), not a Routed subtype
 
 // dest_addr is a keyspace location (u32). All messages route uniformly toward dest_addr:
 // - PUBLISH/LOOKUP: dest_addr = hash(node_id || replica_index) (the key)
@@ -1457,11 +1458,13 @@ The sender computes the expected hash by taking the message with TTL decremented
 When B receives a duplicate (same message, same TTL), B knows A didn't hear B's original forward. Instead of re-forwarding (which would create duplicates), B sends an explicit ACK:
 
 ```rust
-// New message type: ACK = 4
+// Top-level message type: wire_type = 0x03
 struct Ack {
     hash: [u8; 8],  // truncated hash of the message being ACKed
 }
 ```
+
+**Why ACK is a top-level message type:** ACK is intentionally minimal (9 bytes: 1 type + 8 hash) rather than a Routed message subtype. On half-duplex radios, the original sender may have missed the forward because it was transmitting a retry. A smaller ACK has shorter time-on-air, reducing the chance of another collision. ACK needs no routing (strictly local within radio range), no signature (the hash itself proves knowledge of the forwarded message), and no addressing (broadcast to all neighbors).
 
 **Forwarder (B) behavior:**
 1. B receives `Routed` with TTL=X from A
@@ -1608,7 +1611,6 @@ Applications needing stronger guarantees should implement their own ack/retry at
 | LOOKUP | 1 | Some | Some | Some | replica_index (1) |
 | FOUND | 2 | Some | None | None | node_id (16), pubkey (32), keyspace_addr (4), seq (varint), replica_index (1), location_sig (65) |
 | DATA | 3 | Some | 0/1 | 0/1 | application data |
-| ACK | 4 | — | — | — | hash (8 bytes) |
 
 *Routed signature covers all fields except ttl. PUBLISH/FOUND payloads include a dedicated location signature ("LOC:" prefix) that binds node_id to keyspace_addr. This allows storage nodes to forward entries during rebalancing without re-signing. For DATA, src_pubkey can be omitted after initial exchange (receiver has cached pubkey).*
 
@@ -1635,8 +1637,8 @@ min_interval = max(10s, airtime / pulse_budget)
 ```
 
 **Transport priority queues:** The Transport trait provides two outgoing queues:
-- `protocol_outgoing()` — high priority: Pulse, PUBLISH, LOOKUP, FOUND, ACK
-- `app_outgoing()` — lower priority: DATA messages
+- `protocol_outgoing()` — high priority: Pulse, Ack, Routed (PUBLISH, LOOKUP, FOUND)
+- `app_outgoing()` — lower priority: Routed (DATA)
 
 Transport implementations MUST drain the protocol queue before the app queue. This ensures tree maintenance and DHT operations work even when application traffic is heavy. Without this, a flood of DATA messages could starve Pulse broadcasts, causing neighbors to timeout and the tree to degrade.
 
@@ -1711,11 +1713,11 @@ The wire format parser rejects messages with any unexpected values, providing ea
 
 | Check | Location | Invalid values rejected |
 |-------|----------|------------------------|
-| Wire type | First byte | Values other than 0x01 (Pulse) or 0x02 (Routed) |
+| Wire type | First byte | Values other than 0x01 (Pulse), 0x02 (Routed), or 0x03 (Ack) |
 | Varint canonical | All varints | Non-minimal encodings (e.g., 0x80 0x00 for 0) |
 | Child count | Pulse flags | Values > MAX_CHILDREN (12) |
 | Reserved bit 7 | Routed flags | Must be 0 |
-| Message type | Routed bits 0-3 | Values > 4 (only 0-4 valid) |
+| Message type | Routed bits 0-3 | Values > 3 (only 0-3 valid: PUBLISH, LOOKUP, FOUND, DATA) |
 | Signature algorithm | All signatures | Values other than 0x01 (Ed25519) |
 | Replica index | PUBLISH/FOUND | Values >= K_REPLICAS (3) |
 | Children order | Pulse | Non-ascending hash order |

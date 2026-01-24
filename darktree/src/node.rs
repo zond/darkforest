@@ -501,6 +501,11 @@ where
                 }
                 self.handle_routed(routed, now);
             }
+            Message::Ack(_ack) => {
+                self.record_protocol_received();
+                // TODO: Handle ACK for link-layer reliability
+                // Will check pending_acks and remove matching entry
+            }
         }
     }
 

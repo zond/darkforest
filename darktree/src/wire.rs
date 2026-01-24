@@ -396,12 +396,29 @@ pub trait Decode: Sized {
 // Message type discriminators for the wire format
 const WIRE_TYPE_PULSE: u8 = 0x01;
 const WIRE_TYPE_ROUTED: u8 = 0x02;
+const WIRE_TYPE_ACK: u8 = 0x03;
+
+/// Size of ACK hash in bytes.
+pub const ACK_HASH_SIZE: usize = 8;
+
+/// Explicit ACK message for link-layer reliability.
+///
+/// ACK is a minimal top-level message type (9 bytes total) used when a forwarder
+/// receives a duplicate message. Instead of re-forwarding, it sends an ACK with
+/// the hash the original sender is waiting for. The small size minimizes time-on-air
+/// on half-duplex radios where collisions caused the duplicate in the first place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ack {
+    /// Truncated hash of the message being acknowledged (the forwarded version with TTL-1).
+    pub hash: [u8; ACK_HASH_SIZE],
+}
 
 /// Wrapper enum for encoding/decoding top-level messages.
 #[derive(Clone, Debug)]
 pub enum Message {
     Pulse(Pulse),
     Routed(Routed),
+    Ack(Ack),
 }
 
 impl Encode for Pulse {
@@ -571,9 +588,10 @@ impl Decode for Routed {
             return Err(DecodeError::InvalidFlags);
         }
 
-        // Strict validation: message type (bits 0-3) must be 0-4
+        // Strict validation: message type (bits 0-3) must be 0-3
+        // (ACK is a separate top-level message type, not a Routed subtype)
         let msg_type = flags_and_type & 0x0F;
-        if msg_type > crate::types::MSG_ACK {
+        if msg_type > crate::types::MSG_DATA {
             return Err(DecodeError::InvalidMessageType);
         }
 
@@ -620,6 +638,21 @@ impl Decode for Routed {
     }
 }
 
+impl Encode for Ack {
+    fn encode(&self, w: &mut Writer) {
+        w.write_bytes(&self.hash);
+    }
+}
+
+impl Decode for Ack {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let hash_bytes = r.read_bytes(ACK_HASH_SIZE)?;
+        let mut hash = [0u8; ACK_HASH_SIZE];
+        hash.copy_from_slice(hash_bytes);
+        Ok(Ack { hash })
+    }
+}
+
 impl Encode for Message {
     fn encode(&self, w: &mut Writer) {
         match self {
@@ -631,6 +664,10 @@ impl Encode for Message {
                 w.write_u8(WIRE_TYPE_ROUTED);
                 r.encode(w);
             }
+            Message::Ack(a) => {
+                w.write_u8(WIRE_TYPE_ACK);
+                a.encode(w);
+            }
         }
     }
 }
@@ -641,6 +678,7 @@ impl Decode for Message {
         match msg_type {
             WIRE_TYPE_PULSE => Ok(Message::Pulse(Pulse::decode(r)?)),
             WIRE_TYPE_ROUTED => Ok(Message::Routed(Routed::decode(r)?)),
+            WIRE_TYPE_ACK => Ok(Message::Ack(Ack::decode(r)?)),
             _ => Err(DecodeError::InvalidMessageType),
         }
     }
@@ -943,6 +981,22 @@ mod tests {
                 assert_eq!(routed.src_node_id, r.src_node_id);
             }
             _ => panic!("expected Routed"),
+        }
+
+        // Test Ack roundtrip
+        let ack = Ack {
+            hash: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+        };
+        let msg = Message::Ack(ack.clone());
+        let encoded = msg.encode_to_vec();
+        assert_eq!(encoded.len(), 9); // 1 byte type + 8 bytes hash
+        let decoded = Message::decode_from_slice(&encoded).unwrap();
+
+        match decoded {
+            Message::Ack(a) => {
+                assert_eq!(ack.hash, a.hash);
+            }
+            _ => panic!("expected Ack"),
         }
     }
 

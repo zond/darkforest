@@ -39,12 +39,12 @@ pub const PULSE_BW_DIVISOR: u32 = 5;
 /// tau = max(MTU/bandwidth, MIN_TAU_MS).
 pub const MIN_TAU_MS: u64 = 100;
 
-// Message types (0-4 valid; 5-15 rejected at parse time)
+// Routed message types (0-3 valid; 4-15 rejected at parse time)
+// Note: ACK is a separate top-level message type (wire_type 0x03), not a Routed subtype
 pub const MSG_PUBLISH: u8 = 0;
 pub const MSG_LOOKUP: u8 = 1;
 pub const MSG_FOUND: u8 = 2;
 pub const MSG_DATA: u8 = 3;
-pub const MSG_ACK: u8 = 4;
 
 // Algorithm identifiers
 pub const ALGORITHM_ED25519: u8 = 0x01;
