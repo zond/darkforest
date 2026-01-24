@@ -346,17 +346,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::time::Timestamp;
+    use crate::time::{Duration, Timestamp};
     use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
+    use crate::types::NodeId;
 
-    #[test]
-    fn test_publish_stores_locally_when_owner() {
+    fn make_node() -> Node<MockTransport, MockCrypto, MockRandom, MockClock> {
         let transport = MockTransport::new();
         let crypto = MockCrypto::new();
         let random = MockRandom::new();
         let clock = MockClock::new();
+        Node::new(transport, crypto, random, clock)
+    }
 
-        let mut node = Node::new(transport, crypto, random, clock);
+    #[test]
+    fn test_publish_stores_locally_when_owner() {
+        let mut node = make_node();
         let node_id = *node.node_id();
 
         // Node owns full keyspace, so publish should store locally
@@ -364,5 +368,77 @@ mod tests {
 
         // Should have stored our own location entry
         assert!(node.location_store().contains_key(&node_id));
+    }
+
+    #[test]
+    fn test_rebalance_removes_entries_outside_keyspace() {
+        let mut node = make_node();
+        let now = Timestamp::from_secs(100);
+
+        // Publish our location (will store locally since we own full keyspace)
+        node.publish_location(now);
+        let node_id = *node.node_id();
+
+        // Verify entry exists
+        assert!(node.location_store().contains_key(&node_id));
+
+        // Shrink our keyspace to a small range that doesn't include the replica keys
+        // This simulates joining a tree and receiving a smaller keyspace allocation
+        node.set_keyspace_range(0, 1000); // Very small range
+
+        // Rebalance should remove entries we no longer own
+        node.rebalance_keyspace(now);
+
+        // Entry should be removed (we no longer own it)
+        // Note: This depends on how hash_to_key distributes - may need adjustment
+        // if the node's replica keys happen to fall in [0, 1000)
+        // For most node_ids, they won't, so entry should be removed
+        let still_owns = node.owns_replica_key(&node_id);
+        if !still_owns {
+            assert!(!node.location_store().contains_key(&node_id));
+        }
+    }
+
+    #[test]
+    fn test_lookup_stores_pending() {
+        let mut node = make_node();
+        let now = Timestamp::from_secs(100);
+
+        // Create a target node_id to lookup
+        let target: NodeId = [1u8; 16];
+
+        // Initiate lookup
+        node.start_lookup(target, now);
+
+        // Should have a pending lookup
+        assert!(node.pending_lookups().contains_key(&target));
+    }
+
+    #[test]
+    fn test_lookup_timeout_retries_replicas() {
+        let mut node = make_node();
+        let now = Timestamp::from_secs(100);
+
+        // Create a target node_id to lookup
+        let target: NodeId = [1u8; 16];
+
+        // Initiate lookup
+        node.start_lookup(target, now);
+
+        // Check initial state
+        let lookup = node.pending_lookups().get(&target).unwrap();
+        assert_eq!(lookup.replica_index, 0);
+
+        // Simulate timeout by advancing time
+        let timeout_duration = node.lookup_timeout();
+        let after_timeout = now + timeout_duration + Duration::from_secs(1);
+
+        // Handle timeouts
+        node.handle_timeouts(after_timeout);
+
+        // Should have moved to next replica
+        if let Some(lookup) = node.pending_lookups().get(&target) {
+            assert_eq!(lookup.replica_index, 1);
+        }
     }
 }

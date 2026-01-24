@@ -105,11 +105,16 @@ impl<'a> Reader<'a> {
 
     /// Read a fixed number of bytes.
     pub fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
-        if self.pos + len > self.buf.len() {
+        // Use checked arithmetic to prevent overflow on 32-bit systems
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or(DecodeError::UnexpectedEof)?;
+        if end > self.buf.len() {
             return Err(DecodeError::UnexpectedEof);
         }
-        let slice = &self.buf[self.pos..self.pos + len];
-        self.pos += len;
+        let slice = &self.buf[self.pos..end];
+        self.pos = end;
         Ok(slice)
     }
 
@@ -459,6 +464,17 @@ impl Decode for Pulse {
         let keyspace_lo = r.read_u32_be()?;
         let keyspace_hi = r.read_u32_be()?;
 
+        // Fail fast: validate sizes and keyspace before allocating children
+        if subtree_size == 0 {
+            return Err(DecodeError::InvalidValue);
+        }
+        if tree_size < subtree_size {
+            return Err(DecodeError::InvalidValue);
+        }
+        if keyspace_lo > keyspace_hi {
+            return Err(DecodeError::InvalidValue);
+        }
+
         // pubkey (conditional on has_pubkey flag)
         let pubkey = if flags & PULSE_FLAG_HAS_PUBKEY != 0 {
             Some(r.read_pubkey()?)
@@ -489,21 +505,6 @@ impl Decode for Pulse {
         }
 
         let signature = r.read_signature()?;
-
-        // Strict validation: subtree_size must be >= 1 (node counts itself)
-        if subtree_size == 0 {
-            return Err(DecodeError::InvalidValue);
-        }
-
-        // Strict validation: tree_size must be >= subtree_size
-        if tree_size < subtree_size {
-            return Err(DecodeError::InvalidValue);
-        }
-
-        // Strict validation: keyspace range must be valid (lo <= hi)
-        if keyspace_lo > keyspace_hi {
-            return Err(DecodeError::InvalidValue);
-        }
 
         Ok(Pulse {
             node_id,

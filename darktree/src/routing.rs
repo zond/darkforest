@@ -406,14 +406,17 @@ mod tests {
     use super::*;
     use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
 
-    #[test]
-    fn test_owns_key() {
+    fn make_node() -> Node<MockTransport, MockCrypto, MockRandom, MockClock> {
         let transport = MockTransport::new();
         let crypto = MockCrypto::new();
         let random = MockRandom::new();
         let clock = MockClock::new();
+        Node::new(transport, crypto, random, clock)
+    }
 
-        let node = Node::new(transport, crypto, random, clock);
+    #[test]
+    fn test_owns_key() {
+        let node = make_node();
 
         // Node starts with full keyspace [0, u32::MAX)
         assert!(node.owns_key(0));
@@ -423,12 +426,7 @@ mod tests {
 
     #[test]
     fn test_my_address() {
-        let transport = MockTransport::new();
-        let crypto = MockCrypto::new();
-        let random = MockRandom::new();
-        let clock = MockClock::new();
-
-        let node = Node::new(transport, crypto, random, clock);
+        let node = make_node();
 
         // Full keyspace: center is approximately u32::MAX / 2
         let addr = node.my_address();
@@ -438,12 +436,7 @@ mod tests {
 
     #[test]
     fn test_hash_to_key() {
-        let transport = MockTransport::new();
-        let crypto = MockCrypto::new();
-        let random = MockRandom::new();
-        let clock = MockClock::new();
-
-        let node = Node::new(transport, crypto, random, clock);
+        let node = make_node();
 
         let node_id: NodeId = [1u8; 16];
         let key0 = node.hash_to_key(&node_id, 0);
@@ -455,12 +448,7 @@ mod tests {
 
     #[test]
     fn test_addr_for_key() {
-        let transport = MockTransport::new();
-        let crypto = MockCrypto::new();
-        let random = MockRandom::new();
-        let clock = MockClock::new();
-
-        let node = Node::new(transport, crypto, random, clock);
+        let node = make_node();
 
         let key = [
             0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -469,5 +457,93 @@ mod tests {
         let addr = node.addr_for_key(key);
 
         assert_eq!(addr, 0x12345678);
+    }
+
+    #[test]
+    fn test_best_next_hop_returns_child_in_range() {
+        let mut node = make_node();
+
+        // Add a child with keyspace range [1000, 2000)
+        let child_id: NodeId = [1u8; 16];
+        node.child_ranges_mut().insert(child_id, (1000, 2000));
+
+        // Destination within child's range should return child
+        assert_eq!(node.best_next_hop(1500), Some(child_id));
+
+        // Destination outside any child range should return None
+        assert_eq!(node.best_next_hop(500), None);
+        assert_eq!(node.best_next_hop(3000), None);
+    }
+
+    #[test]
+    fn test_best_next_hop_returns_shortcut_in_range() {
+        let mut node = make_node();
+
+        // Add a shortcut with keyspace range [5000, 6000)
+        let shortcut_id: NodeId = [2u8; 16];
+        node.shortcuts_mut().insert(shortcut_id, (5000, 6000));
+
+        // Destination within shortcut's range should return shortcut
+        assert_eq!(node.best_next_hop(5500), Some(shortcut_id));
+
+        // Destination outside any range should return None
+        assert_eq!(node.best_next_hop(4000), None);
+    }
+
+    #[test]
+    fn test_best_next_hop_prefers_tighter_range() {
+        let mut node = make_node();
+
+        // Add a child with wide range [0, 10000)
+        let wide_child: NodeId = [1u8; 16];
+        node.child_ranges_mut().insert(wide_child, (0, 10000));
+
+        // Add a shortcut with tight range [4000, 6000)
+        let tight_shortcut: NodeId = [2u8; 16];
+        node.shortcuts_mut().insert(tight_shortcut, (4000, 6000));
+
+        // Destination 5000 is in both ranges - should prefer tighter range
+        assert_eq!(node.best_next_hop(5000), Some(tight_shortcut));
+
+        // Destination 1000 is only in wide range
+        assert_eq!(node.best_next_hop(1000), Some(wide_child));
+    }
+
+    #[test]
+    fn test_best_next_hop_child_tighter_than_shortcut() {
+        let mut node = make_node();
+
+        // Add a shortcut with wide range [0, 20000)
+        let wide_shortcut: NodeId = [1u8; 16];
+        node.shortcuts_mut().insert(wide_shortcut, (0, 20000));
+
+        // Add a child with tight range [5000, 7000)
+        let tight_child: NodeId = [2u8; 16];
+        node.child_ranges_mut().insert(tight_child, (5000, 7000));
+
+        // Destination 6000 is in both ranges - should prefer tighter child
+        assert_eq!(node.best_next_hop(6000), Some(tight_child));
+    }
+
+    #[test]
+    fn test_best_next_hop_multiple_children() {
+        let mut node = make_node();
+
+        // Add multiple non-overlapping children
+        let child1: NodeId = [1u8; 16];
+        let child2: NodeId = [2u8; 16];
+        let child3: NodeId = [3u8; 16];
+
+        node.child_ranges_mut().insert(child1, (0, 1000));
+        node.child_ranges_mut().insert(child2, (1000, 2000));
+        node.child_ranges_mut().insert(child3, (2000, 3000));
+
+        // Each destination should route to correct child
+        assert_eq!(node.best_next_hop(500), Some(child1));
+        assert_eq!(node.best_next_hop(1500), Some(child2));
+        assert_eq!(node.best_next_hop(2500), Some(child3));
+
+        // Outside all ranges
+        assert_eq!(node.best_next_hop(5000), None);
     }
 }

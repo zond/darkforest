@@ -552,7 +552,7 @@ where
     }
 
     /// Start a lookup for a target node.
-    fn start_lookup(&mut self, target: NodeId, now: Timestamp) {
+    pub(crate) fn start_lookup(&mut self, target: NodeId, now: Timestamp) {
         if self.pending_lookups.contains_key(&target) {
             return; // Already in progress
         }

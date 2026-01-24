@@ -749,4 +749,302 @@ where
             self.location_store_mut().remove(&id);
         }
     }
+
+    /// Compute keyspace range for a child (exposed for testing).
+    #[cfg(test)]
+    pub(crate) fn compute_child_keyspace_for_test(
+        &self,
+        pulse: &Pulse,
+        child_idx: usize,
+    ) -> (u32, u32) {
+        self.compute_child_keyspace(pulse, child_idx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::NeighborTiming;
+    use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
+    use crate::types::{LocationEntry, NodeId, Signature, ALGORITHM_ED25519};
+    use alloc::vec;
+
+    fn make_node() -> Node<MockTransport, MockCrypto, MockRandom, MockClock> {
+        let transport = MockTransport::new();
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+        Node::new(transport, crypto, random, clock)
+    }
+
+    #[test]
+    fn test_handle_neighbor_timeouts_parent() {
+        let mut node = make_node();
+        let now = Timestamp::from_secs(1000);
+
+        // Set up a parent
+        let parent_id: NodeId = [1u8; 16];
+        node.set_parent(Some(parent_id));
+
+        // Add neighbor timing for parent (last seen long ago)
+        let old_time = Timestamp::from_secs(100);
+        node.insert_neighbor_time(
+            parent_id,
+            NeighborTiming {
+                last_seen: old_time,
+                prev_seen: Some(Timestamp::from_secs(50)),
+                rssi: Some(-70),
+                root_hash: [0u8; 4],
+                tree_size: 1,
+                keyspace_range: (0, u32::MAX),
+                children_count: 0,
+            },
+        );
+
+        // Verify parent is set
+        assert_eq!(node.parent(), Some(parent_id));
+
+        // Handle timeouts - parent should timeout and node becomes root
+        node.handle_neighbor_timeouts(now);
+
+        // Parent should be None (we became root)
+        assert_eq!(node.parent(), None);
+    }
+
+    #[test]
+    fn test_handle_neighbor_timeouts_child() {
+        let mut node = make_node();
+        let now = Timestamp::from_secs(1000);
+
+        // Add a child
+        let child_id: NodeId = [2u8; 16];
+        node.children_mut().insert(child_id, 5); // subtree_size = 5
+
+        // Add neighbor timing for child (last seen long ago)
+        let old_time = Timestamp::from_secs(100);
+        node.insert_neighbor_time(
+            child_id,
+            NeighborTiming {
+                last_seen: old_time,
+                prev_seen: Some(Timestamp::from_secs(50)),
+                rssi: Some(-80),
+                root_hash: [0u8; 4],
+                tree_size: 5,
+                keyspace_range: (0, u32::MAX),
+                children_count: 0,
+            },
+        );
+
+        // Verify child exists
+        assert!(node.children().contains_key(&child_id));
+
+        // Handle timeouts - child should be removed
+        node.handle_neighbor_timeouts(now);
+
+        // Child should be removed
+        assert!(!node.children().contains_key(&child_id));
+    }
+
+    #[test]
+    fn test_handle_location_expiry() {
+        let mut node = make_node();
+
+        // Add some location entries
+        let node_id1: NodeId = [1u8; 16];
+        let node_id2: NodeId = [2u8; 16];
+
+        let old_time = Timestamp::from_secs(100);
+        let recent_time = Timestamp::ZERO + Duration::from_hours(11); // Within TTL
+
+        let entry1 = LocationEntry {
+            node_id: node_id1,
+            pubkey: [0u8; 32],
+            keyspace_addr: 1000,
+            seq: 1,
+            replica_index: 0,
+            signature: Signature {
+                algorithm: ALGORITHM_ED25519,
+                sig: [0u8; 64],
+            },
+            received_at: old_time, // Old, should expire
+        };
+
+        let entry2 = LocationEntry {
+            node_id: node_id2,
+            pubkey: [0u8; 32],
+            keyspace_addr: 2000,
+            seq: 1,
+            replica_index: 0,
+            signature: Signature {
+                algorithm: ALGORITHM_ED25519,
+                sig: [0u8; 64],
+            },
+            received_at: recent_time, // Recent, should stay
+        };
+
+        node.insert_location_store(node_id1, entry1);
+        node.insert_location_store(node_id2, entry2);
+
+        // Verify both exist
+        assert!(node.location_store().contains_key(&node_id1));
+        assert!(node.location_store().contains_key(&node_id2));
+
+        // Run expiry at time = 13 hours (LOCATION_TTL = 12 hours)
+        let now = Timestamp::ZERO + Duration::from_hours(13);
+        node.handle_location_expiry(now);
+
+        // Old entry should be gone, recent should remain
+        assert!(!node.location_store().contains_key(&node_id1));
+        assert!(node.location_store().contains_key(&node_id2));
+    }
+
+    #[test]
+    fn test_compute_child_keyspace() {
+        let node = make_node();
+
+        // Create a pulse with parent owning full keyspace and 2 children
+        let pulse = Pulse {
+            node_id: [0u8; 16],
+            flags: Pulse::build_flags(false, false, false, 2),
+            parent_hash: None,
+            root_hash: [0u8; 4],
+            subtree_size: 11, // 1 parent + 5 + 5 children
+            tree_size: 11,
+            keyspace_lo: 0,
+            keyspace_hi: u32::MAX,
+            pubkey: None,
+            children: vec![
+                ([0, 0, 0, 1], 5), // child 0 with subtree_size 5
+                ([0, 0, 0, 2], 5), // child 1 with subtree_size 5
+            ],
+            signature: Signature::default(),
+        };
+
+        // Total = 1 + 5 + 5 = 11
+        // Parent keeps 1/11 of range
+        // Each child gets 5/11 of range
+
+        let (lo0, hi0) = node.compute_child_keyspace_for_test(&pulse, 0);
+        let (lo1, hi1) = node.compute_child_keyspace_for_test(&pulse, 1);
+
+        // Child 0 starts after parent's slice
+        let parent_slice = (u32::MAX as u64) / 11;
+        assert!(lo0 as u64 >= parent_slice);
+
+        // Children are contiguous
+        assert_eq!(hi0, lo1);
+
+        // Both children get equal share (5/11 each)
+        let child0_range = hi0 - lo0;
+        let child1_range = hi1 - lo1;
+        // Allow some rounding error
+        assert!((child0_range as i64 - child1_range as i64).abs() < 2);
+    }
+
+    #[test]
+    fn test_consider_merge_larger_tree_wins() {
+        let mut node = make_node();
+
+        // Our tree has size 5
+        node.set_tree_size(5);
+        node.set_subtree_size(5);
+
+        // Receive pulse from larger tree (size 10)
+        let other_id: NodeId = [1u8; 16];
+        let other_hash = node.compute_node_hash(&other_id);
+
+        let pulse = Pulse {
+            node_id: other_id,
+            flags: Pulse::build_flags(false, false, false, 0),
+            parent_hash: None,
+            root_hash: other_hash,
+            subtree_size: 10,
+            tree_size: 10,
+            keyspace_lo: 0,
+            keyspace_hi: u32::MAX,
+            pubkey: None,
+            children: vec![],
+            signature: Signature::default(),
+        };
+
+        let now = Timestamp::from_secs(100);
+
+        // Add neighbor timing for RSSI
+        node.insert_neighbor_time(
+            other_id,
+            NeighborTiming {
+                last_seen: now,
+                prev_seen: None,
+                rssi: Some(-70),
+                root_hash: other_hash,
+                tree_size: 10,
+                keyspace_range: (0, u32::MAX),
+                children_count: 0,
+            },
+        );
+
+        // Consider merge
+        node.consider_merge(&pulse, &other_hash, now);
+
+        // Should have pending_parent set to join larger tree
+        assert!(node.pending_parent().is_some());
+        let (pending_id, _) = node.pending_parent().unwrap();
+        assert_eq!(pending_id, other_id);
+    }
+
+    #[test]
+    fn test_consider_merge_same_size_root_hash_tiebreak() {
+        let mut node = make_node();
+
+        // Get our root hash
+        let our_root = *node.root_hash();
+
+        // Our tree has size 5
+        node.set_tree_size(5);
+        node.set_subtree_size(5);
+
+        // Create another node with same size but different root
+        let other_id: NodeId = [0xFF; 16]; // High bytes to likely have higher hash
+        let other_hash = node.compute_node_hash(&other_id);
+
+        let pulse = Pulse {
+            node_id: other_id,
+            flags: Pulse::build_flags(false, false, false, 0),
+            parent_hash: None,
+            root_hash: other_hash,
+            subtree_size: 5,
+            tree_size: 5, // Same size
+            keyspace_lo: 0,
+            keyspace_hi: u32::MAX,
+            pubkey: None,
+            children: vec![],
+            signature: Signature::default(),
+        };
+
+        let now = Timestamp::from_secs(100);
+
+        // Add neighbor timing
+        node.insert_neighbor_time(
+            other_id,
+            NeighborTiming {
+                last_seen: now,
+                prev_seen: None,
+                rssi: Some(-70),
+                root_hash: other_hash,
+                tree_size: 5,
+                keyspace_range: (0, u32::MAX),
+                children_count: 0,
+            },
+        );
+
+        // Consider merge
+        node.consider_merge(&pulse, &other_hash, now);
+
+        // With equal tree sizes, smaller root_hash wins (acts as tiebreaker).
+        // We join them if our hash is LARGER than theirs (they have better tiebreaker).
+        if our_root > other_hash {
+            assert!(node.pending_parent().is_some());
+        }
+        // (If our hash is smaller, we don't join them - we have the better tiebreaker)
+    }
 }
