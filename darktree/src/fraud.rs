@@ -175,7 +175,7 @@ where
 
         if self.check_tree_size_fraud(now) {
             // Add the parent we joined through to distrusted
-            if let Some(ctx) = self.join_context().clone() {
+            if let Some(ctx) = self.join_context().as_ref().copied() {
                 let observed = self.fraud_detection().unique_publisher_count() as u32;
                 let expected = self.fraud_detection().subtree_size_at_start();
 

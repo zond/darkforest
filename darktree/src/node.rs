@@ -72,7 +72,7 @@ pub struct PendingLookup {
 }
 
 /// Context for fraud detection when joining a tree.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct JoinContext {
     /// Parent node when we joined.
     pub parent_at_join: NodeId,
@@ -571,12 +571,22 @@ where
         self.send_lookup(target, 0, now);
     }
 
+    // --- Cache accessors ---
+    //
+    // Cache API usage:
+    // - has_pubkey/has_location: Check existence without updating LRU timestamp (for quick checks)
+    // - get_pubkey/get_location_cache: Get value AND update LRU timestamp (for actual usage)
+    // - pubkey_cache()/location_cache(): Raw access for iteration or bulk operations
+    //
+    // Use get_* when the value will be used, has_* when just checking existence.
+
     /// Check if we have a public key cached for a node.
+    /// Does not update the LRU timestamp (use `get_pubkey` when actually using the key).
     pub fn has_pubkey(&self, node_id: &NodeId) -> bool {
         self.pubkey_cache.contains_key(node_id)
     }
 
-    /// Get a cached public key and mark it as recently used.
+    /// Get a cached public key and mark it as recently used for LRU eviction.
     pub fn get_pubkey(&mut self, node_id: &NodeId, now: Timestamp) -> Option<PublicKey> {
         if let Some((pk, last_used)) = self.pubkey_cache.get_mut(node_id) {
             *last_used = now;
@@ -586,7 +596,7 @@ where
         }
     }
 
-    /// Get a cached location and mark it as recently used.
+    /// Get a cached location and mark it as recently used for LRU eviction.
     pub fn get_location_cache(&mut self, node_id: &NodeId, now: Timestamp) -> Option<u32> {
         if let Some((addr, last_used)) = self.location_cache.get_mut(node_id) {
             *last_used = now;
@@ -852,6 +862,29 @@ where
     }
 
     // --- Bounded insertion helpers ---
+    //
+    // These helpers implement LRU (Least Recently Used) eviction for bounded collections.
+    // When a collection reaches its maximum size and a new entry needs to be inserted,
+    // the entry with the oldest timestamp is evicted. The O(n) iteration cost is acceptable
+    // because eviction only occurs when the cache is full, which is infrequent in practice.
+
+    /// Evict the oldest entry from a map based on a timestamp extraction function.
+    /// Returns true if an entry was evicted.
+    fn evict_oldest_by<V, F>(map: &mut HashMap<NodeId, V>, get_timestamp: F) -> bool
+    where
+        F: Fn(&V) -> Timestamp,
+    {
+        if let Some(oldest_key) = map
+            .iter()
+            .min_by_key(|(_, v)| get_timestamp(v))
+            .map(|(k, _)| *k)
+        {
+            map.remove(&oldest_key);
+            true
+        } else {
+            false
+        }
+    }
 
     pub(crate) fn insert_pubkey_cache(
         &mut self,
@@ -861,15 +894,7 @@ where
     ) {
         if self.pubkey_cache.len() >= MAX_PUBKEY_CACHE && !self.pubkey_cache.contains_key(&node_id)
         {
-            // Evict the least recently used entry
-            if let Some(oldest_key) = self
-                .pubkey_cache
-                .iter()
-                .min_by_key(|(_, (_, last_used))| *last_used)
-                .map(|(k, _)| *k)
-            {
-                self.pubkey_cache.remove(&oldest_key);
-            }
+            Self::evict_oldest_by(&mut self.pubkey_cache, |(_, last_used)| *last_used);
         }
         self.pubkey_cache.insert(node_id, (pubkey, now));
     }
@@ -878,14 +903,7 @@ where
         if self.location_store.len() >= MAX_LOCATION_STORE
             && !self.location_store.contains_key(&node_id)
         {
-            if let Some(oldest_key) = self
-                .location_store
-                .iter()
-                .min_by_key(|(_, e)| e.received_at)
-                .map(|(k, _)| *k)
-            {
-                self.location_store.remove(&oldest_key);
-            }
+            Self::evict_oldest_by(&mut self.location_store, |e| e.received_at);
         }
         self.location_store.insert(node_id, entry);
     }
@@ -894,15 +912,7 @@ where
         if self.location_cache.len() >= MAX_LOCATION_CACHE
             && !self.location_cache.contains_key(&node_id)
         {
-            // Evict the least recently used entry
-            if let Some(oldest_key) = self
-                .location_cache
-                .iter()
-                .min_by_key(|(_, (_, last_used))| *last_used)
-                .map(|(k, _)| *k)
-            {
-                self.location_cache.remove(&oldest_key);
-            }
+            Self::evict_oldest_by(&mut self.location_cache, |(_, last_used)| *last_used);
         }
         self.location_cache.insert(node_id, (addr, now));
     }
@@ -910,36 +920,24 @@ where
     pub(crate) fn insert_neighbor_time(&mut self, node_id: NodeId, timing: NeighborTiming) {
         if self.neighbor_times.len() >= MAX_NEIGHBORS && !self.neighbor_times.contains_key(&node_id)
         {
-            if let Some(oldest_key) = self
-                .neighbor_times
-                .iter()
-                .min_by_key(|(_, t)| t.last_seen)
-                .map(|(k, _)| *k)
-            {
-                self.neighbor_times.remove(&oldest_key);
-            }
+            Self::evict_oldest_by(&mut self.neighbor_times, |t| t.last_seen);
         }
         self.neighbor_times.insert(node_id, timing);
     }
 
     pub(crate) fn insert_distrusted(&mut self, node_id: NodeId, timestamp: Timestamp) {
         if self.distrusted.len() >= MAX_DISTRUSTED && !self.distrusted.contains_key(&node_id) {
-            if let Some(oldest_key) = self
-                .distrusted
-                .iter()
-                .min_by_key(|(_, &ts)| ts)
-                .map(|(k, _)| *k)
-            {
-                self.distrusted.remove(&oldest_key);
-            }
+            Self::evict_oldest_by(&mut self.distrusted, |&ts| ts);
         }
         self.distrusted.insert(node_id, timestamp);
     }
 
     pub(crate) fn insert_shortcut(&mut self, node_id: NodeId, keyspace: (u32, u32)) {
         if self.shortcuts.len() >= MAX_SHORTCUTS && !self.shortcuts.contains_key(&node_id) {
-            // Evict the shortcut we haven't heard from in the longest time
-            // Cross-reference with neighbor_times for last_seen
+            // Shortcuts use a different eviction strategy: cross-reference with neighbor_times.
+            // Unlike other caches, shortcuts don't store timestamps. Instead, when we receive
+            // a pulse, we update neighbor_times.last_seen. So we evict the shortcut whose
+            // corresponding neighbor was heard from least recently.
             if let Some(oldest_key) = self
                 .shortcuts
                 .keys()

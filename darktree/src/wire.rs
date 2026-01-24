@@ -52,7 +52,7 @@ pub enum DecodeError {
     InvalidVarint,
     /// Non-canonical varint encoding (must use minimal bytes).
     NonCanonicalVarint,
-    /// Invalid length value.
+    /// Invalid length value or trailing bytes.
     InvalidLength,
     /// Invalid signature format.
     InvalidSignature,
@@ -62,6 +62,8 @@ pub enum DecodeError {
     CapacityExceeded,
     /// Invalid flags.
     InvalidFlags,
+    /// Semantic validation failed (e.g., children not sorted, invalid size relationships).
+    InvalidValue,
 }
 
 /// Zero-copy reader over a byte slice.
@@ -482,7 +484,7 @@ impl Decode for Pulse {
         // Strict validation: children must be sorted by hash (ascending)
         for i in 1..children.len() {
             if children[i - 1].0 >= children[i].0 {
-                return Err(DecodeError::InvalidLength);
+                return Err(DecodeError::InvalidValue);
             }
         }
 
@@ -490,17 +492,17 @@ impl Decode for Pulse {
 
         // Strict validation: subtree_size must be >= 1 (node counts itself)
         if subtree_size == 0 {
-            return Err(DecodeError::InvalidLength);
+            return Err(DecodeError::InvalidValue);
         }
 
         // Strict validation: tree_size must be >= subtree_size
         if tree_size < subtree_size {
-            return Err(DecodeError::InvalidLength);
+            return Err(DecodeError::InvalidValue);
         }
 
         // Strict validation: keyspace range must be valid (lo <= hi)
         if keyspace_lo > keyspace_hi {
-            return Err(DecodeError::InvalidLength);
+            return Err(DecodeError::InvalidValue);
         }
 
         Ok(Pulse {
@@ -664,7 +666,7 @@ impl Decode for LocationEntry {
 
         // Strict validation: replica_index must be < K_REPLICAS (3)
         if replica_index as usize >= crate::types::K_REPLICAS {
-            return Err(DecodeError::InvalidLength);
+            return Err(DecodeError::InvalidValue);
         }
 
         let signature = r.read_signature()?;

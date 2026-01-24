@@ -127,14 +127,14 @@ where
         if let Some(parent_id) = self.parent() {
             let parent_hash = self.compute_node_hash(&parent_id);
             if pulse.node_id == parent_id {
-                self.handle_parent_pulse(&pulse, &sender_hash, now);
+                self.handle_parent_pulse(&pulse, now);
                 return;
             }
             // Also handle by hash match
             if pulse.parent_hash.is_none() || pulse.parent_hash == Some(parent_hash) {
                 // Check if sender is our parent
                 if sender_hash == parent_hash {
-                    self.handle_parent_pulse(&pulse, &sender_hash, now);
+                    self.handle_parent_pulse(&pulse, now);
                     return;
                 }
             }
@@ -180,7 +180,7 @@ where
     }
 
     /// Handle a pulse from our current parent.
-    fn handle_parent_pulse(&mut self, pulse: &Pulse, _sender_hash: &ChildHash, now: Timestamp) {
+    fn handle_parent_pulse(&mut self, pulse: &Pulse, now: Timestamp) {
         // Find ourselves in parent's children list (by hash)
         let my_hash = self.compute_node_hash(self.node_id());
         if let Some(my_idx) = self.find_child_index(pulse, &my_hash) {

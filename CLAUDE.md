@@ -29,8 +29,9 @@ README.md and CLAUDE.md should refer to docs/* files when useful.
 3. Ensure README.md and CLAUDE.md are up to date
 4. Check if any files in the docs directory need update
 5. If available, review with code review agents suitable for the changes.
-6. Fix any high priority issues identified by code review before committing
-7. Add low/medium priority improvements to docs/future-work.md or TODO comments
+6. If you used review agents, add a note to the commit explaining which agents.
+7. Fix any high priority issues identified by code review before committing
+8. Add low/medium priority improvements to docs/future-work.md or TODO comments
 
 ### Commit Standards
 
