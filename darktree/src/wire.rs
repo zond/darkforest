@@ -206,8 +206,13 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a Signature (1 + 64 bytes).
+    /// Validates that algorithm byte is ALGORITHM_ED25519 (0x01).
     pub fn read_signature(&mut self) -> Result<Signature, DecodeError> {
         let algorithm = self.read_u8()?;
+        // Strict validation: only Ed25519 is supported
+        if algorithm != crate::types::ALGORITHM_ED25519 {
+            return Err(DecodeError::InvalidSignature);
+        }
         let sig_bytes = self.read_bytes(64)?;
         let mut sig = [0u8; 64];
         sig.copy_from_slice(sig_bytes);
@@ -369,10 +374,15 @@ pub trait Decode: Sized {
     /// Decode a value from the reader.
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError>;
 
-    /// Decode from a byte slice.
+    /// Decode from a byte slice (strict: rejects trailing bytes).
     fn decode_from_slice(data: &[u8]) -> Result<Self, DecodeError> {
         let mut r = Reader::new(data);
-        Self::decode(&mut r)
+        let result = Self::decode(&mut r)?;
+        // Strict validation: reject trailing bytes
+        if !r.is_empty() {
+            return Err(DecodeError::InvalidLength);
+        }
+        Ok(result)
     }
 }
 
@@ -469,7 +479,29 @@ impl Decode for Pulse {
             children.push((hash, size));
         }
 
+        // Strict validation: children must be sorted by hash (ascending)
+        for i in 1..children.len() {
+            if children[i - 1].0 >= children[i].0 {
+                return Err(DecodeError::InvalidLength);
+            }
+        }
+
         let signature = r.read_signature()?;
+
+        // Strict validation: subtree_size must be >= 1 (node counts itself)
+        if subtree_size == 0 {
+            return Err(DecodeError::InvalidLength);
+        }
+
+        // Strict validation: tree_size must be >= subtree_size
+        if tree_size < subtree_size {
+            return Err(DecodeError::InvalidLength);
+        }
+
+        // Strict validation: keyspace range must be valid (lo <= hi)
+        if keyspace_lo > keyspace_hi {
+            return Err(DecodeError::InvalidLength);
+        }
 
         Ok(Pulse {
             node_id,
@@ -530,6 +562,18 @@ impl Encode for Routed {
 impl Decode for Routed {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let flags_and_type = r.read_u8()?;
+
+        // Strict validation: reserved bit 7 must be 0
+        if flags_and_type & 0x80 != 0 {
+            return Err(DecodeError::InvalidFlags);
+        }
+
+        // Strict validation: message type (bits 0-3) must be 0-4
+        let msg_type = flags_and_type & 0x0F;
+        if msg_type > crate::types::MSG_ACK {
+            return Err(DecodeError::InvalidMessageType);
+        }
+
         let dest_addr = r.read_u32_be()?;
 
         // dest_hash (conditional on flag)
@@ -617,6 +661,12 @@ impl Decode for LocationEntry {
         let keyspace_addr = r.read_u32_be()?;
         let seq = r.read_varint()?;
         let replica_index = r.read_u8()?;
+
+        // Strict validation: replica_index must be < K_REPLICAS (3)
+        if replica_index as usize >= crate::types::K_REPLICAS {
+            return Err(DecodeError::InvalidLength);
+        }
+
         let signature = r.read_signature()?;
 
         Ok(LocationEntry {

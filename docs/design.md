@@ -1705,6 +1705,24 @@ The attacker feeds V false tree information, intercepts all traffic, or isolates
 
 This attack is fundamentally hard to prevent at the protocol layer — it requires physical access or proximity to the victim.
 
+**Strict message parsing (defense in depth):**
+
+The wire format parser rejects messages with any unexpected values, providing early rejection of non-darktree traffic. This complements sync word filtering (which is unreliable due to RF interference) and signature verification (which requires more computation).
+
+| Check | Location | Invalid values rejected |
+|-------|----------|------------------------|
+| Wire type | First byte | Values other than 0x01 (Pulse) or 0x02 (Routed) |
+| Varint canonical | All varints | Non-minimal encodings (e.g., 0x80 0x00 for 0) |
+| Child count | Pulse flags | Values > MAX_CHILDREN (12) |
+| Reserved bit 7 | Routed flags | Must be 0 |
+| Message type | Routed bits 0-3 | Values > 4 (only 0-4 valid) |
+| Signature algorithm | All signatures | Values other than 0x01 (Ed25519) |
+| Replica index | PUBLISH/FOUND | Values >= K_REPLICAS (3) |
+| Children order | Pulse | Non-ascending hash order |
+| Trailing bytes | All messages | Extra bytes after valid message |
+
+This strict parsing ensures that random radio noise or collisions from other protocols (Meshtastic 0x2B, LoRaWAN 0x12/0x34) are quickly rejected without expensive signature verification.
+
 **Left to application:** End-to-end encryption, partner authentication
 
 ### Design Properties
@@ -1760,7 +1778,7 @@ This section provides expected latency for delivering application-level DATA mes
 
 **Real-world LoRa packet loss rates:**
 
-Based on studies of deployed LoRa networks (see `docs/lora-packet-loss-study.md`):
+Based on studies of deployed LoRa networks:
 
 | Congestion Level | Device Density | Typical Loss Rate |
 |------------------|----------------|-------------------|

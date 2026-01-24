@@ -9,7 +9,6 @@ Comprehensive review by protocol-security-architect and embedded-rust-engineer a
 **Design doc:** Part 5 (lines 1428-1563)
 
 The entire link-layer reliability system is missing:
-- No `MSG_ACK = 4` message type (types.rs only defines 0-3)
 - No implicit ACK via overhearing
 - No `pending_acks` tracking
 - No `recently_forwarded` duplicate detection
@@ -179,6 +178,17 @@ Basic tests exist but routing logic is untested.
 - Children count validation in decoder
 - Zero unsafe code in production
 
+### Strict Message Parsing (Defense in Depth)
+- Wire type validation (0x01 Pulse, 0x02 Routed only)
+- Non-canonical varint rejection
+- Signature algorithm validation (0x01 Ed25519 only)
+- Reserved bit 7 in Routed flags must be 0
+- Message type bounds (0-4 only)
+- Replica index bounds (< K_REPLICAS)
+- Children sorted order validation
+- Pulse sanity: subtree_size >= 1, tree_size >= subtree_size, keyspace_lo <= keyspace_hi
+- Trailing bytes rejection
+
 ### Embedded Compatibility
 - no_std compatible (uses alloc, hashbrown for HashMap)
 - No recursion (all iterative algorithms)
@@ -213,5 +223,6 @@ Basic tests exist but routing logic is untested.
 | LOOKUP_TIMEOUT | 32τ | 32τ | Match |
 | PULSE_BW_DIVISOR | 5 | 5 | Match |
 | MAX_RETRIES | 8 | 8 | Match |
+| MSG_ACK | 4 | 4 | Match |
 | MAX_PENDING_ACKS | 32 | N/A | Not implemented |
 | MAX_RECENTLY_FORWARDED | 256 | N/A | Not implemented |
