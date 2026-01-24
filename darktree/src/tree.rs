@@ -10,6 +10,7 @@ use core::cmp::Ordering;
 
 use alloc::vec::Vec;
 
+use crate::config::NodeConfig;
 use crate::node::{JoinContext, NeighborTiming, Node};
 use crate::time::{Duration, Timestamp};
 use crate::traits::{Clock, Crypto, Random, Transport};
@@ -44,12 +45,13 @@ const MISSED_PULSES_TIMEOUT: u64 = 8;
 /// Number of pulses to wait for parent acknowledgment.
 const PARENT_ACK_PULSES: u8 = 3;
 
-impl<T, Cr, R, Clk> Node<T, Cr, R, Clk>
+impl<T, Cr, R, Clk, Cfg> Node<T, Cr, R, Clk, Cfg>
 where
     T: Transport,
     Cr: Crypto,
     R: Random,
     Clk: Clock,
+    Cfg: NodeConfig,
 {
     /// Handle a received Pulse message.
     pub(crate) fn handle_pulse(&mut self, pulse: Pulse, rssi: Option<i16>, now: Timestamp) {
@@ -769,7 +771,8 @@ mod tests {
     use crate::types::{LocationEntry, NodeId, Signature, ALGORITHM_ED25519};
     use alloc::vec;
 
-    fn make_node() -> Node<MockTransport, MockCrypto, MockRandom, MockClock> {
+    fn make_node(
+    ) -> Node<MockTransport, MockCrypto, MockRandom, MockClock, crate::config::DefaultConfig> {
         let transport = MockTransport::new();
         let crypto = MockCrypto::new();
         let random = MockRandom::new();

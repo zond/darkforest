@@ -6,6 +6,7 @@
 
 use alloc::vec::Vec;
 
+use crate::config::NodeConfig;
 use crate::node::{AckHash, Node};
 use crate::time::Timestamp;
 use crate::traits::{Clock, Crypto, Random, Transport};
@@ -15,12 +16,13 @@ use crate::types::{
 };
 use crate::wire::{routed_sign_data, Ack, Encode, Message};
 
-impl<T, Cr, R, Clk> Node<T, Cr, R, Clk>
+impl<T, Cr, R, Clk, Cfg> Node<T, Cr, R, Clk, Cfg>
 where
     T: Transport,
     Cr: Crypto,
     R: Random,
     Clk: Clock,
+    Cfg: NodeConfig,
 {
     /// Handle an incoming Routed message.
     pub(crate) fn handle_routed(&mut self, mut msg: Routed, now: Timestamp) {
@@ -463,9 +465,13 @@ mod tests {
     use alloc::vec;
 
     use super::*;
+    use crate::config::DefaultConfig;
     use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
 
-    fn make_node() -> Node<MockTransport, MockCrypto, MockRandom, MockClock> {
+    /// Type alias for test nodes using default config.
+    type TestNode = Node<MockTransport, MockCrypto, MockRandom, MockClock, DefaultConfig>;
+
+    fn make_node() -> TestNode {
         let transport = MockTransport::new();
         let crypto = MockCrypto::new();
         let random = MockRandom::new();
@@ -750,7 +756,7 @@ mod tests {
         let crypto = MockCrypto::new();
         let random = MockRandom::with_seed(42);
         let clock = MockClock::new();
-        let mut node = Node::new(transport, crypto, random, clock);
+        let mut node: TestNode = Node::new(transport, crypto, random, clock);
 
         let tau_ms = node.tau().as_millis();
         assert_eq!(tau_ms, 100, "Expected default tau of 100ms");
@@ -843,18 +849,17 @@ mod tests {
     #[test]
     fn test_pending_ack_eviction_at_capacity() {
         use crate::time::Timestamp;
-        use crate::types::MAX_PENDING_ACKS;
 
         let mut node = make_node();
         let now = Timestamp::from_secs(1000);
 
-        // Fill pending_acks to capacity
-        for i in 0..MAX_PENDING_ACKS {
+        // Fill pending_acks to capacity (using DefaultConfig)
+        for i in 0..DefaultConfig::MAX_PENDING_ACKS {
             let hash: [u8; 8] = [i as u8; 8];
             node.insert_pending_ack(hash, vec![i as u8], now);
         }
 
-        assert_eq!(node.pending_acks().len(), MAX_PENDING_ACKS);
+        assert_eq!(node.pending_acks().len(), DefaultConfig::MAX_PENDING_ACKS);
 
         // Insert one more - should evict oldest
         let new_hash: [u8; 8] = [0xFF; 8];
@@ -863,7 +868,7 @@ mod tests {
         // Should still be at capacity (not exceed)
         assert_eq!(
             node.pending_acks().len(),
-            MAX_PENDING_ACKS,
+            DefaultConfig::MAX_PENDING_ACKS,
             "Should evict to stay at capacity"
         );
         assert!(
@@ -875,20 +880,22 @@ mod tests {
     #[test]
     fn test_recently_forwarded_eviction_at_capacity() {
         use crate::time::Timestamp;
-        use crate::types::MAX_RECENTLY_FORWARDED;
 
         let mut node = make_node();
         let now = Timestamp::from_secs(1000);
 
-        // Fill recently_forwarded to capacity
-        for i in 0..MAX_RECENTLY_FORWARDED {
+        // Fill recently_forwarded to capacity (using DefaultConfig)
+        for i in 0..DefaultConfig::MAX_RECENTLY_FORWARDED {
             let mut hash: [u8; 8] = [0; 8];
             hash[0] = (i >> 8) as u8;
             hash[1] = (i & 0xFF) as u8;
             node.insert_recently_forwarded(hash, now);
         }
 
-        assert_eq!(node.recently_forwarded().len(), MAX_RECENTLY_FORWARDED);
+        assert_eq!(
+            node.recently_forwarded().len(),
+            DefaultConfig::MAX_RECENTLY_FORWARDED
+        );
 
         // Insert one more - should evict oldest
         let new_hash: [u8; 8] = [0xFF; 8];
@@ -897,7 +904,7 @@ mod tests {
         // Should still be at capacity (not exceed)
         assert_eq!(
             node.recently_forwarded().len(),
-            MAX_RECENTLY_FORWARDED,
+            DefaultConfig::MAX_RECENTLY_FORWARDED,
             "Should evict to stay at capacity"
         );
         assert!(

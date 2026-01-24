@@ -5,28 +5,10 @@ use core::fmt;
 
 use crate::time::{Duration, Timestamp};
 
-// Memory bounds (kept as soft limits for validation)
+// Protocol limits (not configurable via NodeConfig)
 pub const MAX_TREE_DEPTH: usize = 127; // TTL 255 / 2 for round-trip
 pub const MAX_CHILDREN: usize = 12; // Guarantees worst-case Pulse fits in 252 bytes
-pub const MAX_NEIGHBORS: usize = 128;
-pub const MAX_PUBKEY_CACHE: usize = 128;
-pub const MAX_LOCATION_STORE: usize = 256;
-pub const MAX_LOCATION_CACHE: usize = 64;
-pub const MAX_PENDING_LOOKUPS: usize = 16;
-pub const MAX_DISTRUSTED: usize = 64;
-pub const MAX_SHORTCUTS: usize = 64;
 pub const MAX_PACKET_SIZE: usize = 255;
-pub const MAX_PENDING_DATA: usize = 16;
-pub const MAX_MSGS_PER_PENDING_PUBKEY: usize = 8; // Messages queued per node awaiting pubkey
-pub const MAX_PENDING_PUBKEY_NODES: usize = 16; // Max distinct nodes awaiting pubkey
-
-// Link-layer reliability constants
-/// Maximum pending ACKs awaiting confirmation. 32 entries × ~300 bytes ≈ 10KB memory.
-/// Sized to handle burst traffic while staying within embedded memory budget.
-pub const MAX_PENDING_ACKS: usize = 32;
-/// Maximum recently forwarded hashes for duplicate detection. 256 entries × 24 bytes ≈ 6KB.
-/// Sized to cover 300τ window at typical message rates without excessive memory use.
-pub const MAX_RECENTLY_FORWARDED: usize = 256;
 /// Recently forwarded entries expire after 300τ to allow for slow multi-hop ACKs.
 /// On LoRa (τ=6.7s) this is ~33 minutes; on UDP (τ=100ms) this is 30 seconds.
 pub const RECENTLY_FORWARDED_TTL_MULTIPLIER: u64 = 300;

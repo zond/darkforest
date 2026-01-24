@@ -5,6 +5,7 @@
 
 use hashbrown::HashSet;
 
+use crate::config::NodeConfig;
 use crate::node::Node;
 use crate::time::Timestamp;
 use crate::traits::{Clock, Crypto, Random, Transport};
@@ -86,12 +87,13 @@ const FRAUD_Z_THRESHOLD: f64 = 2.33; // 99% confidence
 /// Minimum expected unique publishers for valid statistics.
 const MIN_EXPECTED: f64 = 5.0;
 
-impl<T, Cr, R, Clk> Node<T, Cr, R, Clk>
+impl<T, Cr, R, Clk, Cfg> Node<T, Cr, R, Clk, Cfg>
 where
     T: Transport,
     Cr: Crypto,
     R: Random,
     Clk: Clock,
+    Cfg: NodeConfig,
 {
     /// Check for tree size fraud based on unique publishers.
     ///

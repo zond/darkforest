@@ -7,6 +7,7 @@
 
 use alloc::vec::Vec;
 
+use crate::config::NodeConfig;
 use crate::node::Node;
 use crate::time::Timestamp;
 use crate::traits::{Clock, Crypto, Random, Transport};
@@ -16,12 +17,13 @@ use crate::types::{
 };
 use crate::wire::{location_sign_data, Reader, Writer};
 
-impl<T, Cr, R, Clk> Node<T, Cr, R, Clk>
+impl<T, Cr, R, Clk, Cfg> Node<T, Cr, R, Clk, Cfg>
 where
     T: Transport,
     Cr: Crypto,
     R: Random,
     Clk: Clock,
+    Cfg: NodeConfig,
 {
     /// Check if we own any replica key for a node_id in our keyspace.
     fn owns_replica_key(&self, node_id: &NodeId) -> bool {
@@ -350,7 +352,8 @@ mod tests {
     use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
     use crate::types::NodeId;
 
-    fn make_node() -> Node<MockTransport, MockCrypto, MockRandom, MockClock> {
+    fn make_node(
+    ) -> Node<MockTransport, MockCrypto, MockRandom, MockClock, crate::config::DefaultConfig> {
         let transport = MockTransport::new();
         let crypto = MockCrypto::new();
         let random = MockRandom::new();

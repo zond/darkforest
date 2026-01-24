@@ -45,11 +45,13 @@
 //! - [`dht`] - DHT operations (PUBLISH/LOOKUP/FOUND)
 //! - [`fraud`] - Fraud detection
 //! - [`time`] - Timestamp and Duration types
+//! - [`config`] - Compile-time memory configuration
 
 #![no_std]
 
 extern crate alloc;
 
+pub mod config;
 pub mod dht;
 pub mod fraud;
 pub mod node;
@@ -61,6 +63,7 @@ pub mod types;
 pub mod wire;
 
 // Re-export main types at crate root
+pub use config::{DefaultConfig, NodeConfig, SmallConfig};
 pub use node::Node;
 pub use time::{Duration, Timestamp};
 pub use traits::{Clock, Crypto, IncomingData, OutgoingData, Random, Received, Transport};
@@ -84,6 +87,9 @@ mod tests {
     use crate::node::JoinContext;
     use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
 
+    /// Type alias for test nodes using default config.
+    type TestNode = Node<MockTransport, MockCrypto, MockRandom, MockClock, DefaultConfig>;
+
     #[test]
     fn test_node_creation() {
         let transport = MockTransport::new();
@@ -91,7 +97,7 @@ mod tests {
         let random = MockRandom::new();
         let clock = MockClock::new();
 
-        let node = Node::new(transport, crypto, random, clock);
+        let node: TestNode = Node::new(transport, crypto, random, clock);
 
         // Node should be root of its own single-node tree
         assert!(node.is_root());
@@ -112,7 +118,8 @@ mod tests {
         let (pubkey, secret) = crypto.generate_keypair();
         let node_id = crypto.node_id_from_pubkey(&pubkey);
 
-        let node = Node::with_identity(transport, crypto, random, clock, node_id, pubkey, secret);
+        let node: TestNode =
+            Node::with_identity(transport, crypto, random, clock, node_id, pubkey, secret);
 
         assert_eq!(*node.node_id(), node_id);
         assert_eq!(*node.pubkey(), pubkey);
@@ -153,7 +160,7 @@ mod tests {
         let random = MockRandom::new();
         let clock = MockClock::new();
 
-        let node = Node::new(transport, crypto, random, clock);
+        let node: TestNode = Node::new(transport, crypto, random, clock);
         let tau = node.tau();
 
         assert_eq!(tau.as_millis(), 6710);
@@ -167,7 +174,7 @@ mod tests {
         let random = MockRandom::new();
         let clock = MockClock::new();
 
-        let node = Node::new(transport, crypto, random, clock);
+        let node: TestNode = Node::new(transport, crypto, random, clock);
         let tau = node.tau();
 
         assert_eq!(tau.as_millis(), 100);
@@ -182,7 +189,7 @@ mod tests {
         let random = MockRandom::new();
         let clock = MockClock::new();
 
-        let node = Node::new(transport, crypto, random, clock);
+        let node: TestNode = Node::new(transport, crypto, random, clock);
         let tau = node.tau();
 
         assert_eq!(tau.as_millis(), 100);
@@ -196,7 +203,7 @@ mod tests {
         let random = MockRandom::new();
         let clock = MockClock::new();
 
-        let node = Node::new(transport, crypto, random, clock);
+        let node: TestNode = Node::new(transport, crypto, random, clock);
         let timeout = node.lookup_timeout();
 
         assert_eq!(timeout.as_millis(), 6710 * 32);
@@ -210,7 +217,7 @@ mod tests {
         let random = MockRandom::new();
         let clock = MockClock::new();
 
-        let mut node = Node::new(transport, crypto, random, clock);
+        let mut node: TestNode = Node::new(transport, crypto, random, clock);
 
         // Without join context, fraud detection should not trigger
         let now = Timestamp::from_secs(8 * 3600); // 8 hours
@@ -248,7 +255,7 @@ mod tests {
         let random = MockRandom::new();
         let clock = MockClock::new();
 
-        let node = Node::new(transport, crypto, random, clock);
+        let node: TestNode = Node::new(transport, crypto, random, clock);
 
         // Node starts with full keyspace [0, u32::MAX)
         assert!(node.owns_key(0));
@@ -264,7 +271,7 @@ mod tests {
         let random = MockRandom::new();
         let clock = MockClock::new();
 
-        let node = Node::new(transport, crypto, random, clock);
+        let node: TestNode = Node::new(transport, crypto, random, clock);
 
         // my_address() should be center of keyspace range
         // For [0, MAX): center = MAX/2

@@ -25,10 +25,12 @@
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 use hashbrown::HashMap;
 
 use embassy_sync::channel::Channel;
 
+use crate::config::{DefaultConfig, NodeConfig};
 use crate::fraud::FraudDetection;
 use crate::time::{Duration, Timestamp};
 use crate::traits::{
@@ -37,9 +39,7 @@ use crate::traits::{
 };
 use crate::types::{
     ChildHash, Event, LocationEntry, NodeId, PublicKey, Routed, SecretKey, TransportMetrics,
-    MAX_DISTRUSTED, MAX_LOCATION_CACHE, MAX_LOCATION_STORE, MAX_MSGS_PER_PENDING_PUBKEY,
-    MAX_NEIGHBORS, MAX_PENDING_ACKS, MAX_PENDING_LOOKUPS, MAX_PUBKEY_CACHE, MAX_RECENTLY_FORWARDED,
-    MAX_SHORTCUTS, MIN_PULSE_INTERVAL, RECENTLY_FORWARDED_TTL_MULTIPLIER,
+    MIN_PULSE_INTERVAL, RECENTLY_FORWARDED_TTL_MULTIPLIER,
 };
 
 /// Timing, signal, and tree information for a neighbor.
@@ -130,14 +130,18 @@ pub type RecentlyForwardedMap = HashMap<AckHash, Timestamp>;
 /// - `Cr`: Crypto implementation
 /// - `R`: Random number generator
 /// - `Clk`: Clock/timer implementation
+/// - `Cfg`: Memory configuration (defaults to `DefaultConfig`)
 ///
 /// The node is fully event-driven. Call `run()` to start the main loop.
-pub struct Node<T, Cr, R, Clk> {
+pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     // Dependencies (injected)
     transport: T,
     crypto: Cr,
     random: R,
     clock: Clk,
+
+    // Config phantom
+    _config: PhantomData<Cfg>,
 
     // Application-level channels
     app_incoming: AppInChannel,
@@ -198,12 +202,13 @@ pub struct Node<T, Cr, R, Clk> {
     metrics: TransportMetrics,
 }
 
-impl<T, Cr, R, Clk> Node<T, Cr, R, Clk>
+impl<T, Cr, R, Clk, Cfg> Node<T, Cr, R, Clk, Cfg>
 where
     T: Transport,
     Cr: Crypto,
     R: Random,
     Clk: Clock,
+    Cfg: NodeConfig,
 {
     /// Create a new node with a fresh identity.
     pub fn new(transport: T, mut crypto: Cr, random: R, clock: Clk) -> Self {
@@ -231,6 +236,8 @@ where
             crypto,
             random,
             clock,
+
+            _config: PhantomData,
 
             app_incoming: Channel::new(),
             app_outgoing: Channel::new(),
@@ -676,7 +683,7 @@ where
             return; // Already in progress
         }
 
-        if self.pending_lookups.len() >= MAX_PENDING_LOOKUPS {
+        if self.pending_lookups.len() >= Cfg::MAX_PENDING_LOOKUPS {
             return; // Too many pending
         }
 
@@ -814,10 +821,8 @@ where
     }
 
     pub(crate) fn queue_pending_pubkey(&mut self, needed_node_id: NodeId, msg: Routed) {
-        use crate::types::MAX_PENDING_PUBKEY_NODES;
-
         // Limit number of distinct nodes to prevent unbounded growth
-        if self.pending_pubkey.len() >= MAX_PENDING_PUBKEY_NODES
+        if self.pending_pubkey.len() >= Cfg::MAX_PENDING_PUBKEY_NODES
             && !self.pending_pubkey.contains_key(&needed_node_id)
         {
             // Evict the node we haven't heard from in the longest time
@@ -837,7 +842,7 @@ where
         }
 
         let queue = self.pending_pubkey.entry(needed_node_id).or_default();
-        if queue.len() >= MAX_MSGS_PER_PENDING_PUBKEY {
+        if queue.len() >= Cfg::MAX_MSGS_PER_PENDING_PUBKEY {
             queue.pop_front();
         }
         queue.push_back(msg);
@@ -1024,7 +1029,8 @@ where
         pubkey: PublicKey,
         now: Timestamp,
     ) {
-        if self.pubkey_cache.len() >= MAX_PUBKEY_CACHE && !self.pubkey_cache.contains_key(&node_id)
+        if self.pubkey_cache.len() >= Cfg::MAX_PUBKEY_CACHE
+            && !self.pubkey_cache.contains_key(&node_id)
         {
             Self::evict_oldest_by(&mut self.pubkey_cache, |(_, last_used)| *last_used);
         }
@@ -1032,7 +1038,7 @@ where
     }
 
     pub(crate) fn insert_location_store(&mut self, node_id: NodeId, entry: LocationEntry) {
-        if self.location_store.len() >= MAX_LOCATION_STORE
+        if self.location_store.len() >= Cfg::MAX_LOCATION_STORE
             && !self.location_store.contains_key(&node_id)
         {
             Self::evict_oldest_by(&mut self.location_store, |e| e.received_at);
@@ -1041,7 +1047,7 @@ where
     }
 
     pub(crate) fn insert_location_cache(&mut self, node_id: NodeId, addr: u32, now: Timestamp) {
-        if self.location_cache.len() >= MAX_LOCATION_CACHE
+        if self.location_cache.len() >= Cfg::MAX_LOCATION_CACHE
             && !self.location_cache.contains_key(&node_id)
         {
             Self::evict_oldest_by(&mut self.location_cache, |(_, last_used)| *last_used);
@@ -1050,7 +1056,8 @@ where
     }
 
     pub(crate) fn insert_neighbor_time(&mut self, node_id: NodeId, timing: NeighborTiming) {
-        if self.neighbor_times.len() >= MAX_NEIGHBORS && !self.neighbor_times.contains_key(&node_id)
+        if self.neighbor_times.len() >= Cfg::MAX_NEIGHBORS
+            && !self.neighbor_times.contains_key(&node_id)
         {
             Self::evict_oldest_by(&mut self.neighbor_times, |t| t.last_seen);
         }
@@ -1058,14 +1065,14 @@ where
     }
 
     pub(crate) fn insert_distrusted(&mut self, node_id: NodeId, timestamp: Timestamp) {
-        if self.distrusted.len() >= MAX_DISTRUSTED && !self.distrusted.contains_key(&node_id) {
+        if self.distrusted.len() >= Cfg::MAX_DISTRUSTED && !self.distrusted.contains_key(&node_id) {
             Self::evict_oldest_by(&mut self.distrusted, |&ts| ts);
         }
         self.distrusted.insert(node_id, timestamp);
     }
 
     pub(crate) fn insert_shortcut(&mut self, node_id: NodeId, keyspace: (u32, u32)) {
-        if self.shortcuts.len() >= MAX_SHORTCUTS && !self.shortcuts.contains_key(&node_id) {
+        if self.shortcuts.len() >= Cfg::MAX_SHORTCUTS && !self.shortcuts.contains_key(&node_id) {
             // Shortcuts use a different eviction strategy: cross-reference with neighbor_times.
             // Unlike other caches, shortcuts don't store timestamps. Instead, when we receive
             // a pulse, we update neighbor_times.last_seen. So we evict the shortcut whose
@@ -1113,7 +1120,9 @@ where
         original_bytes: Vec<u8>,
         now: Timestamp,
     ) {
-        if self.pending_acks.len() >= MAX_PENDING_ACKS && !self.pending_acks.contains_key(&hash) {
+        if self.pending_acks.len() >= Cfg::MAX_PENDING_ACKS
+            && !self.pending_acks.contains_key(&hash)
+        {
             Self::evict_oldest_ack_by(&mut self.pending_acks, |pa| pa.next_retry_at);
         }
 
@@ -1129,7 +1138,7 @@ where
     ///
     /// Evicts the oldest entry by timestamp when at capacity.
     pub(crate) fn insert_recently_forwarded(&mut self, hash: AckHash, now: Timestamp) {
-        if self.recently_forwarded.len() >= MAX_RECENTLY_FORWARDED
+        if self.recently_forwarded.len() >= Cfg::MAX_RECENTLY_FORWARDED
             && !self.recently_forwarded.contains_key(&hash)
         {
             Self::evict_oldest_ack_by(&mut self.recently_forwarded, |&ts| ts);
