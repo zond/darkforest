@@ -295,13 +295,27 @@ async fn tx_task(transport: &mut Sx127xTransport) {
 
 ### UDP Multicast + Peer Bridging
 
+UDP transports can maintain a list of **unicast peer addresses** in addition to local multicast. When broadcasting, the transport sends to both the local multicast group AND each configured peer. Incoming packets from peers are treated identically to local multicast packets.
+
+**Use case:** Long-distance links over the internet. Two LoRa mesh networks in different cities can be bridged by running UDP transport nodes that list each other as peers. The darktree protocol sees them as radio neighbors and forms trees across the internet link.
+
+```
+   City A (LoRa mesh)              City B (LoRa mesh)
+        |                               |
+   [UDP bridge] ←── internet ──→ [UDP bridge]
+        |                               |
+   Local multicast               Local multicast
+```
+
+**Configuration:** Simply add peer IP:port addresses to the `peers` list. No protocol changes needed - the transport layer handles it transparently.
+
 ```rust
 use tokio::net::UdpSocket;
 
 struct UdpTransport {
     socket: UdpSocket,
     multicast_addr: SocketAddr,
-    peers: Vec<SocketAddr>,  // Internet bridge peers (optional)
+    peers: Vec<SocketAddr>,  // Internet bridge peers (unicast addresses)
 }
 
 impl Transport for UdpTransport {
