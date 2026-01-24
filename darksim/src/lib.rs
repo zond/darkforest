@@ -441,4 +441,70 @@ mod tests {
             "Parent's tree_size should be 1 after child removal"
         );
     }
+
+    /// Scenario 5.3: Neighbor Expiry
+    /// Setup: Two nodes exchange pulses. One goes silent at t=10τ.
+    /// Run: 50τ
+    /// Expect: Neighbor removed from neighbor_times after timeout.
+    #[test]
+    fn test_neighbor_expiry_removes_silent_neighbor() {
+        use crate::event::ScenarioAction;
+
+        // Create 2-node network
+        let (mut sim, nodes) = ScenarioBuilder::new(2)
+            .with_seed(42)
+            .fully_connected()
+            .build();
+
+        // Run until tree forms and neighbors are established
+        sim.run_for(Duration::from_secs(2));
+
+        // Both nodes should know about each other as neighbors
+        let node0 = sim.node(&nodes[0]).unwrap();
+        let node1 = sim.node(&nodes[1]).unwrap();
+        assert!(
+            node0.neighbor_count() >= 1,
+            "Node 0 should have at least 1 neighbor"
+        );
+        assert!(
+            node1.neighbor_count() >= 1,
+            "Node 1 should have at least 1 neighbor"
+        );
+
+        // Disable links (node 1 goes silent from node 0's perspective)
+        sim.schedule_action(
+            sim.current_time(),
+            ScenarioAction::DisableLink {
+                from: nodes[1],
+                to: nodes[0],
+            },
+        );
+        sim.schedule_action(
+            sim.current_time(),
+            ScenarioAction::DisableLink {
+                from: nodes[0],
+                to: nodes[1],
+            },
+        );
+
+        // Run for timeout period (8 missed pulses at ~5τ interval = 40τ ≈ 4s at default τ)
+        // Using 30s to provide ample margin
+        sim.run_for(Duration::from_secs(30));
+
+        // Node 0 should have removed node 1 from neighbors (timed out)
+        let node0 = sim.node(&nodes[0]).unwrap();
+        assert_eq!(
+            node0.neighbor_count(),
+            0,
+            "Node 0 should have removed timed-out neighbor"
+        );
+
+        // Node 1 should have removed node 0 from neighbors (timed out)
+        let node1 = sim.node(&nodes[1]).unwrap();
+        assert_eq!(
+            node1.neighbor_count(),
+            0,
+            "Node 1 should have removed timed-out neighbor"
+        );
+    }
 }

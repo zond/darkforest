@@ -399,6 +399,11 @@ where
         self.children.len()
     }
 
+    /// Get the number of known neighbors.
+    pub fn neighbor_count(&self) -> usize {
+        self.neighbor_times.len()
+    }
+
     /// Channel for receiving data from other nodes.
     ///
     /// Application reads DATA messages from here.

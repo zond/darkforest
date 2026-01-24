@@ -133,10 +133,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Expect:** P removes C from children after ~24τ. P.subtree_size decreases.
 - **Status:** Implemented in `test_child_timeout_parent_removes_child`
 
-### 5.3 Neighbor Expiry
+### 5.3 Neighbor Expiry ✓
 - **Setup:** Two nodes exchange pulses. One goes silent at t=10τ.
 - **Run:** 50τ
 - **Expect:** Neighbor removed from neighbor_times after timeout.
+- **Status:** Implemented in `test_neighbor_expiry_removes_silent_neighbor`
 
 ---
 

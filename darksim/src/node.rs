@@ -315,6 +315,11 @@ impl SimNode {
         self.inner.children_count()
     }
 
+    /// Get the number of known neighbors.
+    pub fn neighbor_count(&self) -> usize {
+        self.inner.neighbor_count()
+    }
+
     /// Get tau (bandwidth-aware time unit).
     pub fn tau(&self) -> Duration {
         self.inner.tau()
