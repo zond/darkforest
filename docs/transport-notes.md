@@ -117,15 +117,18 @@ Protocol computes Pulse interval from bandwidth using integer math for embedded 
 fn next_pulse_time(&self) -> Option<Timestamp> {
     let last = self.last_pulse?;
 
+    // Minimum interval between pulses is 2*tau (scales with bandwidth)
+    let min_interval = self.tau() * 2;
     let interval = match self.transport.bw() {
         Some(bw) if bw > 0 => {
+            // Interval to stay within pulse bandwidth budget.
             // Single division for integer accuracy:
             // secs = pulse_size / (bw / PULSE_BW_DIVISOR)
             //      = pulse_size * PULSE_BW_DIVISOR / bw
             let secs = (self.last_pulse_size as u64 * PULSE_BW_DIVISOR as u64) / (bw as u64);
-            Duration::from_secs(secs).max(MIN_PULSE_INTERVAL)
+            Duration::from_secs(secs).max(min_interval)
         }
-        _ => MIN_PULSE_INTERVAL,  // 10 seconds minimum
+        _ => min_interval,
     };
 
     Some(last + interval)

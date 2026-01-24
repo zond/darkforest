@@ -17,8 +17,7 @@ pub const RECENTLY_FORWARDED_TTL_MULTIPLIER: u64 = 300;
 pub const K_REPLICAS: usize = 3;
 pub const DEFAULT_TTL: u8 = 255; // Max hops
 
-// Timing constants as Durations
-pub const MIN_PULSE_INTERVAL: Duration = Duration::from_secs(10);
+// Timing constants
 /// Maximum retransmission attempts before giving up. With exponential backoff
 /// (1τ, 2τ, 4τ, 8τ, 16τ, 32τ, 64τ, 128τ), total wait is ~255τ before abandoning.
 pub const MAX_RETRIES: u8 = 8;

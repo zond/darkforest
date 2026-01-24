@@ -867,7 +867,7 @@ At ~3τ Pulse intervals (20 seconds for LoRa), 8 missed Pulses = ~24τ (~160 sec
 Since Pulse intervals vary by node, we track the observed interval:
 
 ```rust
-const MIN_PULSE_INTERVAL: Duration = Duration::from_secs(10);  // rate limit floor
+const MIN_PULSE_INTERVAL: Duration = self.tau() * 2;  // rate limit floor (scales with bandwidth)
 const MISSED_PULSES_TIMEOUT: u32 = 8;  // pulses before declaring neighbor dead
 
 impl Node {
@@ -1744,7 +1744,7 @@ Applications needing stronger guarantees should implement their own ack/retry at
 
 ```
 pulse_budget = 0.20 × duty_cycle
-min_interval = max(10s, airtime / pulse_budget)
+min_interval = max(2τ, airtime / pulse_budget)
 ```
 
 **Transport priority queues:** The Transport trait provides two outgoing queues:

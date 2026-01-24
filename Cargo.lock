@@ -94,6 +94,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "darksim"
+version = "0.1.0"
+dependencies = [
+ "darktree",
+ "embassy-sync",
+ "hashbrown",
+]
+
+[[package]]
 name = "darktree"
 version = "0.1.0"
 dependencies = [

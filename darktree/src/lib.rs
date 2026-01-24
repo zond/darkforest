@@ -52,6 +52,8 @@
 extern crate alloc;
 
 pub mod config;
+#[cfg(feature = "debug")]
+pub mod debug;
 pub mod dht;
 pub mod fraud;
 pub mod node;

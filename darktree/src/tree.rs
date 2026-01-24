@@ -16,7 +16,6 @@ use crate::time::{Duration, Timestamp};
 use crate::traits::{Clock, Crypto, Random, Transport};
 use crate::types::{
     ChildHash, ChildrenList, Event, Pulse, Signature, DISTRUST_TTL, LOCATION_TTL, MAX_CHILDREN,
-    MIN_PULSE_INTERVAL,
 };
 use crate::wire::{pulse_sign_data, Encode, Message};
 
@@ -129,9 +128,17 @@ where
             return;
         }
 
-        // Rate limiting: ignore pulses that arrive too fast
+        // Rate limiting: ignore pulses that arrive too fast (minimum 2*tau between pulses)
+        let min_interval = self.tau() * 2;
         if let Some(timing) = self.neighbor_times().get(&pulse.node_id) {
-            if now < timing.last_seen + MIN_PULSE_INTERVAL {
+            if now < timing.last_seen + min_interval {
+                #[cfg(feature = "debug")]
+                self.emit_debug(crate::debug::DebugEvent::PulseRateLimited {
+                    from: pulse.node_id,
+                    now,
+                    last_seen: timing.last_seen,
+                    min_interval_ms: min_interval.as_millis(),
+                });
                 return; // Too soon
             }
         }
@@ -166,8 +173,21 @@ where
             .crypto()
             .verify(&pubkey, sign_data.as_slice(), &pulse.signature)
         {
+            #[cfg(feature = "debug")]
+            self.emit_debug(crate::debug::DebugEvent::SignatureVerifyFailed {
+                node_id: pulse.node_id,
+            });
             return; // Invalid signature
         }
+
+        #[cfg(feature = "debug")]
+        self.emit_debug(crate::debug::DebugEvent::PulseReceived {
+            from: pulse.node_id,
+            tree_size: pulse.tree_size,
+            root_hash: pulse.root_hash,
+            has_pubkey: pulse.has_pubkey(),
+            need_pubkey: pulse.need_pubkey(),
+        });
 
         // Update neighbor timing (only after signature verification)
         let prev = self
@@ -382,6 +402,14 @@ where
         // Track if this is a new child
         let is_new = !self.children().contains_key(&pulse.node_id);
 
+        #[cfg(feature = "debug")]
+        if is_new {
+            self.emit_debug(crate::debug::DebugEvent::ChildAdded {
+                child_id: pulse.node_id,
+                subtree_size: pulse.subtree_size,
+            });
+        }
+
         // Accept the child
         self.children_mut()
             .insert(pulse.node_id, pulse.subtree_size);
@@ -395,6 +423,11 @@ where
 
         // Update subtree size
         self.recalculate_subtree_size();
+
+        // If we are root, update tree_size to match our subtree_size
+        if self.is_root() {
+            self.set_tree_size(self.subtree_size());
+        }
 
         // Recompute all child keyspace ranges
         self.recompute_child_ranges();
@@ -458,21 +491,45 @@ where
     fn consider_merge(&mut self, pulse: &Pulse, _sender_hash: &ChildHash, now: Timestamp) {
         // Don't merge during discovery phase - wait for select_best_parent
         if self.is_in_discovery() {
+            #[cfg(feature = "debug")]
+            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
+                from: pulse.node_id,
+                dominated: false,
+                reason: "in_discovery",
+            });
             return;
         }
 
         // Don't merge if this node is distrusted
         if self.is_distrusted(&pulse.node_id, now) {
+            #[cfg(feature = "debug")]
+            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
+                from: pulse.node_id,
+                dominated: false,
+                reason: "distrusted",
+            });
             return;
         }
 
         // Don't merge if we're already in a pending parent state
         if self.pending_parent().is_some() {
+            #[cfg(feature = "debug")]
+            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
+                from: pulse.node_id,
+                dominated: false,
+                reason: "pending_parent",
+            });
             return;
         }
 
         // Different root?
         if pulse.root_hash == *self.root_hash() {
+            #[cfg(feature = "debug")]
+            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
+                from: pulse.node_id,
+                dominated: false,
+                reason: "same_root",
+            });
             return;
         }
 
@@ -480,13 +537,32 @@ where
         let dominated = (pulse.tree_size, self.root_hash()) > (self.tree_size(), &pulse.root_hash);
 
         if !dominated {
+            #[cfg(feature = "debug")]
+            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
+                from: pulse.node_id,
+                dominated: false,
+                reason: "not_dominated",
+            });
             return;
         }
 
         // Check if pulse sender is a valid parent candidate
         if pulse.child_count() as usize >= MAX_CHILDREN {
+            #[cfg(feature = "debug")]
+            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
+                from: pulse.node_id,
+                dominated: true,
+                reason: "parent_full",
+            });
             return; // Parent is full
         }
+
+        #[cfg(feature = "debug")]
+        self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
+            from: pulse.node_id,
+            dominated: true,
+            reason: "merging",
+        });
 
         // TREE INVERSION: Leave our current tree position
         // When joining a bigger tree, we first become root of our own subtree.
@@ -545,6 +621,23 @@ where
                 a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1))
             })
             .unwrap(); // Safe: we checked candidates.is_empty() above
+
+        // Only join if the best tree dominates ours
+        // Dominated = (their_tree_size, our_root_hash) > (our_tree_size, their_root_hash)
+        let dominated = (best_tree.0, self.root_hash()) > (self.tree_size(), &best_tree.1);
+
+        #[cfg(feature = "debug")]
+        self.emit_debug(crate::debug::DebugEvent::SelectBestParent {
+            candidate_count: candidates.len(),
+            best_tree_size: best_tree.0,
+            best_root_hash: best_tree.1,
+            dominated,
+        });
+
+        if !dominated {
+            // Best tree doesn't dominate us - stay as root
+            return;
+        }
 
         // Filter to only candidates from the best tree
         candidates.retain(|(_, t)| t.tree_size == best_tree.0 && t.root_hash == best_tree.1);
@@ -737,8 +830,12 @@ where
         // Sort children by hash (lexicographic big-endian)
         children.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // Determine flags
-        let has_parent = self.parent().is_some();
+        // Determine flags - include pending_parent as "has parent" so prospective
+        // parent can see we want to join them
+        let effective_parent = self
+            .parent()
+            .or_else(|| self.pending_parent().map(|(id, _)| id));
+        let has_parent = effective_parent.is_some();
         let we_need_pubkeys = !self.need_pubkey().is_empty();
         let neighbors_need_ours = !self.neighbors_need_pubkey().is_empty();
         let include_pubkey = we_need_pubkeys || neighbors_need_ours;
@@ -746,8 +843,8 @@ where
 
         let flags = Pulse::build_flags(has_parent, we_need_pubkeys, include_pubkey, child_count);
 
-        // Parent hash
-        let parent_hash = self.parent().map(|pid| self.compute_node_hash(&pid));
+        // Parent hash - include pending_parent so prospective parent can adopt us
+        let parent_hash = effective_parent.map(|pid| self.compute_node_hash(&pid));
 
         let mut pulse = Pulse {
             node_id: *self.node_id(),

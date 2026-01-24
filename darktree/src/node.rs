@@ -39,7 +39,7 @@ use crate::traits::{
 };
 use crate::types::{
     ChildHash, Event, LocationEntry, NodeId, PublicKey, Routed, SecretKey, TransportMetrics,
-    MIN_PULSE_INTERVAL, RECENTLY_FORWARDED_TTL_MULTIPLIER,
+    RECENTLY_FORWARDED_TTL_MULTIPLIER,
 };
 
 /// Timing, signal, and tree information for a neighbor.
@@ -207,6 +207,10 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
 
     // Cached computations (avoid u64 division on 32-bit MCUs)
     cached_tau_ms: u64,
+
+    // Debug events channel (only with "debug" feature)
+    #[cfg(feature = "debug")]
+    debug_channel: crate::debug::DebugChannel,
 }
 
 impl<T, Cr, R, Clk, Cfg> Node<T, Cr, R, Clk, Cfg>
@@ -319,6 +323,9 @@ where
             metrics: TransportMetrics::new(),
 
             cached_tau_ms,
+
+            #[cfg(feature = "debug")]
+            debug_channel: embassy_sync::channel::Channel::new(),
         }
     }
 
@@ -404,6 +411,20 @@ where
         &self.events
     }
 
+    /// Channel for debug events (only with "debug" feature).
+    ///
+    /// Simulator/test can receive detailed protocol trace events.
+    #[cfg(feature = "debug")]
+    pub fn debug_channel(&self) -> &crate::debug::DebugChannel {
+        &self.debug_channel
+    }
+
+    /// Emit a debug event (only with "debug" feature).
+    #[cfg(feature = "debug")]
+    pub(crate) fn emit_debug(&self, event: crate::debug::DebugEvent) {
+        let _ = self.debug_channel.try_send(event);
+    }
+
     /// Get the transport reference.
     pub fn transport(&self) -> &T {
         &self.transport
@@ -433,12 +454,39 @@ where
         self.clock.now()
     }
 
+    /// Get a reference to the clock.
+    /// Useful for simulation where the clock time needs to be updated externally.
+    pub fn clock(&self) -> &Clk {
+        &self.clock
+    }
+
     /// Get transport metrics for monitoring.
     ///
     /// Returns counters for sent/dropped/received messages, split by
     /// protocol (Pulse, PUBLISH, LOOKUP, FOUND) and application (DATA).
     pub fn metrics(&self) -> &TransportMetrics {
         &self.metrics
+    }
+
+    /// Initialize the node for operation.
+    ///
+    /// This sends the first pulse and starts the discovery phase.
+    /// Call this before using `handle_timer` and `handle_transport_rx` for
+    /// simulation or testing. The async `run()` method calls this automatically.
+    pub fn initialize(&mut self, now: Timestamp) {
+        // Send first pulse immediately
+        self.send_pulse(now);
+
+        // Start discovery phase if orphan (no parent, no children)
+        // Discovery lasts 3τ to collect neighbor Pulses before selecting parent
+        if self.parent.is_none() && self.children.is_empty() {
+            let discovery_duration = self.tau() * 3;
+            let deadline = now + discovery_duration;
+            self.discovery_deadline = Some(deadline);
+
+            #[cfg(feature = "debug")]
+            self.emit_debug(crate::debug::DebugEvent::DiscoveryStarted { deadline });
+        }
     }
 
     /// Run the node's main loop.
@@ -453,16 +501,9 @@ where
     pub async fn run(&mut self) -> ! {
         use embassy_futures::select::{select3, Either3};
 
-        // Send first pulse immediately
+        // Initialize (sends first pulse, starts discovery)
         let now = self.clock.now();
-        self.send_pulse(now);
-
-        // Start discovery phase if orphan (no parent, no children)
-        // Discovery lasts 3τ to collect neighbor Pulses before selecting parent
-        if self.parent.is_none() && self.children.is_empty() {
-            let discovery_duration = self.tau() * 3;
-            self.discovery_deadline = Some(now + discovery_duration);
-        }
+        self.initialize(now);
 
         loop {
             // Calculate when we need to wake for timer work
@@ -514,15 +555,17 @@ where
 
         let last = self.last_pulse?;
 
+        // Minimum interval between pulses is 2*tau
+        let min_interval = self.tau() * 2;
         let interval = match self.transport.bw() {
             Some(bw) if bw > 0 => {
                 // Interval to stay within pulse bandwidth budget.
                 // Single division for better integer accuracy:
                 // secs = pulse_size / (bw / divisor) = pulse_size * divisor / bw
                 let secs = (self.last_pulse_size as u64 * PULSE_BW_DIVISOR as u64) / (bw as u64);
-                Duration::from_secs(secs).max(MIN_PULSE_INTERVAL)
+                Duration::from_secs(secs).max(min_interval)
             }
-            _ => MIN_PULSE_INTERVAL,
+            _ => min_interval,
         };
 
         let budget_time = last + interval;
@@ -543,13 +586,22 @@ where
     }
 
     /// Handle incoming transport message.
-    fn handle_transport_rx(&mut self, data: &[u8], rssi: Option<i16>, now: Timestamp) {
+    ///
+    /// Call this to process a message received from the transport layer.
+    /// For simulation, call this directly instead of using `run()`.
+    pub fn handle_transport_rx(&mut self, data: &[u8], rssi: Option<i16>, now: Timestamp) {
         use crate::types::MSG_DATA;
         use crate::wire::{Decode, Message};
 
         let msg = match Message::decode_from_slice(data) {
             Ok(m) => m,
-            Err(_) => return,
+            Err(_e) => {
+                #[cfg(feature = "debug")]
+                self.emit_debug(crate::debug::DebugEvent::MessageDecodeFailed {
+                    data_len: data.len(),
+                });
+                return;
+            }
         };
 
         match msg {
@@ -580,7 +632,10 @@ where
     }
 
     /// Handle application send request.
-    fn handle_app_send(&mut self, data: OutgoingData, now: Timestamp) {
+    ///
+    /// Call this to process an outgoing data request from the application.
+    /// For simulation, call this directly instead of using `run()`.
+    pub fn handle_app_send(&mut self, data: OutgoingData, now: Timestamp) {
         let OutgoingData { target, payload } = data;
 
         // Check if we have the target's location cached (marks as recently used)
@@ -595,11 +650,20 @@ where
     }
 
     /// Handle timer events (pulse, timeouts).
-    fn handle_timer(&mut self, now: Timestamp) {
+    ///
+    /// Call this to process timer-driven events (pulse broadcasts, timeouts).
+    /// For simulation, call this directly instead of using `run()`.
+    pub fn handle_timer(&mut self, now: Timestamp) {
         // Check if discovery phase is complete
         if let Some(deadline) = self.discovery_deadline {
             if now >= deadline {
                 self.discovery_deadline = None;
+
+                #[cfg(feature = "debug")]
+                self.emit_debug(crate::debug::DebugEvent::DiscoveryEnded {
+                    neighbor_count: self.neighbor_times.len(),
+                });
+
                 self.select_best_parent(now);
             }
         }

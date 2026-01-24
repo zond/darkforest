@@ -10,6 +10,8 @@ description = "Tree-based DHT protocol for LoRa mesh networks"
 default = []
 std = ["critical-section/std", "hashbrown/default"]
 default-crypto = ["dep:ed25519-dalek", "dep:sha2"]
+# Enable debug events for protocol tracing (use in tests/simulations)
+debug = []
 
 [dependencies]
 ed25519-dalek = { version = "2", features = ["rand_core"], optional = true }
