@@ -20,6 +20,19 @@ Implemented `NodeConfig` trait with `DefaultConfig` (256KB+ RAM) and `SmallConfi
 
 Expanded tests to verify all 12 config values for both DefaultConfig and SmallConfig.
 
+### Missing MCU selection guidance
+**Source:** Code simplifier (2026-01-24)
+**Completed:** 2026-01-24
+
+Added memory footprint table, MCU recommendations, and memory formulas to config.rs docs.
+
+### pending_data lacks bounded insertion helper
+**Source:** Embedded reviewer (2026-01-24)
+**Completed:** 2026-01-24
+
+Documented the implicit bound: pending_data is bounded by MAX_PENDING_LOOKUPS since entries
+are only added when a lookup starts and removed when it completes or times out.
+
 ## Low Priority / Future Work
 
 ### u64 division in hot paths
@@ -29,14 +42,6 @@ Expanded tests to verify all 12 config values for both DefaultConfig and SmallCo
 Keyspace calculation and tau calculation use u64 division. On 32-bit MCUs this is ~100-1000 cycles per operation.
 
 **Impact:** Minor performance concern. Called during pulse processing (~every 20s for LoRa), not truly hot.
-
-### pending_data lacks bounded insertion helper
-**Source:** Embedded reviewer (2026-01-24)
-**Location:** `node.rs`
-
-The `pending_data` HashMap has no `insert_pending_data()` bounded helper like other collections. Currently implicitly bounded by `MAX_PENDING_LOOKUPS` since you can only have pending data for nodes being looked up.
-
-**Recommendation:** Add explicit bounds checking or document the implicit bound.
 
 ### MAX_UNIQUE_PUBLISHERS not configurable
 **Source:** Embedded reviewer (2026-01-24)
@@ -52,11 +57,3 @@ Hardcoded to 512. On 64KB devices using `SmallConfig`, tracking 512 publishers (
 Tests only use `DefaultConfig`. No tests verify `SmallConfig` behavior when hitting smaller bounds.
 
 **Recommendation:** Add at least one test using `SmallConfig` to verify eviction works correctly at smaller capacities.
-
-### Missing MCU selection guidance
-**Source:** Code simplifier (2026-01-24)
-**Location:** `config.rs` docs
-
-No guidance on how to choose between configs for specific MCUs, or how to calculate actual memory footprint.
-
-**Recommendation:** Add documentation with memory formulas and example MCU recommendations.

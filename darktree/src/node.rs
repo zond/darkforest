@@ -178,6 +178,9 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
 
     // Pending operations
     pending_lookups: PendingLookupMap,
+    /// Data waiting for lookup completion. Implicitly bounded by MAX_PENDING_LOOKUPS
+    /// since entries are only added when a lookup is initiated, and removed when
+    /// the lookup completes or times out.
     pending_data: PendingDataMap,
     pending_pubkey: PendingPubkeyMap,
 

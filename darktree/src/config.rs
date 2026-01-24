@@ -3,6 +3,22 @@
 //! The `NodeConfig` trait allows tuning memory usage for different MCU sizes.
 //! Use `DefaultConfig` for 256KB+ RAM, `SmallConfig` for 64KB RAM.
 //!
+//! # Memory Footprint
+//!
+//! Approximate RAM usage per config (excluding stack and code):
+//!
+//! | Config | Bounded Collections | Suitable MCUs |
+//! |--------|--------------------:|---------------|
+//! | `DefaultConfig` | ~50-60 KB | STM32F4, nRF52840, ESP32, RP2040 |
+//! | `SmallConfig` | ~15-20 KB | STM32F1, nRF52810, ATmega2560 |
+//!
+//! Memory formula (rough estimate):
+//! - `MAX_NEIGHBORS * 80` bytes (neighbor timing + routing info)
+//! - `MAX_PUBKEY_CACHE * 48` bytes (pubkey + metadata)
+//! - `MAX_LOCATION_STORE * 100` bytes (DHT entries)
+//! - `MAX_PENDING_ACKS * 300` bytes (retransmission buffers)
+//! - `MAX_RECENTLY_FORWARDED * 16` bytes (hash + timestamp)
+//!
 //! # Example
 //!
 //! ```ignore
