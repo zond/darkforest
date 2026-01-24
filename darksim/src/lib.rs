@@ -163,4 +163,44 @@ mod tests {
             "Tree should have exactly 5 nodes"
         );
     }
+
+    /// Scenario 2.4: Star Topology
+    /// Setup: 1 central node, 10 edge nodes (edges only see center)
+    /// Run: 20τ
+    /// Expect: Central node is root with 10 children.
+    #[test]
+    fn test_star_topology_central_becomes_root() {
+        let (mut sim, nodes) = ScenarioBuilder::new(11) // 1 hub + 10 spokes
+            .with_seed(42)
+            .star_topology()
+            .build();
+
+        // Verify star topology: hub (node 0) connected to all, spokes isolated
+        let hub = nodes[0];
+        assert_eq!(
+            sim.topology().neighbors(hub).len(),
+            10,
+            "Hub should have 10 neighbors"
+        );
+        for spoke in &nodes[1..] {
+            let spoke_neighbors = sim.topology().neighbors(*spoke);
+            assert_eq!(spoke_neighbors.len(), 1, "Spoke should only see hub");
+        }
+
+        let result = sim.run_for(Duration::from_secs(20));
+
+        // Verify single tree formed with central node as root
+        assert!(result.converged(), "Star should converge to single tree");
+        assert_eq!(result.final_tree_count(), 1);
+        assert_eq!(
+            result.final_max_tree_size(),
+            11,
+            "Tree should have exactly 11 nodes"
+        );
+
+        // Verify central node is root
+        let snapshot = result.metrics.latest_snapshot().unwrap();
+        let hub_is_root = snapshot.is_root.get(&hub).copied().unwrap_or(false);
+        assert!(hub_is_root, "Central hub should be the root");
+    }
 }
