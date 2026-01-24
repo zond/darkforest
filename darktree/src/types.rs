@@ -20,12 +20,25 @@ pub const MAX_PENDING_DATA: usize = 16;
 pub const MAX_MSGS_PER_PENDING_PUBKEY: usize = 8; // Messages queued per node awaiting pubkey
 pub const MAX_PENDING_PUBKEY_NODES: usize = 16; // Max distinct nodes awaiting pubkey
 
+// Link-layer reliability constants
+/// Maximum pending ACKs awaiting confirmation. 32 entries × ~300 bytes ≈ 10KB memory.
+/// Sized to handle burst traffic while staying within embedded memory budget.
+pub const MAX_PENDING_ACKS: usize = 32;
+/// Maximum recently forwarded hashes for duplicate detection. 256 entries × 24 bytes ≈ 6KB.
+/// Sized to cover 300τ window at typical message rates without excessive memory use.
+pub const MAX_RECENTLY_FORWARDED: usize = 256;
+/// Recently forwarded entries expire after 300τ to allow for slow multi-hop ACKs.
+/// On LoRa (τ=6.7s) this is ~33 minutes; on UDP (τ=100ms) this is 30 seconds.
+pub const RECENTLY_FORWARDED_TTL_MULTIPLIER: u64 = 300;
+
 // Protocol constants
 pub const K_REPLICAS: usize = 3;
 pub const DEFAULT_TTL: u8 = 255; // Max hops
 
 // Timing constants as Durations
 pub const MIN_PULSE_INTERVAL: Duration = Duration::from_secs(10);
+/// Maximum retransmission attempts before giving up. With exponential backoff
+/// (1τ, 2τ, 4τ, 8τ, 16τ, 32τ, 64τ, 128τ), total wait is ~255τ before abandoning.
 pub const MAX_RETRIES: u8 = 8;
 pub const LOCATION_REFRESH: Duration = Duration::from_hours(8);
 pub const LOCATION_TTL: Duration = Duration::from_hours(12);

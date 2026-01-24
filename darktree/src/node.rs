@@ -38,7 +38,8 @@ use crate::traits::{
 use crate::types::{
     ChildHash, Event, LocationEntry, NodeId, PublicKey, Routed, SecretKey, TransportMetrics,
     MAX_DISTRUSTED, MAX_LOCATION_CACHE, MAX_LOCATION_STORE, MAX_MSGS_PER_PENDING_PUBKEY,
-    MAX_NEIGHBORS, MAX_PENDING_LOOKUPS, MAX_PUBKEY_CACHE, MAX_SHORTCUTS, MIN_PULSE_INTERVAL,
+    MAX_NEIGHBORS, MAX_PENDING_ACKS, MAX_PENDING_LOOKUPS, MAX_PUBKEY_CACHE, MAX_RECENTLY_FORWARDED,
+    MAX_SHORTCUTS, MIN_PULSE_INTERVAL, RECENTLY_FORWARDED_TTL_MULTIPLIER,
 };
 
 /// Timing, signal, and tree information for a neighbor.
@@ -100,6 +101,28 @@ pub type DistrustedMap = HashMap<NodeId, Timestamp>;
 /// Messages awaiting pubkey for a specific node_id (keyed by the node whose pubkey is needed).
 pub type PendingPubkeyMap = HashMap<NodeId, VecDeque<Routed>>;
 
+/// 8-byte hash used for ACK identification.
+pub type AckHash = [u8; 8];
+
+/// Pending ACK entry for link-layer reliability.
+///
+/// Tracks a message awaiting acknowledgment with exponential backoff retry.
+#[derive(Clone, Debug)]
+pub struct PendingAck {
+    /// Original encoded message bytes for retransmission.
+    pub original_bytes: Vec<u8>,
+    /// Number of retries attempted so far.
+    pub retries: u8,
+    /// Timestamp when next retry should occur.
+    pub next_retry_at: Timestamp,
+}
+
+/// Map of pending ACKs keyed by message hash.
+pub type PendingAckMap = HashMap<AckHash, PendingAck>;
+
+/// Map of recently forwarded message hashes for duplicate detection.
+pub type RecentlyForwardedMap = HashMap<AckHash, Timestamp>;
+
 /// The main protocol node.
 ///
 /// Generic over:
@@ -158,6 +181,10 @@ pub struct Node<T, Cr, R, Clk> {
     join_context: Option<JoinContext>,
     distrusted: DistrustedMap,
     fraud_detection: FraudDetection,
+
+    // Link-layer reliability
+    pending_acks: PendingAckMap,
+    recently_forwarded: RecentlyForwardedMap,
 
     // Scheduling
     last_pulse: Option<Timestamp>,
@@ -240,6 +267,9 @@ where
             join_context: None,
             distrusted: HashMap::new(),
             fraud_detection: FraudDetection::new(),
+
+            pending_acks: HashMap::new(),
+            recently_forwarded: HashMap::new(),
 
             last_pulse: None,
             last_pulse_size: 0,
@@ -499,12 +529,18 @@ where
                 } else {
                     self.record_protocol_received();
                 }
+
+                // Implicit ACK: overhearing a Routed message clears pending ACK
+                // This is cheap (just a hash lookup) so we do it BEFORE signature verification.
+                let received_hash = self.compute_ack_hash(&routed);
+                self.pending_acks.remove(&received_hash);
+
                 self.handle_routed(routed, now);
             }
-            Message::Ack(_ack) => {
+            Message::Ack(ack) => {
                 self.record_protocol_received();
-                // TODO: Handle ACK for link-layer reliability
-                // Will check pending_acks and remove matching entry
+                // Explicit ACK: sender received duplicate and is confirming receipt
+                self.pending_acks.remove(&ack.hash);
             }
         }
     }
@@ -553,8 +589,85 @@ where
         self.handle_neighbor_timeouts(now);
         self.handle_location_expiry(now);
 
+        // Link-layer reliability maintenance
+        self.handle_ack_timeouts(now);
+        self.cleanup_recently_forwarded(now);
+
         // Check for tree size fraud
         self.handle_fraud_check(now);
+    }
+
+    /// Handle ACK timeouts - retransmit or give up on pending messages.
+    fn handle_ack_timeouts(&mut self, now: Timestamp) {
+        use crate::types::MAX_RETRIES;
+
+        // Collect entries that need action to avoid borrow issues
+        let mut retransmit = Vec::new();
+        let mut give_up = Vec::new();
+
+        for (&hash, pending) in self.pending_acks.iter() {
+            if now >= pending.next_retry_at {
+                if pending.retries < MAX_RETRIES {
+                    retransmit.push((hash, pending.original_bytes.clone(), pending.retries));
+                } else {
+                    give_up.push(hash);
+                }
+            }
+        }
+
+        // Process retransmissions
+        for (hash, bytes, retries) in retransmit {
+            // Calculate next retry time with exponential backoff and jitter
+            let next_retry = now + self.retry_backoff(retries + 1);
+
+            // Update pending entry
+            if let Some(pending) = self.pending_acks.get_mut(&hash) {
+                pending.retries = retries + 1;
+                pending.next_retry_at = next_retry;
+            }
+
+            // Retransmit
+            let result = self.transport().protocol_outgoing().try_send(bytes);
+            if result.is_ok() {
+                self.record_protocol_sent();
+            } else {
+                self.record_protocol_dropped();
+            }
+        }
+
+        // Remove entries that have exceeded MAX_RETRIES
+        for hash in give_up {
+            self.pending_acks.remove(&hash);
+        }
+    }
+
+    /// Clean up old entries from recently_forwarded.
+    pub(crate) fn cleanup_recently_forwarded(&mut self, now: Timestamp) {
+        let ttl = self.tau() * RECENTLY_FORWARDED_TTL_MULTIPLIER;
+        self.recently_forwarded
+            .retain(|_, &mut timestamp| now.saturating_sub(timestamp) < ttl);
+    }
+
+    /// Calculate retry backoff duration with exponential growth and jitter.
+    ///
+    /// Base: τ × 2^retries (capped at 128τ)
+    /// Jitter: ±10%
+    pub(crate) fn retry_backoff(&mut self, retries: u8) -> Duration {
+        let tau = self.tau();
+
+        // Exponential backoff: τ × 2^retries, capped at 128τ
+        let multiplier = 1u64 << retries.min(7); // 2^retries, max 128
+        let base_ms = tau.as_millis().saturating_mul(multiplier);
+
+        // Add ±10% jitter
+        let jitter_range = base_ms / 10; // 10% of base
+        if jitter_range > 0 {
+            let jitter = self.random_mut().gen_range(0, jitter_range * 2);
+            let jittered = base_ms.saturating_sub(jitter_range).saturating_add(jitter);
+            Duration::from_millis(jittered)
+        } else {
+            Duration::from_millis(base_ms)
+        }
     }
 
     /// Start a lookup for a target node.
@@ -736,6 +849,19 @@ where
 
     pub(crate) fn distrusted(&self) -> &DistrustedMap {
         &self.distrusted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_acks(&self) -> &PendingAckMap {
+        &self.pending_acks
+    }
+
+    pub(crate) fn pending_acks_mut(&mut self) -> &mut PendingAckMap {
+        &mut self.pending_acks
+    }
+
+    pub(crate) fn recently_forwarded(&self) -> &RecentlyForwardedMap {
+        &self.recently_forwarded
     }
 
     pub(crate) fn fraud_detection(&self) -> &FraudDetection {
@@ -959,5 +1085,55 @@ where
             }
         }
         self.shortcuts.insert(node_id, keyspace);
+    }
+
+    /// Evict the oldest entry from an AckHash-keyed map based on a timestamp extraction function.
+    fn evict_oldest_ack_by<V, F>(map: &mut HashMap<AckHash, V>, get_timestamp: F) -> bool
+    where
+        F: Fn(&V) -> Timestamp,
+    {
+        if let Some(oldest_key) = map
+            .iter()
+            .min_by_key(|(_, v)| get_timestamp(v))
+            .map(|(k, _)| *k)
+        {
+            map.remove(&oldest_key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Insert a pending ACK entry with bounded eviction.
+    ///
+    /// Evicts the entry with the oldest `next_retry_at` when at capacity.
+    pub(crate) fn insert_pending_ack(
+        &mut self,
+        hash: AckHash,
+        original_bytes: Vec<u8>,
+        now: Timestamp,
+    ) {
+        if self.pending_acks.len() >= MAX_PENDING_ACKS && !self.pending_acks.contains_key(&hash) {
+            Self::evict_oldest_ack_by(&mut self.pending_acks, |pa| pa.next_retry_at);
+        }
+
+        let pending = PendingAck {
+            original_bytes,
+            retries: 0,
+            next_retry_at: now + self.tau(),
+        };
+        self.pending_acks.insert(hash, pending);
+    }
+
+    /// Insert a recently forwarded entry with bounded eviction.
+    ///
+    /// Evicts the oldest entry by timestamp when at capacity.
+    pub(crate) fn insert_recently_forwarded(&mut self, hash: AckHash, now: Timestamp) {
+        if self.recently_forwarded.len() >= MAX_RECENTLY_FORWARDED
+            && !self.recently_forwarded.contains_key(&hash)
+        {
+            Self::evict_oldest_ack_by(&mut self.recently_forwarded, |&ts| ts);
+        }
+        self.recently_forwarded.insert(hash, now);
     }
 }

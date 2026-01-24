@@ -6,14 +6,14 @@
 
 use alloc::vec::Vec;
 
-use crate::node::Node;
+use crate::node::{AckHash, Node};
 use crate::time::Timestamp;
 use crate::traits::{Clock, Crypto, Random, Transport};
 use crate::types::{
     ChildHash, Error, NodeId, Routed, Signature, DEFAULT_TTL, MSG_DATA, MSG_FOUND, MSG_LOOKUP,
     MSG_PUBLISH,
 };
-use crate::wire::{routed_sign_data, Encode};
+use crate::wire::{routed_sign_data, Ack, Encode, Message};
 
 impl<T, Cr, R, Clk> Node<T, Cr, R, Clk>
 where
@@ -54,8 +54,39 @@ where
             return;
         }
 
-        // Signature valid, forward
-        self.forward_routed(msg);
+        // Duplicate detection: check if we've recently forwarded this message
+        // Note: hash excludes TTL so it's the same at any hop
+        let msg_hash = self.compute_ack_hash(&msg);
+
+        if self.recently_forwarded().contains_key(&msg_hash) {
+            // Duplicate - sender is waiting, send explicit ACK instead of re-forwarding
+            self.send_explicit_ack(msg_hash);
+            return;
+        }
+
+        // Not a duplicate - forward and track
+        self.insert_recently_forwarded(msg_hash, now);
+        self.forward_routed(msg, now);
+    }
+
+    /// Send an explicit ACK for a message hash.
+    ///
+    /// Used when we receive a duplicate message - the sender is waiting for confirmation
+    /// that we received it, so we send a minimal ACK instead of re-forwarding.
+    pub(crate) fn send_explicit_ack(&mut self, hash: AckHash) {
+        let ack = Ack { hash };
+        let encoded = Message::Ack(ack).encode_to_vec();
+
+        // ACK is small (9 bytes) so MTU check is unlikely to fail, but be safe
+        if encoded.len() > self.transport().mtu() {
+            return;
+        }
+
+        let result = self.transport().protocol_outgoing().try_send(encoded);
+        if result.is_ok() {
+            self.record_protocol_sent();
+        }
+        // Don't track drops for ACKs - they're best-effort
     }
 
     /// Verify a Routed message signature.
@@ -110,16 +141,28 @@ where
         }
     }
 
+    /// Compute the 8-byte ACK hash for a Routed message.
+    ///
+    /// Uses `routed_sign_data()` which excludes TTL, so the hash is invariant across hops.
+    /// This allows the original sender to recognize the message when overhearing a forwarder.
+    pub(crate) fn compute_ack_hash(&self, msg: &Routed) -> AckHash {
+        let sign_data = routed_sign_data(msg);
+        let full_hash = self.crypto().hash(sign_data.as_slice());
+        let mut hash = [0u8; 8];
+        hash.copy_from_slice(&full_hash[..8]);
+        hash
+    }
+
     /// Forward a routed message toward its destination.
-    fn forward_routed(&mut self, msg: Routed) {
+    fn forward_routed(&mut self, msg: Routed, now: Timestamp) {
         let dest = msg.dest_addr;
 
         // Try to find best next hop
         if let Some(next_hop) = self.best_next_hop(dest) {
-            self.send_to_neighbor(next_hop, msg);
+            self.send_to_neighbor(next_hop, msg, now);
         } else if let Some(parent) = self.parent() {
             // Forward upward to parent as fallback
-            self.send_to_neighbor(parent, msg);
+            self.send_to_neighbor(parent, msg, now);
         }
         // If no route, drop the message
     }
@@ -155,14 +198,26 @@ where
         best.map(|(node_id, _)| node_id)
     }
 
-    /// Send a Routed message to a specific neighbor.
-    fn send_to_neighbor(&mut self, _neighbor: NodeId, msg: Routed) {
-        let encoded = crate::wire::Message::Routed(msg).encode_to_vec();
+    /// Broadcast a Routed message with ACK tracking.
+    ///
+    /// On broadcast radio (LoRa), all neighbors within range receive the message.
+    /// The `neighbor` parameter documents routing intent for logging/debugging
+    /// and enables future directed-transmission optimizations on point-to-point transports.
+    ///
+    /// Inserts the message hash into pending_acks for retransmission if no ACK is received.
+    fn send_to_neighbor(&mut self, _neighbor: NodeId, msg: Routed, now: Timestamp) {
+        let encoded = crate::wire::Message::Routed(msg.clone()).encode_to_vec();
 
         if encoded.len() > self.transport().mtu() {
             self.record_protocol_dropped();
             return;
         }
+
+        // Compute ACK hash for tracking (uses routed_sign_data which excludes TTL)
+        let ack_hash = self.compute_ack_hash(&msg);
+
+        // Track pending ACK before sending
+        self.insert_pending_ack(ack_hash, encoded.clone(), now);
 
         // Broadcast on protocol channel (neighbors will hear it)
         let result = self.transport().protocol_outgoing().try_send(encoded);
@@ -170,6 +225,8 @@ where
         if result.is_ok() {
             self.record_protocol_sent();
         } else {
+            // Send failed - remove pending ACK since we never actually sent
+            self.pending_acks_mut().remove(&ack_hash);
             self.record_protocol_dropped();
         }
     }
@@ -403,6 +460,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
 
@@ -545,5 +604,342 @@ mod tests {
 
         // Outside all ranges
         assert_eq!(node.best_next_hop(5000), None);
+    }
+
+    #[test]
+    fn test_compute_ack_hash_invariant() {
+        // Hash should be the same regardless of TTL (routed_sign_data excludes TTL)
+        let node = make_node();
+
+        let msg1 = Routed {
+            flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            dest_addr: 0x1234_5678,
+            dest_hash: None,
+            src_addr: Some(0x8765_4321),
+            src_node_id: [7u8; 16],
+            src_pubkey: None,
+            ttl: 255, // High TTL
+            payload: b"test payload".to_vec(),
+            signature: Signature::default(),
+        };
+
+        let mut msg2 = msg1.clone();
+        msg2.ttl = 100; // Different TTL
+
+        let hash1 = node.compute_ack_hash(&msg1);
+        let hash2 = node.compute_ack_hash(&msg2);
+
+        assert_eq!(
+            hash1, hash2,
+            "ACK hash should be invariant across TTL values"
+        );
+    }
+
+    #[test]
+    fn test_compute_ack_hash_different_content() {
+        // Different message content should produce different hashes
+        let node = make_node();
+
+        let msg1 = Routed {
+            flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            dest_addr: 0x1234_5678,
+            dest_hash: None,
+            src_addr: Some(0x8765_4321),
+            src_node_id: [7u8; 16],
+            src_pubkey: None,
+            ttl: 255,
+            payload: b"AAAA".to_vec(),
+            signature: Signature::default(),
+        };
+
+        // Use completely different payload to ensure hash differs
+        let mut msg2 = msg1.clone();
+        msg2.payload = b"ZZZZZZZZ".to_vec();
+
+        let hash1 = node.compute_ack_hash(&msg1);
+        let hash2 = node.compute_ack_hash(&msg2);
+
+        assert_ne!(
+            hash1, hash2,
+            "Different content should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_implicit_ack_clears_pending() {
+        use crate::time::Timestamp;
+        use crate::wire::{Decode, Encode, Message};
+
+        let mut node = make_node();
+        let now = Timestamp::from_secs(1000);
+
+        // Create a message and compute its hash
+        let msg = Routed {
+            flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            dest_addr: 0x1234_5678,
+            dest_hash: None,
+            src_addr: Some(0x8765_4321),
+            src_node_id: [7u8; 16],
+            src_pubkey: None,
+            ttl: 255,
+            payload: b"test".to_vec(),
+            signature: Signature::default(),
+        };
+
+        let hash = node.compute_ack_hash(&msg);
+
+        // Manually insert a pending ACK
+        node.insert_pending_ack(hash, vec![1, 2, 3], now);
+        assert!(node.pending_acks().contains_key(&hash));
+
+        // Simulate receiving the message (which should clear pending ACK via implicit ACK)
+        let encoded = Message::Routed(msg).encode_to_vec();
+        node.transport().inject_rx(encoded.clone(), None);
+
+        // Decode and process - this simulates what handle_transport_rx does
+        let decoded = Message::decode_from_slice(&encoded).unwrap();
+        if let Message::Routed(routed) = decoded {
+            let received_hash = node.compute_ack_hash(&routed);
+            node.pending_acks_mut().remove(&received_hash);
+        }
+
+        // Pending ACK should be cleared
+        assert!(
+            !node.pending_acks().contains_key(&hash),
+            "Pending ACK should be cleared by implicit ACK"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_tracked_in_recently_forwarded() {
+        use crate::time::Timestamp;
+
+        let mut node = make_node();
+        let now = Timestamp::from_secs(1000);
+
+        let msg = Routed {
+            flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            dest_addr: 0x1234_5678,
+            dest_hash: None,
+            src_addr: Some(0x8765_4321),
+            src_node_id: [7u8; 16],
+            src_pubkey: None,
+            ttl: 255,
+            payload: b"test".to_vec(),
+            signature: Signature::default(),
+        };
+
+        let hash = node.compute_ack_hash(&msg);
+
+        // Initially not tracked
+        assert!(!node.recently_forwarded().contains_key(&hash));
+
+        // Insert into recently_forwarded
+        node.insert_recently_forwarded(hash, now);
+
+        // Should now be tracked
+        assert!(node.recently_forwarded().contains_key(&hash));
+    }
+
+    #[test]
+    fn test_retry_backoff_bounds() {
+        use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
+
+        // Create node with known tau (100ms default for MockTransport with no bw)
+        let transport = MockTransport::new();
+        let crypto = MockCrypto::new();
+        let random = MockRandom::with_seed(42);
+        let clock = MockClock::new();
+        let mut node = Node::new(transport, crypto, random, clock);
+
+        let tau_ms = node.tau().as_millis();
+        assert_eq!(tau_ms, 100, "Expected default tau of 100ms");
+
+        // Test exponential growth
+        // retry 0: 1τ = 100ms (±10% = 90-110ms)
+        // retry 1: 2τ = 200ms (±10% = 180-220ms)
+        // retry 2: 4τ = 400ms (±10% = 360-440ms)
+        // retry 7: 128τ = 12800ms (capped)
+        // retry 8+: still 128τ (capped at 2^7)
+
+        for retry in 0..=8 {
+            let backoff = node.retry_backoff(retry);
+            let expected_base = tau_ms * (1u64 << retry.min(7));
+            let min_expected = expected_base * 9 / 10; // -10%
+            let max_expected = expected_base * 11 / 10; // +10%
+
+            assert!(
+                backoff.as_millis() >= min_expected && backoff.as_millis() <= max_expected,
+                "retry {} backoff {} should be in range [{}, {}]",
+                retry,
+                backoff.as_millis(),
+                min_expected,
+                max_expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_ack_roundtrip_encoding() {
+        use crate::node::AckHash;
+        use crate::wire::{Ack, Decode, Encode, Message};
+
+        let hash: AckHash = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let ack = Ack { hash };
+        let msg = Message::Ack(ack);
+
+        let encoded = msg.encode_to_vec();
+        assert_eq!(
+            encoded.len(),
+            9,
+            "Ack message should be 9 bytes (1 type + 8 hash)"
+        );
+
+        let decoded = Message::decode_from_slice(&encoded).unwrap();
+        match decoded {
+            Message::Ack(decoded_ack) => {
+                assert_eq!(decoded_ack.hash, hash);
+            }
+            _ => panic!("Expected Ack message"),
+        }
+    }
+
+    #[test]
+    fn test_cleanup_recently_forwarded_expiry() {
+        use crate::time::{Duration, Timestamp};
+        use crate::types::RECENTLY_FORWARDED_TTL_MULTIPLIER;
+
+        let mut node = make_node();
+        let tau = node.tau();
+        let ttl = tau * RECENTLY_FORWARDED_TTL_MULTIPLIER;
+
+        let now = Timestamp::from_secs(1000);
+        let hash1: [u8; 8] = [1; 8];
+        let hash2: [u8; 8] = [2; 8];
+
+        // Insert two entries at different times
+        node.insert_recently_forwarded(hash1, now);
+        node.insert_recently_forwarded(hash2, now + Duration::from_secs(10));
+
+        // Both should exist
+        assert!(node.recently_forwarded().contains_key(&hash1));
+        assert!(node.recently_forwarded().contains_key(&hash2));
+
+        // Advance time past TTL for first entry only
+        let later = now + ttl + Duration::from_millis(1);
+        node.cleanup_recently_forwarded(later);
+
+        // First entry should be expired, second should still exist
+        assert!(
+            !node.recently_forwarded().contains_key(&hash1),
+            "Entry should expire after TTL"
+        );
+        assert!(
+            node.recently_forwarded().contains_key(&hash2),
+            "Newer entry should still exist"
+        );
+    }
+
+    #[test]
+    fn test_pending_ack_eviction_at_capacity() {
+        use crate::time::Timestamp;
+        use crate::types::MAX_PENDING_ACKS;
+
+        let mut node = make_node();
+        let now = Timestamp::from_secs(1000);
+
+        // Fill pending_acks to capacity
+        for i in 0..MAX_PENDING_ACKS {
+            let hash: [u8; 8] = [i as u8; 8];
+            node.insert_pending_ack(hash, vec![i as u8], now);
+        }
+
+        assert_eq!(node.pending_acks().len(), MAX_PENDING_ACKS);
+
+        // Insert one more - should evict oldest
+        let new_hash: [u8; 8] = [0xFF; 8];
+        node.insert_pending_ack(new_hash, vec![0xFF], now);
+
+        // Should still be at capacity (not exceed)
+        assert_eq!(
+            node.pending_acks().len(),
+            MAX_PENDING_ACKS,
+            "Should evict to stay at capacity"
+        );
+        assert!(
+            node.pending_acks().contains_key(&new_hash),
+            "New entry should be present"
+        );
+    }
+
+    #[test]
+    fn test_recently_forwarded_eviction_at_capacity() {
+        use crate::time::Timestamp;
+        use crate::types::MAX_RECENTLY_FORWARDED;
+
+        let mut node = make_node();
+        let now = Timestamp::from_secs(1000);
+
+        // Fill recently_forwarded to capacity
+        for i in 0..MAX_RECENTLY_FORWARDED {
+            let mut hash: [u8; 8] = [0; 8];
+            hash[0] = (i >> 8) as u8;
+            hash[1] = (i & 0xFF) as u8;
+            node.insert_recently_forwarded(hash, now);
+        }
+
+        assert_eq!(node.recently_forwarded().len(), MAX_RECENTLY_FORWARDED);
+
+        // Insert one more - should evict oldest
+        let new_hash: [u8; 8] = [0xFF; 8];
+        node.insert_recently_forwarded(new_hash, now);
+
+        // Should still be at capacity (not exceed)
+        assert_eq!(
+            node.recently_forwarded().len(),
+            MAX_RECENTLY_FORWARDED,
+            "Should evict to stay at capacity"
+        );
+        assert!(
+            node.recently_forwarded().contains_key(&new_hash),
+            "New entry should be present"
+        );
+    }
+
+    #[test]
+    fn test_explicit_ack_sent_on_duplicate() {
+        use crate::time::Timestamp;
+
+        let mut node = make_node();
+        let now = Timestamp::from_secs(1000);
+
+        let msg = Routed {
+            flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            dest_addr: 0x1234_5678,
+            dest_hash: None,
+            src_addr: Some(0x8765_4321),
+            src_node_id: [7u8; 16],
+            src_pubkey: None,
+            ttl: 255,
+            payload: b"test".to_vec(),
+            signature: Signature::default(),
+        };
+
+        let hash = node.compute_ack_hash(&msg);
+
+        // Mark as recently forwarded (simulating first forward)
+        node.insert_recently_forwarded(hash, now);
+
+        // Clear any messages in transport
+        node.transport().take_sent();
+
+        // Send explicit ACK (simulating duplicate detection)
+        node.send_explicit_ack(hash);
+
+        // Check that an ACK was sent
+        let sent = node.transport().take_protocol_sent();
+        assert_eq!(sent.len(), 1, "Should send one ACK message");
+        assert_eq!(sent[0].len(), 9, "ACK should be 9 bytes");
+        assert_eq!(sent[0][0], 0x03, "ACK wire type should be 0x03");
     }
 }
