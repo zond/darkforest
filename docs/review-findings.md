@@ -87,6 +87,14 @@ The `should_reset()` method exists to check if subtree_size changed 2x (per desi
 
 **Impact:** False positives/negatives in fraud detection after significant tree restructuring.
 
+### No FraudDetected event emitted
+**Source:** Code review
+**Location:** `fraud.rs:168-177`, `types.rs:358-365`
+
+When fraud is detected, the node silently adds the parent to distrusted and calls `leave_and_rejoin()`. No event is emitted to notify the application.
+
+**Fix:** Add `FraudDetected { parent: NodeId, z_score: f32, observed: u32, expected: u32 }` to the `Event` enum and emit it from `handle_fraud_check()`.
+
 ### Missing radio power control in Transport trait
 **Source:** Embedded reviewer
 **Location:** `traits.rs`
