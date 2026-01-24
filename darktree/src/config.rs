@@ -114,6 +114,15 @@ mod tests {
     #[test]
     fn test_default_config_values() {
         assert_eq!(DefaultConfig::MAX_NEIGHBORS, 128);
+        assert_eq!(DefaultConfig::MAX_PUBKEY_CACHE, 128);
+        assert_eq!(DefaultConfig::MAX_LOCATION_STORE, 256);
+        assert_eq!(DefaultConfig::MAX_LOCATION_CACHE, 64);
+        assert_eq!(DefaultConfig::MAX_PENDING_LOOKUPS, 16);
+        assert_eq!(DefaultConfig::MAX_DISTRUSTED, 64);
+        assert_eq!(DefaultConfig::MAX_SHORTCUTS, 64);
+        assert_eq!(DefaultConfig::MAX_PENDING_DATA, 16);
+        assert_eq!(DefaultConfig::MAX_MSGS_PER_PENDING_PUBKEY, 8);
+        assert_eq!(DefaultConfig::MAX_PENDING_PUBKEY_NODES, 16);
         assert_eq!(DefaultConfig::MAX_PENDING_ACKS, 32);
         assert_eq!(DefaultConfig::MAX_RECENTLY_FORWARDED, 256);
     }
@@ -121,6 +130,15 @@ mod tests {
     #[test]
     fn test_small_config_values() {
         assert_eq!(SmallConfig::MAX_NEIGHBORS, 16);
+        assert_eq!(SmallConfig::MAX_PUBKEY_CACHE, 16);
+        assert_eq!(SmallConfig::MAX_LOCATION_STORE, 32);
+        assert_eq!(SmallConfig::MAX_LOCATION_CACHE, 8);
+        assert_eq!(SmallConfig::MAX_PENDING_LOOKUPS, 4);
+        assert_eq!(SmallConfig::MAX_DISTRUSTED, 8);
+        assert_eq!(SmallConfig::MAX_SHORTCUTS, 8);
+        assert_eq!(SmallConfig::MAX_PENDING_DATA, 4);
+        assert_eq!(SmallConfig::MAX_MSGS_PER_PENDING_PUBKEY, 2);
+        assert_eq!(SmallConfig::MAX_PENDING_PUBKEY_NODES, 4);
         assert_eq!(SmallConfig::MAX_PENDING_ACKS, 8);
         assert_eq!(SmallConfig::MAX_RECENTLY_FORWARDED, 32);
     }
@@ -130,6 +148,45 @@ mod tests {
         assert!(SmallConfig::MAX_NEIGHBORS < DefaultConfig::MAX_NEIGHBORS);
         assert!(SmallConfig::MAX_PUBKEY_CACHE < DefaultConfig::MAX_PUBKEY_CACHE);
         assert!(SmallConfig::MAX_LOCATION_STORE < DefaultConfig::MAX_LOCATION_STORE);
+        assert!(SmallConfig::MAX_LOCATION_CACHE < DefaultConfig::MAX_LOCATION_CACHE);
+        assert!(SmallConfig::MAX_PENDING_LOOKUPS < DefaultConfig::MAX_PENDING_LOOKUPS);
+        assert!(SmallConfig::MAX_DISTRUSTED < DefaultConfig::MAX_DISTRUSTED);
+        assert!(SmallConfig::MAX_SHORTCUTS < DefaultConfig::MAX_SHORTCUTS);
+        assert!(SmallConfig::MAX_PENDING_DATA < DefaultConfig::MAX_PENDING_DATA);
+        assert!(SmallConfig::MAX_MSGS_PER_PENDING_PUBKEY < DefaultConfig::MAX_MSGS_PER_PENDING_PUBKEY);
+        assert!(SmallConfig::MAX_PENDING_PUBKEY_NODES < DefaultConfig::MAX_PENDING_PUBKEY_NODES);
         assert!(SmallConfig::MAX_PENDING_ACKS < DefaultConfig::MAX_PENDING_ACKS);
+        assert!(SmallConfig::MAX_RECENTLY_FORWARDED < DefaultConfig::MAX_RECENTLY_FORWARDED);
+    }
+
+    #[test]
+    fn test_configs_are_nonzero() {
+        // DefaultConfig
+        assert!(DefaultConfig::MAX_NEIGHBORS > 0);
+        assert!(DefaultConfig::MAX_PUBKEY_CACHE > 0);
+        assert!(DefaultConfig::MAX_LOCATION_STORE > 0);
+        assert!(DefaultConfig::MAX_LOCATION_CACHE > 0);
+        assert!(DefaultConfig::MAX_PENDING_LOOKUPS > 0);
+        assert!(DefaultConfig::MAX_DISTRUSTED > 0);
+        assert!(DefaultConfig::MAX_SHORTCUTS > 0);
+        assert!(DefaultConfig::MAX_PENDING_DATA > 0);
+        assert!(DefaultConfig::MAX_MSGS_PER_PENDING_PUBKEY > 0);
+        assert!(DefaultConfig::MAX_PENDING_PUBKEY_NODES > 0);
+        assert!(DefaultConfig::MAX_PENDING_ACKS > 0);
+        assert!(DefaultConfig::MAX_RECENTLY_FORWARDED > 0);
+
+        // SmallConfig
+        assert!(SmallConfig::MAX_NEIGHBORS > 0);
+        assert!(SmallConfig::MAX_PUBKEY_CACHE > 0);
+        assert!(SmallConfig::MAX_LOCATION_STORE > 0);
+        assert!(SmallConfig::MAX_LOCATION_CACHE > 0);
+        assert!(SmallConfig::MAX_PENDING_LOOKUPS > 0);
+        assert!(SmallConfig::MAX_DISTRUSTED > 0);
+        assert!(SmallConfig::MAX_SHORTCUTS > 0);
+        assert!(SmallConfig::MAX_PENDING_DATA > 0);
+        assert!(SmallConfig::MAX_MSGS_PER_PENDING_PUBKEY > 0);
+        assert!(SmallConfig::MAX_PENDING_PUBKEY_NODES > 0);
+        assert!(SmallConfig::MAX_PENDING_ACKS > 0);
+        assert!(SmallConfig::MAX_RECENTLY_FORWARDED > 0);
     }
 }

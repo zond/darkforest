@@ -14,6 +14,12 @@ Open issues from protocol-security-architect, embedded-rust-engineer, and code-s
 
 Implemented `NodeConfig` trait with `DefaultConfig` (256KB+ RAM) and `SmallConfig` (64KB RAM).
 
+### Config tests incomplete
+**Source:** Code simplifier (2026-01-24)
+**Completed:** 2026-01-24
+
+Expanded tests to verify all 12 config values for both DefaultConfig and SmallConfig.
+
 ## Low Priority / Future Work
 
 ### u64 division in hot paths
@@ -46,14 +52,6 @@ Hardcoded to 512. On 64KB devices using `SmallConfig`, tracking 512 publishers (
 Tests only use `DefaultConfig`. No tests verify `SmallConfig` behavior when hitting smaller bounds.
 
 **Recommendation:** Add at least one test using `SmallConfig` to verify eviction works correctly at smaller capacities.
-
-### Config tests incomplete
-**Source:** Code simplifier (2026-01-24)
-**Location:** `config.rs` tests
-
-Tests only verify 3 of 12 config values per config type.
-
-**Recommendation:** Either test all values or document why only a subset is tested.
 
 ### Missing MCU selection guidance
 **Source:** Code simplifier (2026-01-24)
