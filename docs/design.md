@@ -563,6 +563,41 @@ My subtree size `S = 10`. After 8 hours, I expect `λ = 3 × 10 = 30` PUBLISH me
 
 Large fraud is detectable within one refresh period (8 hours). For faster detection with smaller `S`, wait longer to accumulate samples.
 
+#### Scalability Challenge
+
+A naive implementation using `HashSet<NodeId>` to track unique publishers doesn't scale:
+- 1,000 nodes × 16 bytes = 16 KB
+- 100,000 nodes × 16 bytes = 1.6 MB — far too much for embedded devices
+
+We need bounded memory regardless of network size.
+
+#### Solution: HyperLogLog Cardinality Estimation
+
+HyperLogLog (HLL) is a probabilistic algorithm that estimates the cardinality (unique count) of a set using fixed memory. It's used by Redis, PostgreSQL, and other systems for COUNT DISTINCT operations.
+
+**Properties:**
+- **Fixed memory:** ~1.5 KB for 2% accuracy, regardless of set size
+- **Supports billions of items** with the same memory footprint
+- **Simple operations:** add(item), estimate() → count
+- **Mergeable:** Two HLL sketches can be combined (useful for distributed counting)
+
+**How it works:**
+1. Hash each item to a uniform random value
+2. Count leading zeros in the hash (geometric distribution)
+3. Track maximum leading zeros seen across many "buckets"
+4. Estimate cardinality from the harmonic mean of bucket values
+
+**Memory vs Accuracy trade-off:**
+
+| Registers | Memory | Std Error |
+|-----------|--------|-----------|
+| 64 | 64 B | 13% |
+| 256 | 256 B | 6.5% |
+| 1024 | 1 KB | 3.25% |
+| 2048 | 2 KB | 2.3% |
+
+For fraud detection, 6.5% error (256 bytes) is acceptable — we're detecting 2× or larger fraud, not subtle differences.
+
 #### Implementation
 
 ```rust
@@ -572,10 +607,15 @@ const MIN_EXPECTED: f64 = 5.0;       // need λ ≥ 5 for valid Poisson approxim
 const DISTRUST_TTL: Duration = Duration::from_secs(24 * 3600);
 const MAX_DISTRUSTED: usize = 64;
 
+// HyperLogLog parameters (configurable via NodeConfig)
+const HLL_REGISTERS: usize = 256;    // 256 bytes, ~6.5% std error
+
 struct Node {
     join_context: Option<JoinContext>,
     distrusted: HashMap<NodeId, Instant>,
     fraud_detection: FraudDetection,
+    hll_secret_key: [u8; 16],  // Random key for SipHash (prevents adversarial bucket attacks)
+    last_fraud_reset: Instant, // Rate-limit reset attempts
     // ...
 }
 
@@ -585,28 +625,80 @@ struct JoinContext {
 }
 
 struct FraudDetection {
-    unique_publishers: HashSet<NodeId>,  // count unique nodes, not total messages
+    // HyperLogLog sketch for cardinality estimation
+    // Each register stores max leading zeros (0-64), fits in u8
+    hll_registers: [u8; HLL_REGISTERS],
     count_start: Instant,
     subtree_size_at_start: u32,
 }
 
-fn on_publish_received(&mut self, msg: &Routed) {
-    if self.is_storage_node_for(msg) {
-        // Count unique node_ids to prevent spoofing via repeated PUBLISH
-        self.fraud_detection.unique_publishers.insert(msg.src_node_id);
+impl FraudDetection {
+    fn new(subtree_size: u32) -> Self {
+        Self {
+            hll_registers: [0; HLL_REGISTERS],
+            count_start: Instant::now(),
+            subtree_size_at_start: subtree_size,
+        }
+    }
+
+    fn add_publisher(&mut self, node_id: &NodeId, secret_key: &[u8]) {
+        // Use keyed hash (SipHash) to prevent adversarial bucket manipulation.
+        // Without keyed hash, attacker could craft NodeIds targeting specific buckets.
+        let hash = siphash64(secret_key, node_id);
+
+        // Use lower bits for bucket index
+        let bucket = (hash as usize) & (HLL_REGISTERS - 1);
+
+        // Count leading zeros in upper 56 bits, +1 for rank (so rank is always >= 1)
+        // For 56-bit value in u64: subtract 8 from leading_zeros() result
+        let leading_zeros = (hash >> 8).leading_zeros() as u8 - 8 + 1;
+
+        // Update register if this is a new maximum
+        if leading_zeros > self.hll_registers[bucket] {
+            self.hll_registers[bucket] = leading_zeros;
+        }
+    }
+
+    fn estimate_cardinality(&self) -> f64 {
+        // HyperLogLog estimation formula
+        let m = HLL_REGISTERS as f64;
+        let alpha = 0.7213 / (1.0 + 1.079 / m);  // bias correction
+
+        let sum: f64 = self.hll_registers.iter()
+            .map(|&r| 2.0_f64.powi(-(r as i32)))
+            .sum();
+
+        let estimate = alpha * m * m / sum;
+
+        // Small range correction (linear counting)
+        let zeros = self.hll_registers.iter().filter(|&&r| r == 0).count();
+        if estimate < 2.5 * m && zeros > 0 {
+            return m * (m / zeros as f64).ln();
+        }
+
+        estimate
     }
 }
 
-fn on_subtree_size_changed(&mut self) {
+fn on_publish_received(&mut self, msg: &Routed) {
+    if self.is_storage_node_for(msg) {
+        // Add to HyperLogLog sketch (O(1) time and space)
+        self.fraud_detection.add_publisher(&msg.src_node_id, &self.hll_secret_key);
+    }
+}
+
+fn on_subtree_size_changed(&mut self, now: Instant) {
     // Reset fraud detection if subtree_size changed significantly (2x either way)
     let old = self.fraud_detection.subtree_size_at_start;
     let new = self.subtree_size;
     if new > old * 2 || new < old / 2 {
-        self.fraud_detection = FraudDetection {
-            unique_publishers: HashSet::new(),
-            count_start: Instant::now(),
-            subtree_size_at_start: new,
-        };
+        // Rate-limit resets to prevent attacker from manipulating subtree_size
+        // to repeatedly reset our fraud detection window
+        const MIN_RESET_INTERVAL: Duration = Duration::from_secs(3600);  // 1 hour
+        if now.duration_since(self.last_fraud_reset) >= MIN_RESET_INTERVAL {
+            self.fraud_detection = FraudDetection::new(new);
+            self.last_fraud_reset = now;
+        }
     }
 }
 
@@ -625,8 +717,18 @@ fn check_tree_size_fraud(&mut self) {
         return;
     }
 
-    let observed = fd.unique_publishers.len() as f64;
-    let z = (expected - observed) / expected.sqrt();
+    // Use HyperLogLog estimate instead of exact count
+    let observed = fd.estimate_cardinality();
+
+    // Combined variance accounts for both:
+    // 1. Poisson variance of expected arrivals: Var(Poisson) = λ = expected
+    // 2. HLL estimation error: ~6.5% std error for 256 registers
+    let poisson_variance = expected;
+    let hll_std_error = 0.065;  // 1.04 / sqrt(256) ≈ 0.065
+    let hll_variance = (hll_std_error * observed).powi(2);
+    let combined_std = (poisson_variance + hll_variance).sqrt();
+
+    let z = (expected - observed) / combined_std;
 
     if z > FRAUD_Z_THRESHOLD {
         // We received significantly fewer PUBLISH than expected.
@@ -638,16 +740,25 @@ fn check_tree_size_fraud(&mut self) {
 
 fn leave_and_rejoin(&mut self) {
     self.join_context = None;
-    self.fraud_detection = FraudDetection {
-        unique_publishers: HashSet::new(),
-        count_start: Instant::now(),
-        subtree_size_at_start: self.subtree_size,
-    };
+    self.fraud_detection = FraudDetection::new(self.subtree_size);
     self.parent = None;
     self.root_id = self.node_id;
     self.tree_size = self.subtree_size;
 }
 ```
+
+#### Memory Budget
+
+With HyperLogLog, fraud detection uses **fixed memory regardless of network size**:
+
+| Config | HLL Registers | Memory | Std Error | Max Network |
+|--------|--------------|--------|-----------|-------------|
+| SmallConfig | 64 | 64 B | 13% | Unlimited |
+| DefaultConfig | 256 | 256 B | 6.5% | Unlimited |
+
+Compare to the previous HashSet approach:
+- 1,000 nodes: 16 KB → 256 B (64× reduction)
+- 100,000 nodes: 1.6 MB → 256 B (6,400× reduction)
 
 #### Distrust Management
 
