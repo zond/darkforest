@@ -237,7 +237,9 @@ where
         // Compute root_hash from our node_id (we are initially root of our own tree)
         let root_hash = Self::compute_node_hash_static(&crypto, &node_id);
 
-        // Cache tau to avoid u64 division on 32-bit MCUs at runtime
+        // Cache tau to avoid u64 division on 32-bit MCUs at runtime.
+        // Note: tau is computed once at initialization. If transport bandwidth
+        // changes dynamically, create a new Node instance.
         let cached_tau_ms = match transport.bw() {
             Some(bw) if bw > 0 => {
                 let ms = (transport.mtu() as u64 * 1000) / bw as u64;

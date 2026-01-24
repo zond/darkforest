@@ -53,15 +53,21 @@ struct FastDivisor {
 
 impl FastDivisor {
     /// Create a fast divisor for the given value.
-    /// Panics if divisor is 0.
+    /// Panics in debug mode if divisor is 0.
     fn new(divisor: u64) -> Self {
         debug_assert!(divisor > 0, "divisor must be non-zero");
-        if divisor == 0 {
-            // Fallback for release builds: treat as 1 to avoid panic
+
+        // Powers of 2 are handled specially: 2^(64+shift)/divisor = 2^64 which
+        // overflows u64. We mark these with reciprocal=0 and use bit shift in div().
+        let is_power_of_two = divisor > 0 && (divisor & (divisor - 1)) == 0;
+
+        if is_power_of_two {
+            // For powers of 2, division is just a right shift
+            let shift = divisor.trailing_zeros();
             return Self {
-                divisor: 1,
-                reciprocal: 1,
-                shift: 0,
+                divisor,
+                reciprocal: 0, // Sentinel: use shift path in div()
+                shift,
             };
         }
 
@@ -83,6 +89,11 @@ impl FastDivisor {
     /// Divide n by the precomputed divisor.
     #[inline]
     fn div(&self, n: u64) -> u64 {
+        // Fast path for powers of 2: just shift
+        if self.reciprocal == 0 {
+            return n >> self.shift;
+        }
+
         // n / d ≈ (n * recip) >> (64 + shift)
         let wide = n as u128 * self.reciprocal as u128;
         let approx = (wide >> (64 + self.shift)) as u64;
@@ -1118,9 +1129,6 @@ mod tests {
     #[test]
     fn test_fast_divisor_correctness() {
         // Test various divisors to ensure reciprocal multiplication matches native division.
-        // Note: FastDivisor is optimized for keyspace division where divisor is always
-        // the total subtree size (typically 1 to ~100,000). Very small divisors (1-3)
-        // may overflow the reciprocal calculation.
         let test_cases: &[(u64, u64)] = &[
             // (numerator, divisor)
             (100, 7),
@@ -1133,6 +1141,33 @@ mod tests {
             (0, 5),
             (5, 5),
             (4, 5),
+            // Powers of 2 - small (use shift fast path)
+            (100, 1),
+            (100, 2),
+            (100, 4),
+            (100, 8),
+            (100, 16),
+            (u32::MAX as u64, 1),
+            (u32::MAX as u64, 2),
+            (u32::MAX as u64, 4),
+            // Powers of 2 - large
+            (u64::MAX, 1),
+            (u64::MAX, 2),
+            (u64::MAX, 64),
+            (u64::MAX, 1 << 32),
+            (u64::MAX, 1 << 62),
+            // Near power-of-2 boundaries (stress detection)
+            (1_000_000, 63),
+            (1_000_000, 65),
+            (1_000_000, 255),
+            (1_000_000, 257),
+            // u64::MAX with small non-power-of-2 divisors
+            (u64::MAX, 3),
+            (u64::MAX, 5),
+            (u64::MAX, 7),
+            // Maximum divisor cases
+            (u64::MAX, u64::MAX),
+            (u64::MAX - 1, u64::MAX),
             // Realistic keyspace cases
             (u32::MAX as u64, 100),    // Full range / 100 nodes
             (u32::MAX as u64, 10000),  // Full range / 10k nodes
