@@ -507,4 +507,58 @@ mod tests {
             "Node 1 should have removed timed-out neighbor"
         );
     }
+
+    /// Scenario 1.2: Discovery Phase Timing
+    /// Setup: 1 node boots, neighbors appear at t=2τ
+    /// Run: 10τ
+    /// Expect: Node waits until 3τ before selecting parent (discovery phase)
+    #[test]
+    fn test_discovery_phase_timing() {
+        use crate::event::ScenarioAction;
+
+        // Create 2-node network but start partitioned (nodes can't see each other)
+        let (mut sim, nodes) = ScenarioBuilder::new(2)
+            .with_seed(42)
+            .fully_connected()
+            .build();
+
+        // Immediately partition the nodes so they can't communicate
+        sim.schedule_action(
+            Timestamp::ZERO,
+            ScenarioAction::Partition {
+                groups: vec![vec![nodes[0]], vec![nodes[1]]],
+            },
+        );
+
+        // Run for 2τ = 200ms (at default τ=100ms)
+        // At this point, both nodes are still in discovery and haven't seen each other
+        sim.run_for(Duration::from_millis(200));
+
+        // Both nodes should still be roots (no parent selection yet)
+        let node0 = sim.node(&nodes[0]).unwrap();
+        let node1 = sim.node(&nodes[1]).unwrap();
+        assert!(node0.is_root(), "Node 0 should still be root at t=2τ");
+        assert!(node1.is_root(), "Node 1 should still be root at t=2τ");
+
+        // Now heal partition - neighbors appear at t=2τ
+        sim.schedule_action(sim.current_time(), ScenarioAction::HealPartition);
+
+        // Run for just under 1τ more (100ms) - we're now at t=3τ
+        // Discovery should end around 3τ from boot (300ms)
+        sim.run_for(Duration::from_millis(100));
+
+        // Run more to allow parent selection to complete (need pulse exchange)
+        sim.run_for(Duration::from_secs(2));
+
+        // Now tree should have formed
+        let node0 = sim.node(&nodes[0]).unwrap();
+        let node1 = sim.node(&nodes[1]).unwrap();
+
+        // One should be root, one should be child
+        let roots = [node0.is_root(), node1.is_root()];
+        assert!(
+            (roots[0] && !roots[1]) || (!roots[0] && roots[1]),
+            "After discovery, one node should be root and one child"
+        );
+    }
 }

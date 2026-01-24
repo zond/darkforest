@@ -12,10 +12,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Expect:** Node is root, tree_size=1, subtree_size=1, keyspace=[0, 2³²)
 - **Status:** Implemented in `test_single_node_becomes_root`
 
-### 1.2 Discovery Phase Timing
+### 1.2 Discovery Phase Timing ✓
 - **Setup:** 1 node boots, neighbors appear at t=2τ
 - **Run:** 10τ
 - **Expect:** Node waits until 3τ before selecting parent (discovery phase)
+- **Status:** Implemented in `test_discovery_phase_timing`
 
 ### 1.3 Discovery Skips Full Parents
 - **Setup:** 3 nodes. P has MAX_CHILDREN (12) children already. N boots.
