@@ -7,7 +7,7 @@ use crate::time::{Duration, Timestamp};
 
 // Memory bounds (kept as soft limits for validation)
 pub const MAX_TREE_DEPTH: usize = 127; // TTL 255 / 2 for round-trip
-pub const MAX_CHILDREN: usize = 16; // 4-bit nibble encoding limit
+pub const MAX_CHILDREN: usize = 12; // Guarantees worst-case Pulse fits in 252 bytes
 pub const MAX_NEIGHBORS: usize = 128;
 pub const MAX_PUBKEY_CACHE: usize = 128;
 pub const MAX_LOCATION_STORE: usize = 256;
@@ -62,14 +62,11 @@ pub type PublicKey = [u8; 32];
 /// 32-byte Ed25519 secret key (seed).
 pub type SecretKey = [u8; 32];
 
-/// Tree address type - path from root to node.
-pub type TreeAddr = Vec<u8>;
+/// 4-byte truncated hash for child identification and verification.
+pub type ChildHash = [u8; 4];
 
-/// Child prefix type for pulse messages.
-pub type ChildPrefix = Vec<u8>;
-
-/// Children list in pulse messages.
-pub type ChildrenList = Vec<(ChildPrefix, u32)>;
+/// Children list in pulse messages: (4-byte hash, subtree_size).
+pub type ChildrenList = Vec<(ChildHash, u32)>;
 
 /// Payload type for routed messages.
 pub type Payload = Vec<u8>;
@@ -104,64 +101,132 @@ impl fmt::Debug for Signature {
     }
 }
 
+// Pulse flags byte layout:
+// - bit 0: has_parent
+// - bit 1: need_pubkey
+// - bit 2: has_pubkey
+// - bits 3-7: child_count (0-12, max MAX_CHILDREN)
+pub const PULSE_FLAG_HAS_PARENT: u8 = 0x01;
+pub const PULSE_FLAG_NEED_PUBKEY: u8 = 0x02;
+pub const PULSE_FLAG_HAS_PUBKEY: u8 = 0x04;
+pub const PULSE_CHILD_COUNT_SHIFT: u8 = 3;
+
 /// Periodic broadcast message for tree maintenance.
+///
+/// Uses keyspace-based addressing where each node owns a range [keyspace_lo, keyspace_hi).
 #[derive(Clone, Debug)]
 pub struct Pulse {
     /// Node's unique identifier.
     pub node_id: NodeId,
-    /// Parent's node ID (None if root).
-    pub parent_id: Option<NodeId>,
-    /// Root of the tree this node belongs to.
-    pub root_id: NodeId,
+    /// Packed flags byte (has_parent, need_pubkey, has_pubkey, child_count).
+    pub flags: u8,
+    /// Truncated hash of parent (None if root).
+    pub parent_hash: Option<ChildHash>,
+    /// Truncated hash of root node.
+    pub root_hash: ChildHash,
     /// Size of subtree rooted at this node.
     pub subtree_size: u32,
     /// Total size of the tree.
     pub tree_size: u32,
-    /// Path from root to this node.
-    pub tree_addr: TreeAddr,
-    /// Whether this node needs public keys from neighbors.
-    pub need_pubkey: bool,
+    /// Start of owned keyspace range.
+    pub keyspace_lo: u32,
+    /// End of owned keyspace range (exclusive).
+    pub keyspace_hi: u32,
     /// Optional public key (included when neighbors need it).
     pub pubkey: Option<PublicKey>,
-    /// Prefix length for children identification.
-    pub child_prefix_len: u8,
-    /// List of (prefix, subtree_size) for each child.
+    /// List of (4-byte hash, subtree_size) for each child, sorted by hash.
     pub children: ChildrenList,
     /// Ed25519 signature over all fields.
     pub signature: Signature,
+}
+
+impl Pulse {
+    /// Check if this pulse indicates the node has a parent.
+    pub fn has_parent(&self) -> bool {
+        self.flags & PULSE_FLAG_HAS_PARENT != 0
+    }
+
+    /// Check if this node needs public keys from neighbors.
+    pub fn need_pubkey(&self) -> bool {
+        self.flags & PULSE_FLAG_NEED_PUBKEY != 0
+    }
+
+    /// Check if this pulse includes a public key.
+    pub fn has_pubkey(&self) -> bool {
+        self.flags & PULSE_FLAG_HAS_PUBKEY != 0
+    }
+
+    /// Get the child count from flags.
+    pub fn child_count(&self) -> u8 {
+        self.flags >> PULSE_CHILD_COUNT_SHIFT
+    }
+
+    /// Build flags byte from components.
+    pub fn build_flags(
+        has_parent: bool,
+        need_pubkey: bool,
+        has_pubkey: bool,
+        child_count: u8,
+    ) -> u8 {
+        let mut flags = 0u8;
+        if has_parent {
+            flags |= PULSE_FLAG_HAS_PARENT;
+        }
+        if need_pubkey {
+            flags |= PULSE_FLAG_NEED_PUBKEY;
+        }
+        if has_pubkey {
+            flags |= PULSE_FLAG_HAS_PUBKEY;
+        }
+        flags |= (child_count.min(16)) << PULSE_CHILD_COUNT_SHIFT;
+        flags
+    }
 }
 
 impl Default for Pulse {
     fn default() -> Self {
         Self {
             node_id: [0u8; 16],
-            parent_id: None,
-            root_id: [0u8; 16],
+            flags: 0,
+            parent_hash: None,
+            root_hash: [0u8; 4],
             subtree_size: 1,
             tree_size: 1,
-            tree_addr: Vec::new(),
-            need_pubkey: false,
+            keyspace_lo: 0,
+            keyspace_hi: u32::MAX,
             pubkey: None,
-            child_prefix_len: 0,
             children: Vec::new(),
             signature: Signature::default(),
         }
     }
 }
 
-/// Unicast routed message.
+// Routed flags_and_type byte layout:
+// - bits 0-3: msg_type (0-15)
+// - bit 4: has_dest_hash
+// - bit 5: has_src_addr
+// - bit 6: has_src_pubkey
+// - bit 7: reserved
+pub const ROUTED_MSG_TYPE_MASK: u8 = 0x0F;
+pub const ROUTED_FLAG_HAS_DEST_HASH: u8 = 0x10;
+pub const ROUTED_FLAG_HAS_SRC_ADDR: u8 = 0x20;
+pub const ROUTED_FLAG_HAS_SRC_PUBKEY: u8 = 0x40;
+
+/// Unicast routed message using keyspace addressing.
 #[derive(Clone, Debug)]
 pub struct Routed {
-    /// Destination tree address.
-    pub dest_addr: TreeAddr,
-    /// Specific destination node ID (None for keyspace routing).
-    pub dest_node_id: Option<NodeId>,
-    /// Source tree address (for replies, optional for one-way messages like PUBLISH).
-    pub src_addr: Option<TreeAddr>,
+    /// Combined flags and message type byte.
+    pub flags_and_type: u8,
+    /// Destination keyspace address (u32).
+    pub dest_addr: u32,
+    /// Optional 4-byte hash of recipient for verification.
+    pub dest_hash: Option<ChildHash>,
+    /// Optional source keyspace address (for replies).
+    pub src_addr: Option<u32>,
     /// Source node identifier.
     pub src_node_id: NodeId,
-    /// Message type (PUBLISH, LOOKUP, FOUND, DATA).
-    pub msg_type: u8,
+    /// Optional source public key.
+    pub src_pubkey: Option<PublicKey>,
     /// Time-to-live hop counter.
     pub ttl: u8,
     /// Type-specific payload.
@@ -170,14 +235,57 @@ pub struct Routed {
     pub signature: Signature,
 }
 
+impl Routed {
+    /// Get the message type.
+    pub fn msg_type(&self) -> u8 {
+        self.flags_and_type & ROUTED_MSG_TYPE_MASK
+    }
+
+    /// Check if dest_hash is present.
+    pub fn has_dest_hash(&self) -> bool {
+        self.flags_and_type & ROUTED_FLAG_HAS_DEST_HASH != 0
+    }
+
+    /// Check if src_addr is present.
+    pub fn has_src_addr(&self) -> bool {
+        self.flags_and_type & ROUTED_FLAG_HAS_SRC_ADDR != 0
+    }
+
+    /// Check if src_pubkey is present.
+    pub fn has_src_pubkey(&self) -> bool {
+        self.flags_and_type & ROUTED_FLAG_HAS_SRC_PUBKEY != 0
+    }
+
+    /// Build flags_and_type byte from components.
+    pub fn build_flags_and_type(
+        msg_type: u8,
+        has_dest_hash: bool,
+        has_src_addr: bool,
+        has_src_pubkey: bool,
+    ) -> u8 {
+        let mut flags = msg_type & ROUTED_MSG_TYPE_MASK;
+        if has_dest_hash {
+            flags |= ROUTED_FLAG_HAS_DEST_HASH;
+        }
+        if has_src_addr {
+            flags |= ROUTED_FLAG_HAS_SRC_ADDR;
+        }
+        if has_src_pubkey {
+            flags |= ROUTED_FLAG_HAS_SRC_PUBKEY;
+        }
+        flags
+    }
+}
+
 impl Default for Routed {
     fn default() -> Self {
         Self {
-            dest_addr: Vec::new(),
-            dest_node_id: None,
+            flags_and_type: 0,
+            dest_addr: 0,
+            dest_hash: None,
             src_addr: None,
             src_node_id: [0u8; 16],
-            msg_type: 0,
+            src_pubkey: None,
             ttl: DEFAULT_TTL,
             payload: Vec::new(),
             signature: Signature::default(),
@@ -190,11 +298,15 @@ impl Default for Routed {
 pub struct LocationEntry {
     /// Node whose location this is.
     pub node_id: NodeId,
-    /// Current tree address.
-    pub tree_addr: TreeAddr,
-    /// Sequence number for replay protection (varint encoded on wire).
+    /// Node's public key.
+    pub pubkey: PublicKey,
+    /// Keyspace address (center of node's keyspace range).
+    pub keyspace_addr: u32,
+    /// Sequence number for replay protection.
     pub seq: u32,
-    /// Signature over "LOC:" || node_id || tree_addr || seq.
+    /// Replica index (0, 1, or 2).
+    pub replica_index: u8,
+    /// Signature over "LOC:" || node_id || keyspace_addr || seq.
     pub signature: Signature,
     /// Local timestamp when entry was received (for expiry).
     pub received_at: Timestamp,
@@ -246,14 +358,11 @@ impl TransportMetrics {
 #[derive(Clone, Debug)]
 pub enum Event {
     /// Lookup completed successfully.
-    LookupComplete {
-        node_id: NodeId,
-        tree_addr: TreeAddr,
-    },
+    LookupComplete { node_id: NodeId, keyspace_addr: u32 },
     /// Lookup failed (all replicas exhausted).
     LookupFailed { node_id: NodeId },
     /// Tree structure changed.
-    TreeChanged { new_root: NodeId, new_size: u32 },
+    TreeChanged { new_root: ChildHash, new_size: u32 },
 }
 
 /// Error type for node operations.

@@ -1,9 +1,8 @@
-//! Routing algorithm and keyspace calculations.
+//! Message routing based on keyspace addressing.
 //!
-//! This module handles:
-//! - Tree address routing (up to ancestor, down to destination)
-//! - Keyspace calculations for DHT storage
-//! - Shortcut optimization
+//! Routing uses keyspace ranges where each node owns a contiguous range
+//! [keyspace_lo, keyspace_hi). Messages route toward dest_addr by forwarding
+//! to the neighbor whose range contains the destination with the tightest fit.
 
 use alloc::vec::Vec;
 
@@ -11,19 +10,10 @@ use crate::node::Node;
 use crate::time::Timestamp;
 use crate::traits::{Clock, Crypto, Random, Transport};
 use crate::types::{
-    Error, NodeId, Routed, Signature, TreeAddr, DEFAULT_TTL, MSG_DATA, MSG_FOUND, MSG_LOOKUP,
+    ChildHash, Error, NodeId, Routed, Signature, DEFAULT_TTL, MSG_DATA, MSG_FOUND, MSG_LOOKUP,
     MSG_PUBLISH,
 };
-use crate::wire::{routed_sign_data, Encode, Message};
-
-/// Calculate the length of the common prefix between two tree addresses.
-///
-/// Used for shortcut routing: a shortcut is useful if its common_prefix_len
-/// with the destination is greater than our own.
-#[inline]
-fn common_prefix_len(a: &TreeAddr, b: &TreeAddr) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-}
+use crate::wire::{routed_sign_data, Encode};
 
 impl<T, Cr, R, Clk> Node<T, Cr, R, Clk>
 where
@@ -32,186 +22,246 @@ where
     R: Random,
     Clk: Clock,
 {
-    /// Handle a received Routed message.
+    /// Handle an incoming Routed message.
     pub(crate) fn handle_routed(&mut self, mut msg: Routed, now: Timestamp) {
-        // TTL check - prevent routing loops
+        // Check TTL
         if msg.ttl == 0 {
-            return; // Drop message
-        }
-        msg.ttl -= 1;
-
-        // Am I the destination?
-        if msg.dest_addr == *self.tree_addr() {
-            match msg.dest_node_id {
-                Some(id) if id != *self.node_id() => {
-                    // Stale address - node moved, drop
-                    return;
-                }
-                _ => {
-                    self.handle_locally(msg, now);
-                    return;
-                }
-            }
-        }
-
-        // Destination in my subtree → route down
-        if msg.dest_addr.starts_with(self.tree_addr()) {
-            let next_ordinal = msg.dest_addr[self.tree_addr().len()];
-            self.send_to_child_by_ordinal(next_ordinal, msg);
             return;
         }
 
-        // Destination elsewhere → route up (or via shortcut)
-        self.route_up_or_shortcut(msg);
+        // Decrement TTL for forwarding
+        msg.ttl = msg.ttl.saturating_sub(1);
+
+        let dest = msg.dest_addr;
+        let msg_type = msg.msg_type();
+
+        // Do I own this keyspace location?
+        if self.owns_key(dest) {
+            // Handle locally based on message type
+            match msg_type {
+                MSG_PUBLISH => self.handle_publish(msg, now),
+                MSG_LOOKUP => self.handle_lookup_msg(msg, now),
+                MSG_FOUND => self.handle_found(msg, now),
+                MSG_DATA => self.handle_data(msg, now),
+                _ => {} // Unknown type, drop silently
+            }
+            return;
+        }
+
+        // Not for us - verify signature before forwarding to prevent bandwidth waste
+        if self.verify_routed_signature(&msg).is_none() {
+            // Can't verify signature (no pubkey or invalid) - drop
+            return;
+        }
+
+        // Signature valid, forward
+        self.forward_routed(msg);
     }
 
-    /// Handle a message that has reached its destination.
-    fn handle_locally(&mut self, msg: Routed, now: Timestamp) {
-        // SECURITY: Require verified pubkey for signature verification
-        let pubkey = match self.pubkey_cache().get(&msg.src_node_id) {
-            Some(pk) => *pk,
+    /// Verify a Routed message signature.
+    /// Returns the verified pubkey if valid, None otherwise.
+    pub(crate) fn verify_routed_signature(
+        &mut self,
+        msg: &Routed,
+    ) -> Option<crate::types::PublicKey> {
+        // Get pubkey from message or cache
+        let pubkey = match msg.src_pubkey {
+            Some(pk) => {
+                // Verify pubkey binds to src_node_id
+                if !self.crypto().verify_pubkey_binding(&msg.src_node_id, &pk) {
+                    return None;
+                }
+                // Cache for future use
+                self.insert_pubkey_cache(msg.src_node_id, pk);
+                pk
+            }
             None => {
-                // Can't verify without pubkey - mark that we need it
-                self.need_pubkey_mut().insert(msg.src_node_id);
-                return;
+                // Check cache
+                match self.pubkey_cache().get(&msg.src_node_id) {
+                    Some(&pk) => pk,
+                    None => {
+                        // No pubkey available - mark that we need it
+                        self.need_pubkey_mut().insert(msg.src_node_id);
+                        return None;
+                    }
+                }
             }
         };
 
         // Verify signature
-        let sign_data = routed_sign_data(&msg);
-        if !self
+        let sign_data = routed_sign_data(msg);
+        if self
             .crypto()
             .verify(&pubkey, sign_data.as_slice(), &msg.signature)
         {
-            return; // Invalid signature
-        }
-
-        match msg.msg_type {
-            MSG_PUBLISH => self.handle_publish(msg, now),
-            MSG_LOOKUP => self.handle_lookup_msg(msg, now),
-            MSG_FOUND => self.handle_found(msg, now),
-            MSG_DATA => self.handle_data(msg),
-            _ => {} // Unknown message type, ignore
+            Some(pubkey)
+        } else {
+            None
         }
     }
 
-    /// Send to a child by ordinal index.
-    fn send_to_child_by_ordinal(&mut self, ordinal: u8, msg: Routed) {
-        // IMPORTANT: Ordinals are assigned based on prefix-sorted order (see build_pulse)
-        let prefix_len = self.child_prefix_len();
-        if prefix_len == 0 {
-            return; // No children or invalid state
+    /// Verify that dest_hash matches our node_id hash.
+    /// Returns false if dest_hash is present but doesn't match.
+    pub(crate) fn verify_dest_hash(&self, msg: &Routed) -> bool {
+        match msg.dest_hash {
+            Some(dest_hash) => dest_hash == self.compute_node_hash(self.node_id()),
+            None => true, // No dest_hash to verify
         }
-
-        // Build sorted prefixes matching build_pulse order
-        let mut prefixes: Vec<Vec<u8>> = self
-            .children()
-            .keys()
-            .map(|id| id[..prefix_len as usize].to_vec())
-            .collect();
-        prefixes.sort();
-
-        // Forward if ordinal is valid (broadcast, child will pick it up based on tree_addr)
-        if (ordinal as usize) < prefixes.len() {
-            let _ = self.send_routed(msg);
-        }
-        // If ordinal out of range, message is dropped (stale routing info)
     }
 
-    /// Route up to parent or via shortcut.
-    ///
-    /// Uses shortcut S instead of normal tree path if:
-    /// `common_prefix_len(S.tree_addr, dest_addr) > common_prefix_len(my_addr, dest_addr)`
-    ///
-    /// In other words: use the shortcut if it's "closer" to the destination's branch.
-    fn route_up_or_shortcut(&mut self, msg: Routed) {
-        let dest_addr = &msg.dest_addr;
-        let my_addr = self.tree_addr();
-        let my_prefix_len = common_prefix_len(my_addr, dest_addr);
+    /// Forward a routed message toward its destination.
+    fn forward_routed(&mut self, msg: Routed) {
+        let dest = msg.dest_addr;
 
-        // Find the best shortcut (one with longest common prefix with dest_addr)
-        let mut best_shortcut: Option<[u8; 16]> = None;
-        let mut best_prefix_len = my_prefix_len;
+        // Try to find best next hop
+        if let Some(next_hop) = self.best_next_hop(dest) {
+            self.send_to_neighbor(next_hop, msg);
+        } else if let Some(parent) = self.parent() {
+            // Forward upward to parent as fallback
+            self.send_to_neighbor(parent, msg);
+        }
+        // If no route, drop the message
+    }
 
-        for shortcut_id in self.shortcuts().iter() {
-            if let Some(timing) = self.neighbor_times().get(shortcut_id) {
-                let shortcut_prefix_len = common_prefix_len(&timing.tree_addr, dest_addr);
-                if shortcut_prefix_len > best_prefix_len {
-                    best_shortcut = Some(*shortcut_id);
-                    best_prefix_len = shortcut_prefix_len;
+    /// Find the best next hop for a destination keyspace address.
+    ///
+    /// Returns the neighbor (child or shortcut) whose keyspace range:
+    /// 1. Contains the destination address
+    /// 2. Has the tightest range (smallest hi - lo)
+    fn best_next_hop(&self, dest: u32) -> Option<NodeId> {
+        let mut best: Option<(NodeId, u64)> = None; // (node_id, range_size)
+
+        // Check children
+        for (child_id, &(lo, hi)) in self.child_ranges() {
+            if dest >= lo && dest < hi {
+                let range_size = (hi as u64).saturating_sub(lo as u64);
+                if best.map_or(true, |(_, best_size)| range_size < best_size) {
+                    best = Some((*child_id, range_size));
                 }
             }
         }
 
-        // Note: Both cases call send_routed() which broadcasts the message.
-        // The shortcut (or parent) will hear the broadcast and forward it based
-        // on their own routing logic. We don't explicitly address the shortcut.
-        if best_shortcut.is_some() || self.parent().is_some() {
-            let _ = self.send_routed(msg);
+        // Check shortcuts
+        for (shortcut_id, &(lo, hi)) in self.shortcuts() {
+            if dest >= lo && dest < hi {
+                let range_size = (hi as u64).saturating_sub(lo as u64);
+                if best.map_or(true, |(_, best_size)| range_size < best_size) {
+                    best = Some((*shortcut_id, range_size));
+                }
+            }
         }
-        // If we're root and no shortcut helps, drop (destination unreachable)
+
+        best.map(|(node_id, _)| node_id)
     }
 
-    /// Handle received DATA message.
-    fn handle_data(&mut self, msg: Routed) {
-        // Push to application incoming channel
+    /// Send a Routed message to a specific neighbor.
+    fn send_to_neighbor(&mut self, _neighbor: NodeId, msg: Routed) {
+        let encoded = crate::wire::Message::Routed(msg).encode_to_vec();
+
+        if encoded.len() > self.transport().mtu() {
+            self.record_protocol_dropped();
+            return;
+        }
+
+        // Broadcast on protocol channel (neighbors will hear it)
+        let result = self.transport().protocol_outgoing().try_send(encoded);
+
+        if result.is_ok() {
+            self.record_protocol_sent();
+        } else {
+            self.record_protocol_dropped();
+        }
+    }
+
+    /// Handle incoming DATA message.
+    fn handle_data(&mut self, msg: Routed, _now: Timestamp) {
+        if !self.verify_dest_hash(&msg) {
+            return; // Stale address - not the intended recipient
+        }
+
+        // Check if we can verify the signature
+        // DATA messages queue for retry when pubkey is missing (unlike other message types)
+        let needs_pubkey =
+            msg.src_pubkey.is_none() && !self.pubkey_cache().contains_key(&msg.src_node_id);
+
+        if self.verify_routed_signature(&msg).is_none() {
+            if needs_pubkey {
+                // Queue message to retry when pubkey arrives
+                self.queue_pending_pubkey(msg.src_node_id, msg);
+            }
+            return;
+        }
+
+        // Deliver to application
         self.push_incoming_data(msg.src_node_id, msg.payload);
     }
 
-    /// Send data to a specific node at a known tree address.
+    /// Send DATA to a known destination.
     pub(crate) fn send_data_to(
         &mut self,
         target: NodeId,
-        addr: TreeAddr,
-        data: Vec<u8>,
+        dest_addr: u32,
+        payload: Vec<u8>,
         _now: Timestamp,
     ) -> Result<(), Error> {
-        let msg = self.build_routed(addr, Some(target), MSG_DATA, data);
+        let dest_hash = self.compute_node_hash(&target);
+
+        let msg = self.build_routed(dest_addr, Some(dest_hash), MSG_DATA, payload);
         self.send_routed(msg)
     }
 
-    /// Build a signed Routed message with src_addr included (for messages expecting replies).
+    /// Build a Routed message with optional dest_hash for verification.
     pub(crate) fn build_routed(
-        &self,
-        dest_addr: TreeAddr,
-        dest_node_id: Option<NodeId>,
+        &mut self,
+        dest_addr: u32,
+        dest_hash: Option<ChildHash>,
         msg_type: u8,
         payload: Vec<u8>,
     ) -> Routed {
-        self.build_routed_inner(dest_addr, dest_node_id, msg_type, payload, true)
+        self.build_routed_inner(dest_addr, dest_hash, msg_type, payload, false)
     }
 
-    /// Build a signed Routed message without src_addr (for one-way messages like PUBLISH).
+    /// Build a Routed message without dest_hash, always including pubkey (for PUBLISH).
+    /// PUBLISH messages go to potentially distant storage nodes that need our pubkey.
     pub(crate) fn build_routed_no_reply(
-        &self,
-        dest_addr: TreeAddr,
+        &mut self,
+        dest_addr: u32,
         msg_type: u8,
         payload: Vec<u8>,
     ) -> Routed {
-        self.build_routed_inner(dest_addr, None, msg_type, payload, false)
+        // Always include pubkey for PUBLISH - storage nodes likely don't have it cached
+        self.build_routed_inner(dest_addr, None, msg_type, payload, true)
     }
 
-    /// Internal helper for building signed Routed messages.
+    /// Internal helper to build Routed messages.
     fn build_routed_inner(
-        &self,
-        dest_addr: TreeAddr,
-        dest_node_id: Option<NodeId>,
+        &mut self,
+        dest_addr: u32,
+        dest_hash: Option<ChildHash>,
         msg_type: u8,
         payload: Vec<u8>,
-        include_src_addr: bool,
+        force_pubkey: bool,
     ) -> Routed {
-        let src_addr = if include_src_addr {
-            Some(self.tree_addr().clone())
-        } else {
-            None
-        };
+        let include_pubkey = force_pubkey || !self.neighbors_need_pubkey().is_empty();
+
+        let flags_and_type = Routed::build_flags_and_type(
+            msg_type,
+            dest_hash.is_some(),
+            true, // always include src_addr for replies
+            include_pubkey,
+        );
 
         let mut msg = Routed {
+            flags_and_type,
             dest_addr,
-            dest_node_id,
-            src_addr,
+            dest_hash,
+            src_addr: Some(self.my_address()),
             src_node_id: *self.node_id(),
-            msg_type,
+            src_pubkey: if include_pubkey {
+                Some(*self.pubkey())
+            } else {
+                None
+            },
             ttl: DEFAULT_TTL,
             payload,
             signature: Signature::default(),
@@ -223,124 +273,200 @@ where
         msg
     }
 
-    /// Calculate tree address for a keyspace key.
-    ///
-    /// Walks down from root, narrowing range at each level based on
-    /// child ordinal and subtree sizes.
-    pub fn addr_for_key(&self, key: u32) -> TreeAddr {
-        // Start at root with full keyspace [0, 2^32)
-        let mut addr = Vec::new();
-        let mut range_start: u64 = 0;
-        let mut range_size: u64 = 1u64 << 32;
+    /// Send a Routed message.
+    pub(crate) fn send_routed(&mut self, msg: Routed) -> Result<(), Error> {
+        let dest = msg.dest_addr;
+        let msg_type = msg.msg_type();
 
-        // Walk down the tree
-        let mut current_addr = Vec::new();
-
-        loop {
-            // Find children info for current position
-            // If we're at our own position, use our children
-            if current_addr == *self.tree_addr() {
-                if self.children().is_empty() {
-                    // We're a leaf at this address
-                    break;
-                }
-
-                // Divide range among children based on subtree sizes
-                let total_subtree: u64 = self.children().values().map(|&s| s as u64).sum();
-                if total_subtree == 0 {
-                    break;
-                }
-
-                // Sort children by prefix to match ordinal assignment (see build_pulse)
-                let prefix_len = self.child_prefix_len();
-                let mut sorted_children: Vec<(Vec<u8>, u32)> = self
-                    .children()
-                    .iter()
-                    .map(|(k, &v)| (k[..prefix_len as usize].to_vec(), v))
-                    .collect();
-                sorted_children.sort_by(|a, b| a.0.cmp(&b.0));
-
-                let key_u64 = key as u64;
-                let mut child_start = range_start;
-
-                for (idx, (_, child_subtree)) in sorted_children.iter().enumerate() {
-                    // Use u128 to avoid overflow: range_size * child_subtree can exceed u64
-                    let child_range = ((range_size as u128) * (*child_subtree as u128)
-                        / (total_subtree as u128)) as u64;
-                    let child_end = child_start + child_range;
-
-                    if key_u64 >= child_start && key_u64 < child_end {
-                        addr.push(idx as u8);
-                        current_addr.push(idx as u8);
-                        range_start = child_start;
-                        range_size = child_range;
-                        break;
-                    }
-                    child_start = child_end;
-                }
-
-                // If we didn't find a child (shouldn't happen), break
-                if addr.len() == current_addr.len() - 1 {
-                    break;
-                }
-            } else {
-                // We don't have visibility into other subtrees
-                // Return the best address we can compute
-                break;
+        // If we own the destination, handle locally
+        if self.owns_key(dest) {
+            let encoded = crate::wire::Message::Routed(msg.clone()).encode_to_vec();
+            if encoded.len() > self.transport().mtu() {
+                return Err(Error::MessageTooLarge);
             }
+            // Handle locally as if we received it
+            let now = self.now();
+            match msg_type {
+                MSG_PUBLISH => self.handle_publish(msg, now),
+                MSG_LOOKUP => self.handle_lookup_msg(msg, now),
+                MSG_FOUND => self.handle_found(msg, now),
+                MSG_DATA => self.handle_data(msg, now),
+                _ => {}
+            }
+            return Ok(());
         }
 
-        addr
-    }
-
-    /// Hash a node_id with replica index to get a keyspace key.
-    pub fn hash_to_key(&self, node_id: &NodeId, replica: u8) -> u32 {
-        let mut data = Vec::with_capacity(17);
-        data.extend_from_slice(node_id);
-        data.push(replica);
-        let hash = self.crypto().hash(&data);
-        u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]])
-    }
-
-    /// Send a Routed message to the appropriate queue based on msg_type.
-    ///
-    /// Protocol messages (PUBLISH, LOOKUP, FOUND) go to the protocol queue.
-    /// Application data (DATA) goes to the app queue.
-    ///
-    /// If the queue is full, the message is dropped and metrics are updated.
-    /// This is acceptable because the protocol is designed for lossy operation
-    /// (see design.md "Best-effort delivery" section).
-    pub(crate) fn send_routed(&mut self, msg: Routed) -> Result<(), Error> {
-        let is_data = msg.msg_type == MSG_DATA;
-        let encoded = Message::Routed(msg).encode_to_vec();
+        // Encode and send
+        let encoded = crate::wire::Message::Routed(msg).encode_to_vec();
 
         if encoded.len() > self.transport().mtu() {
             return Err(Error::MessageTooLarge);
         }
 
-        let queue = if is_data {
+        // Use app channel for DATA, protocol channel for others
+        let channel = if msg_type == MSG_DATA {
             self.transport().app_outgoing()
         } else {
             self.transport().protocol_outgoing()
         };
 
-        match queue.try_send(encoded) {
-            Ok(()) => {
-                if is_data {
-                    self.record_app_sent();
-                } else {
-                    self.record_protocol_sent();
-                }
-                Ok(())
+        let result = channel.try_send(encoded);
+
+        if result.is_ok() {
+            if msg_type == MSG_DATA {
+                self.record_app_sent();
+            } else {
+                self.record_protocol_sent();
             }
-            Err(_) => {
-                if is_data {
-                    self.record_app_dropped();
+            Ok(())
+        } else {
+            if msg_type == MSG_DATA {
+                self.record_app_dropped();
+            } else {
+                self.record_protocol_dropped();
+            }
+            Err(Error::QueueFull)
+        }
+    }
+
+    /// Handle timeouts for pending lookups and other operations.
+    pub(crate) fn handle_timeouts(&mut self, now: Timestamp) {
+        use crate::types::{Event, K_REPLICAS};
+
+        let timeout = self.lookup_timeout();
+
+        // Collect lookups that need action
+        let mut retry_lookups = Vec::new();
+        let mut failed_lookups = Vec::new();
+
+        for (target, lookup) in self.pending_lookups().iter() {
+            let elapsed = now.saturating_sub(lookup.last_query_at);
+            if elapsed >= timeout {
+                if lookup.replica_index + 1 < K_REPLICAS {
+                    retry_lookups.push((*target, lookup.replica_index + 1));
                 } else {
-                    self.record_protocol_dropped();
+                    failed_lookups.push(*target);
                 }
-                Err(Error::QueueFull)
             }
         }
+
+        // Process retries
+        for (target, next_replica) in retry_lookups {
+            if let Some(lookup) = self.pending_lookups_mut().get_mut(&target) {
+                lookup.replica_index = next_replica;
+                lookup.last_query_at = now;
+            }
+            self.send_lookup(target, next_replica, now);
+        }
+
+        // Process failures
+        for target in failed_lookups {
+            self.pending_lookups_mut().remove(&target);
+            self.pending_data_mut().remove(&target);
+            self.push_event(Event::LookupFailed { node_id: target });
+        }
+    }
+
+    /// Hash a node_id with replica index to get DHT key.
+    pub(crate) fn hash_to_key(&self, node_id: &NodeId, replica: u8) -> [u8; 32] {
+        let mut data = [0u8; 17];
+        data[..16].copy_from_slice(node_id);
+        data[16] = replica;
+        self.crypto().hash(&data)
+    }
+
+    /// Convert a DHT key to a keyspace address.
+    pub(crate) fn addr_for_key(&self, key: [u8; 32]) -> u32 {
+        // Use first 4 bytes of hash as u32 keyspace address
+        u32::from_be_bytes([key[0], key[1], key[2], key[3]])
+    }
+
+    /// Process pending messages that were waiting for a pubkey.
+    pub(crate) fn process_pending_pubkey(
+        &mut self,
+        node_id: &NodeId,
+        pubkey: &crate::types::PublicKey,
+        now: Timestamp,
+    ) {
+        // Cache the pubkey
+        self.insert_pubkey_cache(*node_id, *pubkey);
+
+        // Process pending messages
+        if let Some(pending) = self.take_pending_pubkey(node_id) {
+            for msg in pending {
+                self.handle_routed(msg, now);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
+
+    #[test]
+    fn test_owns_key() {
+        let transport = MockTransport::new();
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+
+        let node = Node::new(transport, crypto, random, clock);
+
+        // Node starts with full keyspace [0, u32::MAX)
+        assert!(node.owns_key(0));
+        assert!(node.owns_key(1000));
+        assert!(node.owns_key(u32::MAX - 1));
+    }
+
+    #[test]
+    fn test_my_address() {
+        let transport = MockTransport::new();
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+
+        let node = Node::new(transport, crypto, random, clock);
+
+        // Full keyspace: center is approximately u32::MAX / 2
+        let addr = node.my_address();
+        // (0/2) + (MAX/2) = MAX/2
+        assert_eq!(addr, u32::MAX / 2);
+    }
+
+    #[test]
+    fn test_hash_to_key() {
+        let transport = MockTransport::new();
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+
+        let node = Node::new(transport, crypto, random, clock);
+
+        let node_id: NodeId = [1u8; 16];
+        let key0 = node.hash_to_key(&node_id, 0);
+        let key1 = node.hash_to_key(&node_id, 1);
+
+        // Different replicas should produce different keys
+        assert_ne!(key0, key1);
+    }
+
+    #[test]
+    fn test_addr_for_key() {
+        let transport = MockTransport::new();
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+
+        let node = Node::new(transport, crypto, random, clock);
+
+        let key = [
+            0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+        ];
+        let addr = node.addr_for_key(key);
+
+        assert_eq!(addr, 0x12345678);
     }
 }

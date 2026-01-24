@@ -2,14 +2,13 @@
 //!
 //! A protocol for building mesh networks over LoRa radios with O(log N) routing.
 //!
-//! This crate is `no_std` compatible. Use the `std` feature (enabled by default)
-//! for std environments, or disable default features for embedded targets.
+//! This crate is `no_std` by default. Enable the `std` feature for std environments.
 //!
 //! # Key Properties
 //!
 //! - Nodes form a spanning tree via periodic broadcasts
-//! - Tree addresses enable efficient routing without flooding
-//! - A distributed hash table maps node IDs to tree addresses
+//! - Keyspace-based routing: each node owns a range [lo, hi) of the 32-bit keyspace
+//! - A distributed hash table maps node IDs to keyspace addresses
 //! - Ed25519 signatures prevent impersonation
 //! - No clock synchronization required
 //!
@@ -66,8 +65,8 @@ pub use node::Node;
 pub use time::{Duration, Timestamp};
 pub use traits::{Clock, Crypto, IncomingData, OutgoingData, Random, Received, Transport};
 pub use types::{
-    Error, Event, LocationEntry, NodeId, Payload, PublicKey, Pulse, Routed, SecretKey, Signature,
-    TreeAddr,
+    ChildHash, Error, Event, LocationEntry, NodeId, Payload, PublicKey, Pulse, Routed, SecretKey,
+    Signature,
 };
 pub use wire::{Decode, DecodeError, Encode, Message};
 
@@ -98,7 +97,8 @@ mod tests {
         assert!(node.is_root());
         assert_eq!(node.tree_size(), 1);
         assert_eq!(node.subtree_size(), 1);
-        assert!(node.tree_addr().is_empty());
+        // Node starts with full keyspace
+        assert_eq!(node.keyspace_range(), (0, u32::MAX));
     }
 
     #[test]
@@ -122,14 +122,14 @@ mod tests {
     fn test_pulse_roundtrip() {
         let pulse = Pulse {
             node_id: [1u8; 16],
-            parent_id: None,
-            root_id: [1u8; 16],
+            flags: Pulse::build_flags(false, false, false, 0),
+            parent_hash: None,
+            root_hash: [1u8, 2, 3, 4],
             subtree_size: 1,
             tree_size: 1,
-            tree_addr: vec![],
-            need_pubkey: false,
+            keyspace_lo: 0,
+            keyspace_hi: u32::MAX,
             pubkey: None,
-            child_prefix_len: 0,
             children: vec![],
             signature: Signature::default(),
         };
@@ -138,8 +138,10 @@ mod tests {
         let decoded = Pulse::decode_from_slice(&encoded).unwrap();
 
         assert_eq!(pulse.node_id, decoded.node_id);
-        assert_eq!(pulse.parent_id, decoded.parent_id);
+        assert_eq!(pulse.parent_hash, decoded.parent_hash);
         assert_eq!(pulse.tree_size, decoded.tree_size);
+        assert_eq!(pulse.keyspace_lo, decoded.keyspace_lo);
+        assert_eq!(pulse.keyspace_hi, decoded.keyspace_hi);
     }
 
     #[test]
@@ -202,7 +204,7 @@ mod tests {
 
     #[test]
     fn test_fraud_detection_triggers() {
-        // Test that fraud detection fires when PUBLISH count is too low
+        // Test that fraud detection fires when unique publisher count is too low
         let transport = MockTransport::new();
         let crypto = MockCrypto::new();
         let random = MockRandom::new();
@@ -211,7 +213,7 @@ mod tests {
         let mut node = Node::new(transport, crypto, random, clock);
 
         // Without join context, fraud detection should not trigger
-        let now = Timestamp::from_secs(7200); // 2 hours
+        let now = Timestamp::from_secs(8 * 3600); // 8 hours
         assert!(!node.check_tree_size_fraud(now));
 
         // Set up join context (required for fraud detection)
@@ -224,17 +226,49 @@ mod tests {
         // Initialize fraud detection: subtree_size=10, starting at t=0
         node.fraud_detection_mut().reset(Timestamp::ZERO, 10);
 
-        // After 2 hours with subtree_size=10:
-        // expected = 3.0 * 10 * (2/8) = 7.5 PUBLISH messages
-        // With 0 observed, z = 7.5 / sqrt(7.5) = 2.74 > 2.33 threshold
+        // After 8 hours with subtree_size=10:
+        // expected = 10 unique publishers
+        // With 0 observed, z = 10 / sqrt(10) = 3.16 > 2.33 threshold
         assert!(node.check_tree_size_fraud(now));
 
-        // Now record enough PUBLISH messages to avoid fraud detection
-        // Need observed close to expected (7.5), let's do 6
-        for _ in 0..6 {
-            node.fraud_detection_mut().on_publish_received();
+        // Now record enough unique PUBLISH messages to avoid fraud detection
+        // Need observed close to expected (10), let's do 8
+        for i in 0..8 {
+            let publisher = [i; 16];
+            node.fraud_detection_mut().on_publish_received(&publisher);
         }
-        // z = (7.5 - 6) / sqrt(7.5) = 0.55 < 2.33
+        // z = (10 - 8) / sqrt(10) = 0.63 < 2.33
         assert!(!node.check_tree_size_fraud(now));
+    }
+
+    #[test]
+    fn test_keyspace_ownership() {
+        let transport = MockTransport::new();
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+
+        let node = Node::new(transport, crypto, random, clock);
+
+        // Node starts with full keyspace [0, u32::MAX)
+        assert!(node.owns_key(0));
+        assert!(node.owns_key(u32::MAX / 2));
+        assert!(node.owns_key(u32::MAX - 1));
+        // Note: hi is exclusive, so MAX itself is not owned
+    }
+
+    #[test]
+    fn test_my_address() {
+        let transport = MockTransport::new();
+        let crypto = MockCrypto::new();
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+
+        let node = Node::new(transport, crypto, random, clock);
+
+        // my_address() should be center of keyspace range
+        // For [0, MAX): center = MAX/2
+        let addr = node.my_address();
+        assert_eq!(addr, u32::MAX / 2);
     }
 }

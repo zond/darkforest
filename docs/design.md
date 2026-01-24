@@ -76,7 +76,9 @@ struct Pulse {
 // Example: 5 children, has parent, includes pubkey → 0b00101_101 = 0x2D
 
 // Keyspace range [keyspace_lo, keyspace_hi): The portion of 32-bit keyspace this node owns.
-// Root owns [0, 2³²). Children compute their range from parent's Pulse (see Keyspace section).
+// Root owns [0, u32::MAX). Since keyspace_hi is u32, the keyspace contains u32::MAX valid
+// addresses (0 through u32::MAX-1). The value u32::MAX itself is not a valid address.
+// Children compute their range from parent's Pulse (see Keyspace section).
 // A node's "address" for routing is the center of its range: (keyspace_lo + keyspace_hi) / 2.
 
 // Signature covers ALL fields (domain-separated):
@@ -1018,7 +1020,9 @@ This part describes how nodes publish and discover each other's keyspace address
 
 ### Keyspace
 
-The keyspace is `[0, 2³²)`. Each node owns a range proportional to its subtree_size. The root owns the entire keyspace and divides it among itself and its children.
+The keyspace is `[0, u32::MAX)`. Since `keyspace_hi` is stored as `u32`, the keyspace contains exactly `u32::MAX` valid addresses (0 through u32::MAX-1). The value `u32::MAX` itself is not a valid address - it serves as the exclusive upper bound.
+
+Each node owns a range proportional to its subtree_size. The root owns the entire keyspace and divides it among itself and its children.
 
 **Keyspace division algorithm:**
 
@@ -1077,26 +1081,27 @@ This address is what gets published to the location directory and used in `dest_
 
 ### Location Entries
 
-The directory stores node locations (`node_id → keyspace_addr`). Each entry is signed by its owner:
+The directory stores node locations (`node_id → keyspace_addr`). Each entry includes a location signature:
 
 ```rust
 struct LocationEntry {
-    node_id: NodeId,            // from src_node_id
-    pubkey: PublicKey,          // from src_pubkey
-    keyspace_addr: u32,         // from src_addr (center of node's keyspace range)
-    seq: u32,                   // from payload
-    replica_index: u8,          // from payload, for rebalancing
-    signature: Signature,       // original Routed signature
+    node_id: NodeId,            // owner's identity
+    pubkey: PublicKey,          // owner's public key
+    keyspace_addr: u32,         // center of owner's keyspace range
+    seq: u32,                   // sequence number for replay protection
+    replica_index: u8,          // 0, 1, or 2 (for rebalancing)
+    signature: Signature,       // location signature (LOC: prefix)
     received_at: Instant,       // local timestamp for expiry
+}
+
+// Location signature covers:
+// "LOC:" || node_id || keyspace_addr || seq
+fn location_sign_data(node_id: &NodeId, keyspace_addr: u32, seq: u32) -> Vec<u8> {
+    encode(b"LOC:", node_id, keyspace_addr, seq)
 }
 ```
 
-For rebalancing, the storage node reconstructs the Routed message:
-- `dest_addr = hash_to_u32(node_id || replica_index)` (the key)
-- `flags_and_type = PUBLISH | HAS_SRC_ADDR`
-- `src_addr = keyspace_addr`
-- `src_node_id`, `src_pubkey`, `signature` from stored entry
-- `payload = encode(replica_index, seq)`
+The location signature uses a separate "LOC:" domain prefix, allowing storage nodes to forward entries during rebalancing without re-signing. The signature proves the owner's claim to the keyspace address.
 
 **Varint encoding:** All varint fields (seq, subtree_size, tree_size) use LEB128 encoding. Implementations MUST use canonical (minimal) encoding: the shortest byte sequence that represents the value. Non-minimal encodings (e.g., `0x80 0x00` for 0 instead of `0x00`) MUST be rejected during decoding to prevent signature ambiguity attacks. Standard libraries like `integer-encoding` or `postcard` handle this correctly.
 
@@ -1130,15 +1135,21 @@ struct Node {
 impl Node {
     fn publish_location(&mut self) {
         self.location_seq += 1;
+        let my_addr = self.my_address();
+
+        // Sign the location claim
+        let loc_sig = sign(b"LOC:", &self.node_id, my_addr, self.location_seq);
 
         for replica in 0..K_REPLICAS {
             let key = hash_to_u32(&[&self.node_id[..], &[replica as u8]].concat());
+            let payload = encode(&self.node_id, &self.pubkey, my_addr,
+                                 self.location_seq, replica as u8, &loc_sig);
             self.send_routed(Routed {
-                flags_and_type: PUBLISH | HAS_SRC_ADDR,  // has_dest_hash=0, has_src_addr=1
-                dest_addr: key,                          // route toward this key
+                flags_and_type: PUBLISH | HAS_SRC_ADDR | HAS_SRC_PUBKEY,
+                dest_addr: key,
                 dest_hash: None,
-                src_addr: Some(self.my_address()),       // our keyspace address (the location)
-                payload: encode(replica as u8, self.location_seq),
+                src_addr: Some(my_addr),
+                payload,
                 ...
             });
         }
@@ -1152,23 +1163,22 @@ impl Node {
 }
 ```
 
-**PUBLISH payload:** `replica_index (1 byte) || seq (varint, 1-5)`
+**PUBLISH payload:** `node_id (16) || pubkey (32) || keyspace_addr (4) || seq (varint) || replica_index (1) || location_signature (65)`
 
-Typical size: 2-6 bytes. The published keyspace address comes from `src_addr` in the Routed header.
+Typical size: 119-123 bytes. The payload is self-contained—storage nodes can verify and forward it without accessing the Routed header.
 
-The owner's identity comes from `src_node_id` in the Routed header, and `src_pubkey` is the owner's public key. The Routed signature authenticates the entire message including `src_addr`.
-
-Storage nodes store: `src_node_id` (owner), `src_pubkey`, `src_addr` (keyspace address), `replica_index`, `seq`, `payload`, and `signature` (for rebalancing).
-
-**Rebalancing:** When keyspace ownership changes (e.g., a new child joins), the storage node reconstructs and re-routes stored PUBLISH messages. The signature remains valid because it covers `dest_addr` (the key), which doesn't change.
+**Rebalancing:** When keyspace ownership changes (e.g., a new child joins), the storage node forwards stored entries to new owners. The location signature remains valid because it doesn't depend on routing path.
 
 **PUBLISH verification order** (storage node receiving a PUBLISH):
-1. Verify `src_node_id == hash(src_pubkey)[..16]` (pubkey bound to node_id)
-2. Verify Routed signature against `src_pubkey`
-3. Parse PUBLISH payload to extract `replica_index`, `seq`
-4. Verify keyspace ownership: `dest_addr` falls in my range
-5. Verify `seq > existing_seq` for this `src_node_id` (replay protection)
-6. Store entry with current timestamp for expiry tracking
+1. Verify Routed signature (defense-in-depth; LOC: signature is critical protection)
+2. Parse PUBLISH payload: `node_id`, `pubkey`, `keyspace_addr`, `seq`, `replica_index`, `location_signature`
+3. Verify keyspace ownership: we own a replica key for `payload.node_id`
+4. Verify `payload.pubkey` binds to `payload.node_id`: `hash(pubkey)[..16] == node_id`
+5. Verify LOC: signature: `verify(pubkey, "LOC:" || node_id || keyspace_addr || seq, signature)`
+6. Verify `seq > existing_seq` for this `node_id` (replay protection)
+7. Store entry with current timestamp for expiry tracking
+
+Note: The Routed `src_node_id` may differ from `payload.node_id` during rebalancing (storage nodes forward entries they no longer own). The LOC: signature is the authoritative proof of the location claim.
 
 ### Lookup (LOOKUP / FOUND)
 
@@ -1218,12 +1228,15 @@ impl Node {
                 return;  // key mismatch, wrong replica
             }
 
+            // Return complete location entry
+            let payload = encode(&entry.node_id, &entry.pubkey, entry.keyspace_addr,
+                                 entry.seq, entry.replica_index, &entry.signature);
             self.send_routed(Routed {
                 flags_and_type: FOUND | HAS_DEST_HASH,
                 dest_addr: msg.src_addr.unwrap(),     // route back to requester
                 dest_hash: Some(hash(&msg.src_node_id)[..4]),
                 src_addr: None,  // no reply expected
-                payload: encode(&entry.pubkey, entry.keyspace_addr, entry.seq),
+                payload,
                 ...
             });
         }
@@ -1231,13 +1244,23 @@ impl Node {
     }
 
     fn handle_found(&mut self, msg: Routed) {
-        let (pubkey, keyspace_addr, seq): (PublicKey, u32, u32) = decode(&msg.payload);
+        let (node_id, pubkey, keyspace_addr, seq, _, signature) = decode(&msg.payload);
 
-        // Find which pending lookup this matches (by pubkey → node_id)
-        let node_id: NodeId = hash(&pubkey)[..16].try_into().unwrap();
         if !self.pending_lookups.contains_key(&node_id) {
             return;  // no matching pending lookup
         }
+
+        // Verify pubkey binds to node_id
+        if hash(&pubkey)[..16] != node_id {
+            return;
+        }
+
+        // Verify location signature
+        let sign_data = encode(b"LOC:", &node_id, keyspace_addr, seq);
+        if !verify(&pubkey, &sign_data, &signature) {
+            return;
+        }
+
         self.pending_lookups.remove(&node_id);
 
         // Cache both location and pubkey
@@ -1251,9 +1274,9 @@ impl Node {
 
 The target is identified by `dest_hash`. The storage node finds an entry matching that hash and verifies the key.
 
-**FOUND payload:** `target_pubkey (32) || keyspace_addr (4) || seq (varint, 1-5)` = 37-41 bytes
+**FOUND payload:** `node_id (16) || pubkey (32) || keyspace_addr (4) || seq (varint) || replica_index (1) || location_signature (65)` = 119-123 bytes
 
-FOUND includes the target's pubkey so the requester can derive the node_id and immediately verify signatures from that node.
+FOUND returns the complete location entry, including the location signature. The requester can verify the location claim and cache both the pubkey and keyspace address.
 
 **Lookup process:**
 1. Send LOOKUP for replica 0
@@ -1581,13 +1604,18 @@ Applications needing stronger guarantees should implement their own ack/retry at
 
 | Type | Value | dest_hash | src_addr | src_pubkey | Payload |
 |------|-------|-----------|----------|------------|---------|
-| PUBLISH | 0 | None | Some | Some | replica_index (1), seq (varint) |
+| PUBLISH | 0 | None | Some | Some | node_id (16), pubkey (32), keyspace_addr (4), seq (varint), replica_index (1), location_sig (65) |
 | LOOKUP | 1 | Some | Some | Some | replica_index (1) |
-| FOUND | 2 | Some | None | None | target_pubkey (32), keyspace_addr (4), seq (varint) |
+| FOUND | 2 | Some | None | None | node_id (16), pubkey (32), keyspace_addr (4), seq (varint), replica_index (1), location_sig (65) |
 | DATA | 3 | Some | 0/1 | 0/1 | application data |
 | ACK | 4 | — | — | — | hash (8 bytes) |
 
-*Routed signature covers all fields except ttl. For PUBLISH, src_node_id is the owner, src_addr is their published location, and src_pubkey enables immediate signature verification. For DATA, src_pubkey can be omitted after initial exchange (receiver has cached pubkey).*
+*Routed signature covers all fields except ttl. PUBLISH/FOUND payloads include a dedicated location signature ("LOC:" prefix) that binds node_id to keyspace_addr. This allows storage nodes to forward entries during rebalancing without re-signing. For DATA, src_pubkey can be omitted after initial exchange (receiver has cached pubkey).*
+
+**Domain separation prefixes:**
+- `"PULSE:"` — Pulse signatures (tree maintenance)
+- `"ROUTE:"` — Routed message signatures (all message types)
+- `"LOC:"` — Location signatures (PUBLISH/FOUND payloads, signs: node_id || keyspace_addr || seq)
 
 ### Bandwidth
 

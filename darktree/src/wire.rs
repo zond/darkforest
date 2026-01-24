@@ -1,22 +1,47 @@
 //! Wire format serialization and deserialization.
 //!
-//! Uses cursor-based encoding with varints for sizes and nibble-packed tree addresses.
+//! Uses cursor-based encoding with varints for sizes and keyspace-based addressing.
 //!
-//! ## Tree Address Wire Format (Nibble-Packed)
+//! ## Pulse Wire Format
 //!
 //! ```text
-//! Wire format: [depth: u8] [nibbles: ceil(depth/2) bytes]
-//! - High nibble first in each byte
-//! - For odd depths, low nibble of last byte MUST be 0
-//! - depth=0 (root) encoded as just 0x00
+//! node_id (16) || flags (1) || [parent_hash (4)] || root_hash (4)
+//! || subtree_size (varint) || tree_size (varint)
+//! || keyspace_lo (4) || keyspace_hi (4)
+//! || [pubkey (32)] || children (N × (hash(4) + subtree_size(varint)))
+//! || signature (65)
 //!
-//! Example: depth 5, path [3,7,2,15,1]
-//!   → 0x05 0x37 0x2F 0x10
+//! Flags byte:
+//! - bit 0: has_parent (determines if parent_hash present)
+//! - bit 1: need_pubkey
+//! - bit 2: has_pubkey (determines if pubkey present)
+//! - bits 3-7: child_count (0-16)
+//!
+//! Children are sorted by hash (lexicographic big-endian).
+//! ```
+//!
+//! ## Routed Wire Format
+//!
+//! ```text
+//! flags_and_type (1) || dest_addr (4) || [dest_hash (4)] || [src_addr (4)]
+//! || src_node_id (16) || [src_pubkey (32)] || ttl (1)
+//! || payload_len (varint) || payload || signature (65)
+//!
+//! flags_and_type byte:
+//! - bits 0-3: msg_type
+//! - bit 4: has_dest_hash
+//! - bit 5: has_src_addr
+//! - bit 6: has_src_pubkey
+//! - bit 7: reserved
 //! ```
 
 use alloc::vec::Vec;
 
-use crate::types::{ChildrenList, LocationEntry, Pulse, Routed, Signature, MAX_TREE_DEPTH};
+use crate::types::{
+    ChildHash, ChildrenList, LocationEntry, Pulse, Routed, Signature, PULSE_CHILD_COUNT_SHIFT,
+    PULSE_FLAG_HAS_PARENT, PULSE_FLAG_HAS_PUBKEY, ROUTED_FLAG_HAS_DEST_HASH,
+    ROUTED_FLAG_HAS_SRC_ADDR, ROUTED_FLAG_HAS_SRC_PUBKEY,
+};
 
 /// Decoding error types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,12 +60,8 @@ pub enum DecodeError {
     InvalidMessageType,
     /// Collection capacity exceeded.
     CapacityExceeded,
-    /// Invalid tree address: depth exceeds MAX_TREE_DEPTH.
-    TreeAddrTooDeep,
-    /// Invalid tree address: odd depth with non-zero padding nibble.
-    TreeAddrInvalidPadding,
-    /// Invalid tree address: nibble value > 15.
-    TreeAddrInvalidNibble,
+    /// Invalid flags.
+    InvalidFlags,
 }
 
 /// Zero-copy reader over a byte slice.
@@ -168,6 +189,14 @@ impl<'a> Reader<'a> {
         Ok(id)
     }
 
+    /// Read a 4-byte hash (ChildHash).
+    pub fn read_child_hash(&mut self) -> Result<ChildHash, DecodeError> {
+        let bytes = self.read_bytes(4)?;
+        let mut hash = [0u8; 4];
+        hash.copy_from_slice(bytes);
+        Ok(hash)
+    }
+
     /// Read a PublicKey (32 bytes).
     pub fn read_pubkey(&mut self) -> Result<[u8; 32], DecodeError> {
         let bytes = self.read_bytes(32)?;
@@ -202,59 +231,6 @@ impl<'a> Reader<'a> {
             Ok(None)
         } else {
             Ok(Some(self.read_pubkey()?))
-        }
-    }
-
-    /// Read a nibble-packed tree address.
-    ///
-    /// Wire format: [depth: u8] [nibbles: ceil(depth/2) bytes]
-    /// - High nibble first in each byte
-    /// - For odd depths, low nibble of last byte MUST be 0
-    /// - Returns Vec<u8> where each element is a nibble (0-15)
-    pub fn read_tree_addr(&mut self) -> Result<Vec<u8>, DecodeError> {
-        let depth = self.read_u8()? as usize;
-
-        if depth > MAX_TREE_DEPTH {
-            return Err(DecodeError::TreeAddrTooDeep);
-        }
-
-        if depth == 0 {
-            return Ok(Vec::new());
-        }
-
-        let num_bytes = depth.div_ceil(2);
-        let packed_bytes = self.read_bytes(num_bytes)?;
-
-        let mut addr = Vec::with_capacity(depth);
-        for (i, &byte) in packed_bytes.iter().enumerate() {
-            let high_nibble = (byte >> 4) & 0x0F;
-            let low_nibble = byte & 0x0F;
-
-            // Always add the high nibble
-            addr.push(high_nibble);
-
-            // Add low nibble if within depth, otherwise verify it's zero padding
-            if i * 2 + 1 < depth {
-                addr.push(low_nibble);
-            } else if low_nibble != 0 {
-                return Err(DecodeError::TreeAddrInvalidPadding);
-            }
-        }
-
-        Ok(addr)
-    }
-
-    /// Read an optional tree address (1 + 0 or nibble-packed addr).
-    ///
-    /// Wire format:
-    /// - None: 0x00 (1 byte)
-    /// - Some(addr): 0x01 [nibble-packed addr]
-    pub fn read_optional_tree_addr(&mut self) -> Result<Option<Vec<u8>>, DecodeError> {
-        let present = self.read_u8()?;
-        if present == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(self.read_tree_addr()?))
         }
     }
 }
@@ -326,6 +302,11 @@ impl Writer {
         self.write_bytes(id);
     }
 
+    /// Write a 4-byte hash (ChildHash).
+    pub fn write_child_hash(&mut self, hash: &ChildHash) {
+        self.write_bytes(hash);
+    }
+
     /// Write a PublicKey (32 bytes).
     pub fn write_pubkey(&mut self, pk: &[u8; 32]) {
         self.write_bytes(pk);
@@ -355,43 +336,6 @@ impl Writer {
             Some(pk) => {
                 self.write_u8(1);
                 self.write_pubkey(pk);
-            }
-        }
-    }
-
-    /// Write a nibble-packed tree address.
-    ///
-    /// Wire format: [depth: u8] [nibbles: ceil(depth/2) bytes]
-    /// - High nibble first in each byte
-    /// - For odd depths, low nibble of last byte is 0
-    pub fn write_tree_addr(&mut self, addr: &[u8]) {
-        let depth = addr.len();
-        self.write_u8(depth as u8);
-
-        if depth == 0 {
-            return;
-        }
-
-        // Pack nibbles into bytes
-        let num_bytes = depth.div_ceil(2);
-        for i in 0..num_bytes {
-            let high_nibble = addr.get(i * 2).copied().unwrap_or(0) & 0x0F;
-            let low_nibble = addr.get(i * 2 + 1).copied().unwrap_or(0) & 0x0F;
-            self.write_u8((high_nibble << 4) | low_nibble);
-        }
-    }
-
-    /// Write an optional tree address (1 + 0 or nibble-packed addr).
-    ///
-    /// Wire format:
-    /// - None: 0x00 (1 byte)
-    /// - Some(addr): 0x01 [nibble-packed addr]
-    pub fn write_optional_tree_addr(&mut self, addr: Option<&[u8]>) {
-        match addr {
-            None => self.write_u8(0),
-            Some(addr) => {
-                self.write_u8(1);
-                self.write_tree_addr(addr);
             }
         }
     }
@@ -446,19 +390,41 @@ pub enum Message {
 impl Encode for Pulse {
     fn encode(&self, w: &mut Writer) {
         w.write_node_id(&self.node_id);
-        w.write_optional_node_id(self.parent_id.as_ref());
-        w.write_node_id(&self.root_id);
+        w.write_u8(self.flags);
+
+        // parent_hash (conditional on has_parent flag)
+        if self.flags & PULSE_FLAG_HAS_PARENT != 0 {
+            if let Some(ref hash) = self.parent_hash {
+                w.write_child_hash(hash);
+            } else {
+                // Flag says has_parent but no hash - write zeros (shouldn't happen)
+                w.write_child_hash(&[0u8; 4]);
+            }
+        }
+
+        w.write_child_hash(&self.root_hash);
         w.write_varint(self.subtree_size);
         w.write_varint(self.tree_size);
-        w.write_tree_addr(&self.tree_addr);
-        w.write_u8(if self.need_pubkey { 1 } else { 0 });
-        w.write_optional_pubkey(self.pubkey.as_ref());
-        w.write_u8(self.child_prefix_len);
-        w.write_varint(self.children.len() as u32);
-        for (prefix, size) in &self.children {
-            w.write_bytes(prefix);
+        w.write_u32_be(self.keyspace_lo);
+        w.write_u32_be(self.keyspace_hi);
+
+        // pubkey (conditional on has_pubkey flag)
+        if self.flags & PULSE_FLAG_HAS_PUBKEY != 0 {
+            if let Some(ref pk) = self.pubkey {
+                w.write_pubkey(pk);
+            } else {
+                // Flag says has_pubkey but no key - write zeros (shouldn't happen)
+                w.write_pubkey(&[0u8; 32]);
+            }
+        }
+
+        // Children: count is in flags, then N × (hash(4) + subtree_size(varint))
+        // Note: children must be sorted by hash
+        for (hash, size) in &self.children {
+            w.write_child_hash(hash);
             w.write_varint(*size);
         }
+
         w.write_signature(&self.signature);
     }
 }
@@ -466,40 +432,55 @@ impl Encode for Pulse {
 impl Decode for Pulse {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let node_id = r.read_node_id()?;
-        let parent_id = r.read_optional_node_id()?;
-        let root_id = r.read_node_id()?;
+        let flags = r.read_u8()?;
+
+        // parent_hash (conditional on has_parent flag)
+        let parent_hash = if flags & PULSE_FLAG_HAS_PARENT != 0 {
+            Some(r.read_child_hash()?)
+        } else {
+            None
+        };
+
+        let root_hash = r.read_child_hash()?;
         let subtree_size = r.read_varint()?;
         let tree_size = r.read_varint()?;
-        let tree_addr = r.read_tree_addr()?;
-        let need_pubkey = r.read_u8()? != 0;
-        let pubkey = r.read_optional_pubkey()?;
-        let child_prefix_len = r.read_u8()?;
-        let children_count = r.read_varint()? as usize;
+        let keyspace_lo = r.read_u32_be()?;
+        let keyspace_hi = r.read_u32_be()?;
+
+        // pubkey (conditional on has_pubkey flag)
+        let pubkey = if flags & PULSE_FLAG_HAS_PUBKEY != 0 {
+            Some(r.read_pubkey()?)
+        } else {
+            None
+        };
+
+        // Children count from flags (bits 3-7)
+        let child_count = (flags >> PULSE_CHILD_COUNT_SHIFT) as usize;
 
         // Validate children count to prevent memory exhaustion attacks
-        if children_count > crate::types::MAX_CHILDREN {
+        if child_count > crate::types::MAX_CHILDREN {
             return Err(DecodeError::CapacityExceeded);
         }
 
-        let mut children = ChildrenList::with_capacity(children_count);
-        for _ in 0..children_count {
-            let prefix = r.read_bytes(child_prefix_len as usize)?.to_vec();
+        let mut children = ChildrenList::with_capacity(child_count);
+        for _ in 0..child_count {
+            let hash = r.read_child_hash()?;
             let size = r.read_varint()?;
-            children.push((prefix, size));
+            children.push((hash, size));
         }
 
         let signature = r.read_signature()?;
 
         Ok(Pulse {
             node_id,
-            parent_id,
-            root_id,
+            flags,
+            parent_hash,
+            root_hash,
             subtree_size,
             tree_size,
-            tree_addr,
-            need_pubkey,
+            keyspace_lo,
+            keyspace_hi,
             pubkey,
-            child_prefix_len,
             children,
             signature,
         })
@@ -508,11 +489,38 @@ impl Decode for Pulse {
 
 impl Encode for Routed {
     fn encode(&self, w: &mut Writer) {
-        w.write_tree_addr(&self.dest_addr);
-        w.write_optional_node_id(self.dest_node_id.as_ref());
-        w.write_optional_tree_addr(self.src_addr.as_deref());
+        w.write_u8(self.flags_and_type);
+        w.write_u32_be(self.dest_addr);
+
+        // dest_hash (conditional on flag)
+        if self.flags_and_type & ROUTED_FLAG_HAS_DEST_HASH != 0 {
+            if let Some(ref hash) = self.dest_hash {
+                w.write_child_hash(hash);
+            } else {
+                w.write_child_hash(&[0u8; 4]);
+            }
+        }
+
+        // src_addr (conditional on flag)
+        if self.flags_and_type & ROUTED_FLAG_HAS_SRC_ADDR != 0 {
+            if let Some(addr) = self.src_addr {
+                w.write_u32_be(addr);
+            } else {
+                w.write_u32_be(0);
+            }
+        }
+
         w.write_node_id(&self.src_node_id);
-        w.write_u8(self.msg_type);
+
+        // src_pubkey (conditional on flag)
+        if self.flags_and_type & ROUTED_FLAG_HAS_SRC_PUBKEY != 0 {
+            if let Some(ref pk) = self.src_pubkey {
+                w.write_pubkey(pk);
+            } else {
+                w.write_pubkey(&[0u8; 32]);
+            }
+        }
+
         w.write_u8(self.ttl);
         w.write_len_prefixed(&self.payload);
         w.write_signature(&self.signature);
@@ -521,21 +529,43 @@ impl Encode for Routed {
 
 impl Decode for Routed {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        let dest_addr = r.read_tree_addr()?;
-        let dest_node_id = r.read_optional_node_id()?;
-        let src_addr = r.read_optional_tree_addr()?;
+        let flags_and_type = r.read_u8()?;
+        let dest_addr = r.read_u32_be()?;
+
+        // dest_hash (conditional on flag)
+        let dest_hash = if flags_and_type & ROUTED_FLAG_HAS_DEST_HASH != 0 {
+            Some(r.read_child_hash()?)
+        } else {
+            None
+        };
+
+        // src_addr (conditional on flag)
+        let src_addr = if flags_and_type & ROUTED_FLAG_HAS_SRC_ADDR != 0 {
+            Some(r.read_u32_be()?)
+        } else {
+            None
+        };
+
         let src_node_id = r.read_node_id()?;
-        let msg_type = r.read_u8()?;
+
+        // src_pubkey (conditional on flag)
+        let src_pubkey = if flags_and_type & ROUTED_FLAG_HAS_SRC_PUBKEY != 0 {
+            Some(r.read_pubkey()?)
+        } else {
+            None
+        };
+
         let ttl = r.read_u8()?;
         let payload = r.read_len_prefixed()?.to_vec();
         let signature = r.read_signature()?;
 
         Ok(Routed {
+            flags_and_type,
             dest_addr,
-            dest_node_id,
+            dest_hash,
             src_addr,
             src_node_id,
-            msg_type,
+            src_pubkey,
             ttl,
             payload,
             signature,
@@ -572,8 +602,10 @@ impl Decode for Message {
 impl Encode for LocationEntry {
     fn encode(&self, w: &mut Writer) {
         w.write_node_id(&self.node_id);
-        w.write_tree_addr(&self.tree_addr);
+        w.write_pubkey(&self.pubkey);
+        w.write_u32_be(self.keyspace_addr);
         w.write_varint(self.seq);
+        w.write_u8(self.replica_index);
         w.write_signature(&self.signature);
     }
 }
@@ -581,15 +613,18 @@ impl Encode for LocationEntry {
 impl Decode for LocationEntry {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let node_id = r.read_node_id()?;
-        let tree_addr = r.read_tree_addr()?;
-        // Use canonical varint to reject non-minimal encodings
+        let pubkey = r.read_pubkey()?;
+        let keyspace_addr = r.read_u32_be()?;
         let seq = r.read_varint()?;
+        let replica_index = r.read_u8()?;
         let signature = r.read_signature()?;
 
         Ok(LocationEntry {
             node_id,
-            tree_addr,
+            pubkey,
+            keyspace_addr,
             seq,
+            replica_index,
             signature,
             received_at: crate::time::Timestamp::ZERO,
         })
@@ -601,19 +636,31 @@ pub fn pulse_sign_data(pulse: &Pulse) -> Writer {
     let mut w = Writer::new();
     w.write_bytes(crate::types::DOMAIN_PULSE);
     w.write_node_id(&pulse.node_id);
-    w.write_optional_node_id(pulse.parent_id.as_ref());
-    w.write_node_id(&pulse.root_id);
+    w.write_u8(pulse.flags);
+
+    if pulse.flags & PULSE_FLAG_HAS_PARENT != 0 {
+        if let Some(ref hash) = pulse.parent_hash {
+            w.write_child_hash(hash);
+        }
+    }
+
+    w.write_child_hash(&pulse.root_hash);
     w.write_varint(pulse.subtree_size);
     w.write_varint(pulse.tree_size);
-    w.write_tree_addr(&pulse.tree_addr);
-    w.write_u8(if pulse.need_pubkey { 1 } else { 0 });
-    w.write_optional_pubkey(pulse.pubkey.as_ref());
-    w.write_u8(pulse.child_prefix_len);
-    w.write_varint(pulse.children.len() as u32);
-    for (prefix, size) in &pulse.children {
-        w.write_bytes(prefix);
+    w.write_u32_be(pulse.keyspace_lo);
+    w.write_u32_be(pulse.keyspace_hi);
+
+    if pulse.flags & PULSE_FLAG_HAS_PUBKEY != 0 {
+        if let Some(ref pk) = pulse.pubkey {
+            w.write_pubkey(pk);
+        }
+    }
+
+    for (hash, size) in &pulse.children {
+        w.write_child_hash(hash);
         w.write_varint(*size);
     }
+
     w
 }
 
@@ -621,21 +668,39 @@ pub fn pulse_sign_data(pulse: &Pulse) -> Writer {
 pub fn routed_sign_data(routed: &Routed) -> Writer {
     let mut w = Writer::new();
     w.write_bytes(crate::types::DOMAIN_ROUTE);
-    w.write_tree_addr(&routed.dest_addr);
-    w.write_optional_node_id(routed.dest_node_id.as_ref());
-    w.write_optional_tree_addr(routed.src_addr.as_deref());
+    w.write_u8(routed.flags_and_type);
+    w.write_u32_be(routed.dest_addr);
+
+    if routed.flags_and_type & ROUTED_FLAG_HAS_DEST_HASH != 0 {
+        if let Some(ref hash) = routed.dest_hash {
+            w.write_child_hash(hash);
+        }
+    }
+
+    if routed.flags_and_type & ROUTED_FLAG_HAS_SRC_ADDR != 0 {
+        if let Some(addr) = routed.src_addr {
+            w.write_u32_be(addr);
+        }
+    }
+
     w.write_node_id(&routed.src_node_id);
-    w.write_u8(routed.msg_type);
+
+    if routed.flags_and_type & ROUTED_FLAG_HAS_SRC_PUBKEY != 0 {
+        if let Some(ref pk) = routed.src_pubkey {
+            w.write_pubkey(pk);
+        }
+    }
+
     w.write_len_prefixed(&routed.payload);
     w
 }
 
 /// Build the data to be signed for a LocationEntry.
-pub fn location_sign_data(node_id: &[u8; 16], tree_addr: &[u8], seq: u32) -> Writer {
+pub fn location_sign_data(node_id: &[u8; 16], keyspace_addr: u32, seq: u32) -> Writer {
     let mut w = Writer::new();
     w.write_bytes(crate::types::DOMAIN_LOC);
     w.write_node_id(node_id);
-    w.write_tree_addr(tree_addr);
+    w.write_u32_be(keyspace_addr);
     w.write_varint(seq);
     w
 }
@@ -645,7 +710,7 @@ mod tests {
     use alloc::vec;
 
     use super::*;
-    use crate::types::ALGORITHM_ED25519;
+    use crate::types::{Pulse, Routed, ALGORITHM_ED25519, MSG_DATA, MSG_PUBLISH};
 
     #[test]
     fn test_varint_roundtrip() {
@@ -667,15 +732,15 @@ mod tests {
     fn test_pulse_roundtrip() {
         let pulse = Pulse {
             node_id: [1u8; 16],
-            parent_id: Some([2u8; 16]),
-            root_id: [3u8; 16],
+            flags: Pulse::build_flags(true, true, true, 2),
+            parent_hash: Some([2u8; 4]),
+            root_hash: [3u8; 4],
             subtree_size: 10,
             tree_size: 100,
-            tree_addr: vec![0, 1, 2],
-            need_pubkey: true,
+            keyspace_lo: 0x1000_0000,
+            keyspace_hi: 0x2000_0000,
             pubkey: Some([4u8; 32]),
-            child_prefix_len: 2,
-            children: vec![(vec![0xAB, 0xCD], 5), (vec![0xDE, 0xF0], 3)],
+            children: vec![([0xAB, 0xCD, 0xEF, 0x01], 5), ([0xDE, 0xF0, 0x12, 0x34], 3)],
             signature: Signature {
                 algorithm: ALGORITHM_ED25519,
                 sig: [5u8; 64],
@@ -686,26 +751,54 @@ mod tests {
         let decoded = Pulse::decode_from_slice(&encoded).unwrap();
 
         assert_eq!(pulse.node_id, decoded.node_id);
-        assert_eq!(pulse.parent_id, decoded.parent_id);
-        assert_eq!(pulse.root_id, decoded.root_id);
+        assert_eq!(pulse.flags, decoded.flags);
+        assert_eq!(pulse.parent_hash, decoded.parent_hash);
+        assert_eq!(pulse.root_hash, decoded.root_hash);
         assert_eq!(pulse.subtree_size, decoded.subtree_size);
         assert_eq!(pulse.tree_size, decoded.tree_size);
-        assert_eq!(pulse.tree_addr, decoded.tree_addr);
-        assert_eq!(pulse.need_pubkey, decoded.need_pubkey);
+        assert_eq!(pulse.keyspace_lo, decoded.keyspace_lo);
+        assert_eq!(pulse.keyspace_hi, decoded.keyspace_hi);
         assert_eq!(pulse.pubkey, decoded.pubkey);
-        assert_eq!(pulse.child_prefix_len, decoded.child_prefix_len);
         assert_eq!(pulse.children.len(), decoded.children.len());
         assert_eq!(pulse.signature, decoded.signature);
     }
 
     #[test]
+    fn test_pulse_no_parent_no_pubkey() {
+        let pulse = Pulse {
+            node_id: [1u8; 16],
+            flags: Pulse::build_flags(false, false, false, 0),
+            parent_hash: None,
+            root_hash: [3u8; 4],
+            subtree_size: 1,
+            tree_size: 1,
+            keyspace_lo: 0,
+            keyspace_hi: u32::MAX,
+            pubkey: None,
+            children: vec![],
+            signature: Signature::default(),
+        };
+
+        let encoded = pulse.encode_to_vec();
+        let decoded = Pulse::decode_from_slice(&encoded).unwrap();
+
+        assert_eq!(pulse.node_id, decoded.node_id);
+        assert!(!decoded.has_parent());
+        assert!(decoded.parent_hash.is_none());
+        assert!(!decoded.has_pubkey());
+        assert!(decoded.pubkey.is_none());
+        assert_eq!(decoded.child_count(), 0);
+    }
+
+    #[test]
     fn test_routed_roundtrip() {
         let routed = Routed {
-            dest_addr: vec![1, 2, 3],
-            dest_node_id: Some([6u8; 16]),
-            src_addr: Some(vec![4, 5]),
+            flags_and_type: Routed::build_flags_and_type(MSG_DATA, true, true, false),
+            dest_addr: 0x1234_5678,
+            dest_hash: Some([0xAB, 0xCD, 0xEF, 0x01]),
+            src_addr: Some(0x8765_4321),
             src_node_id: [7u8; 16],
-            msg_type: crate::types::MSG_DATA,
+            src_pubkey: None,
             ttl: 32,
             payload: b"hello world".to_vec(),
             signature: Signature {
@@ -717,39 +810,60 @@ mod tests {
         let encoded = routed.encode_to_vec();
         let decoded = Routed::decode_from_slice(&encoded).unwrap();
 
+        assert_eq!(routed.flags_and_type, decoded.flags_and_type);
         assert_eq!(routed.dest_addr, decoded.dest_addr);
-        assert_eq!(routed.dest_node_id, decoded.dest_node_id);
+        assert_eq!(routed.dest_hash, decoded.dest_hash);
         assert_eq!(routed.src_addr, decoded.src_addr);
         assert_eq!(routed.src_node_id, decoded.src_node_id);
-        assert_eq!(routed.msg_type, decoded.msg_type);
+        assert_eq!(routed.src_pubkey, decoded.src_pubkey);
         assert_eq!(routed.ttl, decoded.ttl);
         assert_eq!(routed.payload, decoded.payload);
         assert_eq!(routed.signature, decoded.signature);
     }
 
     #[test]
-    fn test_routed_roundtrip_no_src_addr() {
+    fn test_routed_minimal() {
         let routed = Routed {
-            dest_addr: vec![1, 2, 3],
-            dest_node_id: None,
-            src_addr: None, // No src_addr (e.g., PUBLISH messages)
+            flags_and_type: Routed::build_flags_and_type(MSG_PUBLISH, false, false, false),
+            dest_addr: 0x1234_5678,
+            dest_hash: None,
+            src_addr: None,
             src_node_id: [7u8; 16],
-            msg_type: crate::types::MSG_PUBLISH,
+            src_pubkey: None,
             ttl: 255,
-            payload: b"location data".to_vec(),
-            signature: Signature {
-                algorithm: ALGORITHM_ED25519,
-                sig: [8u8; 64],
-            },
+            payload: vec![],
+            signature: Signature::default(),
         };
 
         let encoded = routed.encode_to_vec();
         let decoded = Routed::decode_from_slice(&encoded).unwrap();
 
-        assert_eq!(routed.dest_addr, decoded.dest_addr);
-        assert_eq!(routed.dest_node_id, decoded.dest_node_id);
-        assert_eq!(routed.src_addr, decoded.src_addr);
+        assert_eq!(decoded.msg_type(), MSG_PUBLISH);
+        assert!(!decoded.has_dest_hash());
+        assert!(decoded.dest_hash.is_none());
+        assert!(!decoded.has_src_addr());
         assert!(decoded.src_addr.is_none());
+    }
+
+    #[test]
+    fn test_routed_with_src_pubkey() {
+        let routed = Routed {
+            flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, true),
+            dest_addr: 0x1234_5678,
+            dest_hash: None,
+            src_addr: Some(0x8765_4321),
+            src_node_id: [7u8; 16],
+            src_pubkey: Some([9u8; 32]),
+            ttl: 32,
+            payload: b"data".to_vec(),
+            signature: Signature::default(),
+        };
+
+        let encoded = routed.encode_to_vec();
+        let decoded = Routed::decode_from_slice(&encoded).unwrap();
+
+        assert!(decoded.has_src_pubkey());
+        assert_eq!(decoded.src_pubkey, Some([9u8; 32]));
     }
 
     #[test]
@@ -783,11 +897,13 @@ mod tests {
     fn test_location_entry_roundtrip() {
         let entry = LocationEntry {
             node_id: [9u8; 16],
-            tree_addr: vec![1, 2, 3, 4],
+            pubkey: [10u8; 32],
+            keyspace_addr: 0x1234_5678,
             seq: 12345678,
+            replica_index: 1,
             signature: Signature {
                 algorithm: ALGORITHM_ED25519,
-                sig: [10u8; 64],
+                sig: [11u8; 64],
             },
             received_at: crate::time::Timestamp::ZERO,
         };
@@ -796,69 +912,11 @@ mod tests {
         let decoded = LocationEntry::decode_from_slice(&encoded).unwrap();
 
         assert_eq!(entry.node_id, decoded.node_id);
-        assert_eq!(entry.tree_addr, decoded.tree_addr);
+        assert_eq!(entry.pubkey, decoded.pubkey);
+        assert_eq!(entry.keyspace_addr, decoded.keyspace_addr);
         assert_eq!(entry.seq, decoded.seq);
+        assert_eq!(entry.replica_index, decoded.replica_index);
         assert_eq!(entry.signature, decoded.signature);
-    }
-
-    #[test]
-    fn test_tree_addr_roundtrip() {
-        // Test root (depth 0)
-        let mut w = Writer::new();
-        w.write_tree_addr(&[]);
-        let encoded = w.finish();
-        assert_eq!(encoded, vec![0x00]); // Just depth byte
-        let mut r = Reader::new(&encoded);
-        let decoded = r.read_tree_addr().unwrap();
-        assert!(decoded.is_empty());
-
-        // Test even depth (depth 4)
-        let addr = vec![3, 7, 2, 15];
-        let mut w = Writer::new();
-        w.write_tree_addr(&addr);
-        let encoded = w.finish();
-        assert_eq!(encoded, vec![0x04, 0x37, 0x2F]); // depth=4, nibbles packed
-        let mut r = Reader::new(&encoded);
-        let decoded = r.read_tree_addr().unwrap();
-        assert_eq!(addr, decoded);
-
-        // Test odd depth (depth 5) - last nibble should be padded with 0
-        let addr = vec![3, 7, 2, 15, 1];
-        let mut w = Writer::new();
-        w.write_tree_addr(&addr);
-        let encoded = w.finish();
-        assert_eq!(encoded, vec![0x05, 0x37, 0x2F, 0x10]); // depth=5, last byte padded
-        let mut r = Reader::new(&encoded);
-        let decoded = r.read_tree_addr().unwrap();
-        assert_eq!(addr, decoded);
-
-        // Test depth 1
-        let addr = vec![5];
-        let mut w = Writer::new();
-        w.write_tree_addr(&addr);
-        let encoded = w.finish();
-        assert_eq!(encoded, vec![0x01, 0x50]); // depth=1, one nibble, padded
-        let mut r = Reader::new(&encoded);
-        let decoded = r.read_tree_addr().unwrap();
-        assert_eq!(addr, decoded);
-    }
-
-    #[test]
-    fn test_tree_addr_invalid_padding() {
-        // Odd depth with non-zero padding nibble should be rejected
-        let invalid = vec![0x03, 0x12, 0x3F]; // depth=3, last nibble is F, should be 0
-        let mut r = Reader::new(&invalid);
-        let result = r.read_tree_addr();
-        assert_eq!(result, Err(DecodeError::TreeAddrInvalidPadding));
-    }
-
-    #[test]
-    fn test_tree_addr_too_deep() {
-        // Depth > MAX_TREE_DEPTH should be rejected
-        let invalid = vec![128]; // depth=128 > 127
-        let mut r = Reader::new(&invalid);
-        let result = r.read_tree_addr();
-        assert_eq!(result, Err(DecodeError::TreeAddrTooDeep));
     }
 
     #[test]
@@ -908,21 +966,14 @@ mod tests {
     }
 
     #[test]
-    fn test_optional_tree_addr() {
-        // Test None
+    fn test_child_hash_roundtrip() {
+        let hash: ChildHash = [0xAB, 0xCD, 0xEF, 0x01];
         let mut w = Writer::new();
-        w.write_optional_tree_addr(None);
+        w.write_child_hash(&hash);
         let encoded = w.finish();
-        assert_eq!(encoded, vec![0x00]);
-        let mut r = Reader::new(&encoded);
-        assert_eq!(r.read_optional_tree_addr().unwrap(), None);
 
-        // Test Some
-        let addr = vec![1, 2, 3];
-        let mut w = Writer::new();
-        w.write_optional_tree_addr(Some(&addr));
-        let encoded = w.finish();
         let mut r = Reader::new(&encoded);
-        assert_eq!(r.read_optional_tree_addr().unwrap(), Some(addr));
+        let decoded = r.read_child_hash().unwrap();
+        assert_eq!(hash, decoded);
     }
 }

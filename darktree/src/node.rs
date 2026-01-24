@@ -36,9 +36,9 @@ use crate::traits::{
     Transport,
 };
 use crate::types::{
-    Event, LocationEntry, NodeId, PublicKey, Routed, SecretKey, TransportMetrics, TreeAddr,
-    MAX_DISTRUSTED, MAX_LOCATION_CACHE, MAX_LOCATION_STORE, MAX_NEIGHBORS, MAX_PENDING_DATA,
-    MAX_PENDING_LOOKUPS, MAX_PENDING_PUBKEY, MAX_PUBKEY_CACHE, MIN_PULSE_INTERVAL,
+    ChildHash, Event, LocationEntry, NodeId, PublicKey, Routed, SecretKey, TransportMetrics,
+    MAX_DISTRUSTED, MAX_LOCATION_CACHE, MAX_LOCATION_STORE, MAX_NEIGHBORS, MAX_PENDING_LOOKUPS,
+    MAX_PENDING_PUBKEY, MAX_PUBKEY_CACHE, MIN_PULSE_INTERVAL,
 };
 
 /// Timing, signal, and tree information for a neighbor.
@@ -50,12 +50,12 @@ pub struct NeighborTiming {
     pub prev_seen: Option<Timestamp>,
     /// Last observed signal strength in dBm (if available).
     pub rssi: Option<i16>,
-    /// Root of the neighbor's tree.
-    pub root_id: NodeId,
+    /// Root hash of the neighbor's tree.
+    pub root_hash: ChildHash,
     /// Size of the neighbor's tree.
     pub tree_size: u32,
-    /// Neighbor's tree address (used for shortcut routing and parent selection).
-    pub tree_addr: TreeAddr,
+    /// Neighbor's keyspace range (lo, hi).
+    pub keyspace_range: (u32, u32),
     /// Number of children the neighbor has.
     pub children_count: u8,
 }
@@ -93,13 +93,17 @@ pub struct JoinContext {
 
 // Type aliases for collections
 pub type ChildMap = BTreeMap<NodeId, u32>;
-pub type ShortcutSet = BTreeSet<NodeId>;
+/// Child ranges: child_id -> (keyspace_lo, keyspace_hi).
+pub type ChildRanges = HashMap<NodeId, (u32, u32)>;
+/// Shortcuts: shortcut_id -> (keyspace_lo, keyspace_hi).
+pub type ShortcutMap = HashMap<NodeId, (u32, u32)>;
 pub type NeighborTimingMap = HashMap<NodeId, NeighborTiming>;
 pub type PubkeyCache = HashMap<NodeId, PublicKey>;
 pub type NeedPubkeySet = BTreeSet<NodeId>;
 pub type NeighborsNeedPubkeySet = BTreeSet<NodeId>;
 pub type LocationStore = HashMap<NodeId, LocationEntry>;
-pub type LocationCache = HashMap<NodeId, TreeAddr>;
+/// Location cache: node_id -> keyspace_addr.
+pub type LocationCache = HashMap<NodeId, u32>;
 pub type PendingLookupMap = HashMap<NodeId, PendingLookup>;
 pub type PendingRequestMap = HashMap<NodeId, PendingRequest>;
 pub type PendingDataMap = HashMap<NodeId, Vec<u8>>;
@@ -133,17 +137,19 @@ pub struct Node<T, Cr, R, Clk> {
     pubkey: PublicKey,
     secret: SecretKey,
 
-    // Tree position
+    // Tree position (keyspace-based)
     parent: Option<NodeId>,
     pending_parent: Option<(NodeId, u8)>, // (candidate, pulses_waited)
-    root_id: NodeId,
+    root_hash: ChildHash,
     tree_size: u32,
     subtree_size: u32,
-    tree_addr: TreeAddr,
+    keyspace_lo: u32,
+    keyspace_hi: u32,
 
     // Neighbors
     children: ChildMap,
-    shortcuts: ShortcutSet,
+    child_ranges: ChildRanges,
+    shortcuts: ShortcutMap,
     neighbor_times: NeighborTimingMap,
 
     // Caches
@@ -202,6 +208,9 @@ where
         pubkey: PublicKey,
         secret: SecretKey,
     ) -> Self {
+        // Compute root_hash from our node_id (we are initially root of our own tree)
+        let root_hash = Self::compute_node_hash_static(&crypto, &node_id);
+
         Self {
             transport,
             crypto,
@@ -218,13 +227,15 @@ where
 
             parent: None,
             pending_parent: None,
-            root_id: node_id,
+            root_hash,
             tree_size: 1,
             subtree_size: 1,
-            tree_addr: Vec::new(),
+            keyspace_lo: 0,
+            keyspace_hi: u32::MAX,
 
             children: BTreeMap::new(),
-            shortcuts: BTreeSet::new(),
+            child_ranges: HashMap::new(),
+            shortcuts: HashMap::new(),
             neighbor_times: HashMap::new(),
 
             pubkey_cache: HashMap::new(),
@@ -253,6 +264,17 @@ where
         }
     }
 
+    /// Compute the 4-byte hash of a node_id.
+    fn compute_node_hash_static(crypto: &Cr, node_id: &NodeId) -> ChildHash {
+        let hash = crypto.hash(node_id);
+        [hash[0], hash[1], hash[2], hash[3]]
+    }
+
+    /// Compute the 4-byte hash of a node_id.
+    pub fn compute_node_hash(&self, node_id: &NodeId) -> ChildHash {
+        Self::compute_node_hash_static(&self.crypto, node_id)
+    }
+
     /// Get this node's identity.
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
@@ -263,9 +285,23 @@ where
         &self.pubkey
     }
 
-    /// Get current tree address.
-    pub fn tree_addr(&self) -> &TreeAddr {
-        &self.tree_addr
+    /// Get current keyspace range.
+    pub fn keyspace_range(&self) -> (u32, u32) {
+        (self.keyspace_lo, self.keyspace_hi)
+    }
+
+    /// Get this node's keyspace address (center of range).
+    /// Uses overflow-safe calculation.
+    pub fn my_address(&self) -> u32 {
+        (self.keyspace_lo / 2) + (self.keyspace_hi / 2)
+    }
+
+    /// Check if this node owns a keyspace location.
+    ///
+    /// Uses half-open interval [keyspace_lo, keyspace_hi). The keyspace is
+    /// [0, u32::MAX), so u32::MAX is not a valid address.
+    pub fn owns_key(&self, key: u32) -> bool {
+        key >= self.keyspace_lo && key < self.keyspace_hi
     }
 
     /// Get current tree size.
@@ -278,9 +314,9 @@ where
         self.subtree_size
     }
 
-    /// Get the root node ID.
-    pub fn root_id(&self) -> &NodeId {
-        &self.root_id
+    /// Get the root hash.
+    pub fn root_hash(&self) -> &ChildHash {
+        &self.root_hash
     }
 
     /// Check if this node is the root.
@@ -338,6 +374,11 @@ where
     /// Get the crypto reference.
     pub fn crypto(&self) -> &Cr {
         &self.crypto
+    }
+
+    /// Get the current timestamp from the clock.
+    pub fn now(&self) -> Timestamp {
+        self.clock.now()
     }
 
     /// Get transport metrics for monitoring.
@@ -464,7 +505,7 @@ where
                 self.handle_pulse(pulse, rssi, now);
             }
             Message::Routed(routed) => {
-                if routed.msg_type == MSG_DATA {
+                if routed.msg_type() == MSG_DATA {
                     self.record_app_received();
                 } else {
                     self.record_protocol_received();
@@ -479,7 +520,7 @@ where
         let OutgoingData { target, payload } = data;
 
         // Check if we have the target's location cached
-        if let Some(addr) = self.location_cache.get(&target).cloned() {
+        if let Some(addr) = self.location_cache.get(&target).copied() {
             // Send directly
             let _ = self.send_data_to(target, addr, payload, now);
         } else {
@@ -570,12 +611,19 @@ where
         &mut self.children
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn shortcuts(&self) -> &ShortcutSet {
+    pub(crate) fn child_ranges(&self) -> &ChildRanges {
+        &self.child_ranges
+    }
+
+    pub(crate) fn child_ranges_mut(&mut self) -> &mut ChildRanges {
+        &mut self.child_ranges
+    }
+
+    pub(crate) fn shortcuts(&self) -> &ShortcutMap {
         &self.shortcuts
     }
 
-    pub(crate) fn shortcuts_mut(&mut self) -> &mut ShortcutSet {
+    pub(crate) fn shortcuts_mut(&mut self) -> &mut ShortcutMap {
         &mut self.shortcuts
     }
 
@@ -619,27 +667,12 @@ where
         &mut self.location_store
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn location_cache(&self) -> &LocationCache {
-        &self.location_cache
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn location_cache_mut(&mut self) -> &mut LocationCache {
-        &mut self.location_cache
-    }
-
     pub(crate) fn pending_lookups(&self) -> &PendingLookupMap {
         &self.pending_lookups
     }
 
     pub(crate) fn pending_lookups_mut(&mut self) -> &mut PendingLookupMap {
         &mut self.pending_lookups
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn pending_data(&self) -> &PendingDataMap {
-        &self.pending_data
     }
 
     pub(crate) fn pending_data_mut(&mut self) -> &mut PendingDataMap {
@@ -674,10 +707,6 @@ where
         &self.distrusted
     }
 
-    pub(crate) fn distrusted_mut(&mut self) -> &mut DistrustedMap {
-        &mut self.distrusted
-    }
-
     pub(crate) fn fraud_detection(&self) -> &FraudDetection {
         &self.fraud_detection
     }
@@ -710,8 +739,8 @@ where
         self.pending_parent = pending;
     }
 
-    pub(crate) fn set_root_id(&mut self, root: NodeId) {
-        self.root_id = root;
+    pub(crate) fn set_root_hash(&mut self, root: ChildHash) {
+        self.root_hash = root;
     }
 
     pub(crate) fn set_tree_size(&mut self, size: u32) {
@@ -722,13 +751,17 @@ where
         self.subtree_size = size;
     }
 
-    pub(crate) fn set_tree_addr(&mut self, addr: TreeAddr) {
-        self.tree_addr = addr;
+    pub(crate) fn keyspace_lo(&self) -> u32 {
+        self.keyspace_lo
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn location_seq(&self) -> u32 {
-        self.location_seq
+    pub(crate) fn keyspace_hi(&self) -> u32 {
+        self.keyspace_hi
+    }
+
+    pub(crate) fn set_keyspace_range(&mut self, lo: u32, hi: u32) {
+        self.keyspace_lo = lo;
+        self.keyspace_hi = hi;
     }
 
     pub(crate) fn next_location_seq(&mut self) -> u32 {
@@ -756,16 +789,6 @@ where
         self.proactive_pulse_pending = time;
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn discovery_deadline(&self) -> Option<Timestamp> {
-        self.discovery_deadline
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn set_discovery_deadline(&mut self, time: Option<Timestamp>) {
-        self.discovery_deadline = time;
-    }
-
     /// Check if node is in discovery phase.
     pub(crate) fn is_in_discovery(&self) -> bool {
         self.discovery_deadline.is_some()
@@ -773,11 +796,6 @@ where
 
     pub(crate) fn secret(&self) -> &SecretKey {
         &self.secret
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn crypto_mut(&mut self) -> &mut Cr {
-        &mut self.crypto
     }
 
     pub(crate) fn random_mut(&mut self) -> &mut R {
@@ -838,7 +856,7 @@ where
         self.location_store.insert(node_id, entry);
     }
 
-    pub(crate) fn insert_location_cache(&mut self, node_id: NodeId, addr: TreeAddr) {
+    pub(crate) fn insert_location_cache(&mut self, node_id: NodeId, addr: u32) {
         if self.location_cache.len() >= MAX_LOCATION_CACHE
             && !self.location_cache.contains_key(&node_id)
         {
@@ -847,23 +865,6 @@ where
             }
         }
         self.location_cache.insert(node_id, addr);
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn insert_pending_lookup(&mut self, node_id: NodeId, lookup: PendingLookup) {
-        if self.pending_lookups.len() >= MAX_PENDING_LOOKUPS
-            && !self.pending_lookups.contains_key(&node_id)
-        {
-            if let Some(oldest_key) = self
-                .pending_lookups
-                .iter()
-                .min_by_key(|(_, l)| l.started_at)
-                .map(|(k, _)| *k)
-            {
-                self.pending_lookups.remove(&oldest_key);
-            }
-        }
-        self.pending_lookups.insert(node_id, lookup);
     }
 
     pub(crate) fn insert_neighbor_time(&mut self, node_id: NodeId, timing: NeighborTiming) {
@@ -879,17 +880,6 @@ where
             }
         }
         self.neighbor_times.insert(node_id, timing);
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn insert_pending_data(&mut self, node_id: NodeId, payload: Vec<u8>) {
-        if self.pending_data.len() >= MAX_PENDING_DATA && !self.pending_data.contains_key(&node_id)
-        {
-            if let Some(key) = self.pending_data.keys().next().copied() {
-                self.pending_data.remove(&key);
-            }
-        }
-        self.pending_data.insert(node_id, payload);
     }
 
     pub(crate) fn insert_distrusted(&mut self, node_id: NodeId, timestamp: Timestamp) {

@@ -28,32 +28,39 @@ where
         (0..K_REPLICAS).any(|replica| {
             let key = self.hash_to_key(node_id, replica as u8);
             let dest_addr = self.addr_for_key(key);
-            dest_addr.starts_with(self.tree_addr())
+            self.owns_key(dest_addr)
         })
     }
 
     /// Publish our location to the DHT.
     pub(crate) fn publish_location(&mut self, now: Timestamp) {
         let seq = self.next_location_seq();
+        let my_addr = self.my_address();
 
         // Build location signature
-        let sign_data = location_sign_data(self.node_id(), self.tree_addr(), seq);
+        let sign_data = location_sign_data(self.node_id(), my_addr, seq);
         let signature = self.crypto().sign(self.secret(), sign_data.as_slice());
 
-        // Build payload: owner_node_id || tree_addr || seq || signature
-        let mut payload = Writer::new();
-        payload.write_node_id(self.node_id());
-        payload.write_tree_addr(self.tree_addr());
-        payload.write_varint(seq);
-        payload.write_signature(&signature);
-        let payload_bytes = payload.finish();
+        // Extract values needed for payload construction (avoids borrowing self in loop)
+        let node_id = *self.node_id();
+        let pubkey = *self.pubkey();
 
         // Publish to K_REPLICAS locations
         for replica in 0..K_REPLICAS {
-            let key = self.hash_to_key(self.node_id(), replica as u8);
+            let key = self.hash_to_key(&node_id, replica as u8);
             let dest_addr = self.addr_for_key(key);
 
-            let msg = self.build_routed_no_reply(dest_addr, MSG_PUBLISH, payload_bytes.clone());
+            // Build payload: owner_node_id || pubkey || keyspace_addr || seq || replica_index || signature
+            let mut payload = Writer::new();
+            payload.write_node_id(&node_id);
+            payload.write_pubkey(&pubkey);
+            payload.write_u32_be(my_addr);
+            payload.write_varint(seq);
+            payload.write_u8(replica as u8);
+            payload.write_signature(&signature);
+            let payload_bytes = payload.finish();
+
+            let msg = self.build_routed_no_reply(dest_addr, MSG_PUBLISH, payload_bytes);
             let _ = self.send_routed(msg);
         }
 
@@ -63,19 +70,32 @@ where
 
     /// Handle a PUBLISH message.
     pub(crate) fn handle_publish(&mut self, msg: Routed, now: Timestamp) {
-        // Decode payload: owner_node_id || tree_addr || seq || signature
+        // Verify Routed signature (defense-in-depth; location signature is critical protection)
+        if self.verify_routed_signature(&msg).is_none() {
+            return;
+        }
+
+        // Decode payload: owner_node_id || pubkey || keyspace_addr || seq || replica_index || signature
         let mut reader = Reader::new(&msg.payload);
 
         let owner_node_id = match reader.read_node_id() {
             Ok(id) => id,
             Err(_) => return,
         };
-        let tree_addr = match reader.read_tree_addr() {
+        let pubkey = match reader.read_pubkey() {
+            Ok(pk) => pk,
+            Err(_) => return,
+        };
+        let keyspace_addr = match reader.read_u32_be() {
             Ok(addr) => addr,
             Err(_) => return,
         };
         let seq = match reader.read_varint() {
             Ok(s) => s,
+            Err(_) => return,
+        };
+        let replica_index = match reader.read_u8() {
+            Ok(r) => r,
             Err(_) => return,
         };
         let signature = match reader.read_signature() {
@@ -88,19 +108,16 @@ where
             return;
         }
 
-        // SECURITY: Require verified pubkey for signature verification
-        let pubkey = match self.pubkey_cache().get(&owner_node_id) {
-            Some(pk) => *pk,
-            None => {
-                // Can't verify without pubkey - queue for later and mark that we need it
-                self.need_pubkey_mut().insert(owner_node_id);
-                self.queue_pending_pubkey(owner_node_id, msg);
-                return;
-            }
-        };
+        // SECURITY: Verify pubkey binds to node_id
+        if !self.crypto().verify_pubkey_binding(&owner_node_id, &pubkey) {
+            return;
+        }
+
+        // Cache the pubkey
+        self.insert_pubkey_cache(owner_node_id, pubkey);
 
         // Verify signature
-        let sign_data = location_sign_data(&owner_node_id, &tree_addr, seq);
+        let sign_data = location_sign_data(&owner_node_id, keyspace_addr, seq);
         if !self
             .crypto()
             .verify(&pubkey, sign_data.as_slice(), &signature)
@@ -118,8 +135,10 @@ where
         // Store the entry
         let entry = LocationEntry {
             node_id: owner_node_id,
-            tree_addr,
+            pubkey,
+            keyspace_addr,
             seq,
+            replica_index,
             signature,
             received_at: now,
         };
@@ -127,7 +146,8 @@ where
         self.insert_location_store(owner_node_id, entry);
 
         // Update fraud detection counters
-        self.fraud_detection_mut().on_publish_received();
+        self.fraud_detection_mut()
+            .on_publish_received(&owner_node_id);
     }
 
     /// Send a LOOKUP message.
@@ -135,60 +155,105 @@ where
         let key = self.hash_to_key(&target, replica as u8);
         let dest_addr = self.addr_for_key(key);
 
-        // Payload is just the target node_id
-        let msg = self.build_routed(dest_addr, None, MSG_LOOKUP, target.to_vec());
+        // dest_hash identifies the target (4-byte truncated hash of target node_id)
+        let dest_hash = self.compute_node_hash(&target);
+
+        // Payload is just the replica_index (1 byte) per design doc
+        let msg = self.build_routed(
+            dest_addr,
+            Some(dest_hash),
+            MSG_LOOKUP,
+            alloc::vec![replica as u8],
+        );
         let _ = self.send_routed(msg);
     }
 
     /// Handle a LOOKUP message.
     pub(crate) fn handle_lookup_msg(&mut self, msg: Routed, _now: Timestamp) {
-        // Payload is the target node_id (16 bytes)
-        if msg.payload.len() != 16 {
+        // Verify Routed signature before responding
+        if self.verify_routed_signature(&msg).is_none() {
             return;
         }
 
-        let mut target = [0u8; 16];
-        target.copy_from_slice(&msg.payload);
+        // dest_hash identifies the target entry
+        let dest_hash = match msg.dest_hash {
+            Some(hash) => hash,
+            None => return, // LOOKUP requires dest_hash
+        };
+
+        // Payload is replica_index (1 byte)
+        if msg.payload.len() != 1 {
+            return;
+        }
+
+        // Find entry matching dest_hash by iterating location_store
+        // (Design doc specifies this approach; MAX_LOCATION_STORE=256 makes this acceptable)
+        let entry = match self
+            .location_store()
+            .iter()
+            .find(|(node_id, _)| self.compute_node_hash(node_id) == dest_hash)
+        {
+            Some((_, entry)) => entry.clone(),
+            None => return, // No matching entry
+        };
 
         // Need src_addr to reply
-        let src_addr = match &msg.src_addr {
-            Some(addr) => addr.clone(),
+        let src_addr = match msg.src_addr {
+            Some(addr) => addr,
             None => return, // Can't reply without source address
         };
 
-        // Check if we have the entry
-        if let Some(entry) = self.location_store().get(&target) {
-            // Build FOUND response
-            // Payload: target_node_id || tree_addr || seq || location_signature
-            let mut payload = Writer::new();
-            payload.write_node_id(&entry.node_id);
-            payload.write_tree_addr(&entry.tree_addr);
-            payload.write_varint(entry.seq);
-            payload.write_signature(&entry.signature);
-            let payload_bytes = payload.finish();
+        // Build FOUND response
+        // Payload: target_node_id || pubkey || keyspace_addr || seq || replica_index || location_signature
+        let mut payload = Writer::new();
+        payload.write_node_id(&entry.node_id);
+        payload.write_pubkey(&entry.pubkey);
+        payload.write_u32_be(entry.keyspace_addr);
+        payload.write_varint(entry.seq);
+        payload.write_u8(entry.replica_index);
+        payload.write_signature(&entry.signature);
+        let payload_bytes = payload.finish();
 
-            let response =
-                self.build_routed(src_addr, Some(msg.src_node_id), MSG_FOUND, payload_bytes);
-            let _ = self.send_routed(response);
-        }
-        // If not found, don't respond - requester will try next replica
+        // Compute dest_hash for the requester
+        let response_dest_hash = self.compute_node_hash(&msg.src_node_id);
+
+        let response =
+            self.build_routed(src_addr, Some(response_dest_hash), MSG_FOUND, payload_bytes);
+        let _ = self.send_routed(response);
     }
 
     /// Handle a FOUND response.
     pub(crate) fn handle_found(&mut self, msg: Routed, now: Timestamp) {
-        // Decode payload: target_node_id || tree_addr || seq || location_signature
+        if !self.verify_dest_hash(&msg) {
+            return; // Not for us
+        }
+
+        // Verify Routed signature (defense-in-depth; location signature is critical protection)
+        if self.verify_routed_signature(&msg).is_none() {
+            return;
+        }
+
+        // Decode payload: target_node_id || pubkey || keyspace_addr || seq || replica_index || location_signature
         let mut reader = Reader::new(&msg.payload);
 
         let node_id = match reader.read_node_id() {
             Ok(id) => id,
             Err(_) => return,
         };
-        let tree_addr = match reader.read_tree_addr() {
+        let pubkey = match reader.read_pubkey() {
+            Ok(pk) => pk,
+            Err(_) => return,
+        };
+        let keyspace_addr = match reader.read_u32_be() {
             Ok(addr) => addr,
             Err(_) => return,
         };
         let seq = match reader.read_varint() {
             Ok(s) => s,
+            Err(_) => return,
+        };
+        let _replica_index = match reader.read_u8() {
+            Ok(r) => r,
             Err(_) => return,
         };
         let signature = match reader.read_signature() {
@@ -201,18 +266,13 @@ where
             return; // Unexpected response
         }
 
-        // SECURITY: Verify the location signature (signed by the target node)
-        // We need the target's pubkey to verify - if we don't have it, mark that we need it
-        let pubkey = match self.pubkey_cache().get(&node_id) {
-            Some(pk) => *pk,
-            None => {
-                // Can't verify location without pubkey - request it
-                self.need_pubkey_mut().insert(node_id);
-                return;
-            }
-        };
+        // SECURITY: Verify pubkey binds to node_id
+        if !self.crypto().verify_pubkey_binding(&node_id, &pubkey) {
+            return;
+        }
 
-        let sign_data = location_sign_data(&node_id, &tree_addr, seq);
+        // SECURITY: Verify the location signature (signed by the target node)
+        let sign_data = location_sign_data(&node_id, keyspace_addr, seq);
         if !self
             .crypto()
             .verify(&pubkey, sign_data.as_slice(), &signature)
@@ -220,8 +280,11 @@ where
             return; // Invalid location signature
         }
 
+        // Cache the pubkey
+        self.insert_pubkey_cache(node_id, pubkey);
+
         // Cache the location
-        self.insert_location_cache(node_id, tree_addr.clone());
+        self.insert_location_cache(node_id, keyspace_addr);
 
         // Remove pending lookup
         self.pending_lookups_mut().remove(&node_id);
@@ -229,12 +292,12 @@ where
         // Emit event
         self.push_event(Event::LookupComplete {
             node_id,
-            tree_addr: tree_addr.clone(),
+            keyspace_addr,
         });
 
         // Send any pending data
         if let Some(data) = self.pending_data_mut().remove(&node_id) {
-            let _ = self.send_data_to(node_id, tree_addr, data, now);
+            let _ = self.send_data_to(node_id, keyspace_addr, data, now);
         }
     }
 
@@ -261,8 +324,10 @@ where
             // Build payload with the stored signature
             let mut payload = Writer::new();
             payload.write_node_id(&entry.node_id);
-            payload.write_tree_addr(&entry.tree_addr);
+            payload.write_pubkey(&entry.pubkey);
+            payload.write_u32_be(entry.keyspace_addr);
             payload.write_varint(entry.seq);
+            payload.write_u8(entry.replica_index);
             payload.write_signature(&entry.signature);
             let payload_bytes = payload.finish();
 
@@ -285,18 +350,19 @@ mod tests {
     use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
 
     #[test]
-    fn test_publish_creates_messages() {
+    fn test_publish_stores_locally_when_owner() {
         let transport = MockTransport::new();
         let crypto = MockCrypto::new();
         let random = MockRandom::new();
         let clock = MockClock::new();
 
         let mut node = Node::new(transport, crypto, random, clock);
+        let node_id = *node.node_id();
 
-        // Publish location
+        // Node owns full keyspace, so publish should store locally
         node.publish_location(Timestamp::ZERO);
 
-        // Should have sent K_REPLICAS messages
-        assert_eq!(node.transport().take_sent().len(), K_REPLICAS);
+        // Should have stored our own location entry
+        assert!(node.location_store().contains_key(&node_id));
     }
 }
