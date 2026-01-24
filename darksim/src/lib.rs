@@ -157,10 +157,10 @@ mod tests {
         // Verify single tree formed
         assert!(result.converged(), "Chain should converge to single tree");
         assert_eq!(result.final_tree_count(), 1);
-        // Note: tree_size includes root self-count, so 5 nodes = tree_size 6
-        assert!(
-            result.final_max_tree_size() >= 5,
-            "Tree should include all 5 nodes"
+        assert_eq!(
+            result.final_max_tree_size(),
+            5,
+            "Tree should have exactly 5 nodes"
         );
     }
 }

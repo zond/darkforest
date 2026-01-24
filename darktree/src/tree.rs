@@ -15,7 +15,8 @@ use crate::node::{JoinContext, NeighborTiming, Node};
 use crate::time::{Duration, Timestamp};
 use crate::traits::{Clock, Crypto, Random, Transport};
 use crate::types::{
-    ChildHash, ChildrenList, Event, Pulse, Signature, DISTRUST_TTL, LOCATION_TTL, MAX_CHILDREN,
+    ChildHash, ChildrenList, Event, NodeId, Pulse, Signature, DISTRUST_TTL, LOCATION_TTL,
+    MAX_CHILDREN,
 };
 use crate::wire::{pulse_sign_data, Encode, Message};
 
@@ -453,6 +454,9 @@ where
             self.set_parent(Some(parent_id));
             self.set_pending_parent(None);
 
+            // Remove new parent from our children if it was there (prevents cycles)
+            self.remove_child(&parent_id);
+
             // Compute our keyspace range
             let (new_lo, new_hi) = self.compute_child_keyspace(pulse, my_idx);
             self.set_keyspace_range(new_lo, new_hi);
@@ -747,6 +751,20 @@ where
         self.set_subtree_size(size);
     }
 
+    /// Remove a child and update all related state.
+    ///
+    /// Returns true if the child was present and removed.
+    fn remove_child(&mut self, child_id: &NodeId) -> bool {
+        if self.children_mut().remove(child_id).is_some() {
+            self.child_ranges_mut().remove(child_id);
+            self.recalculate_subtree_size();
+            self.recompute_child_ranges();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Estimate current pulse size.
     fn estimate_pulse_size(&self) -> usize {
         // Base: node_id(16) + flags(1) + root_hash(4) + subtree(varint~3) + tree_size(varint~3)
@@ -903,11 +921,7 @@ where
             }
 
             // If child, remove
-            if self.children_mut().remove(&id).is_some() {
-                self.child_ranges_mut().remove(&id);
-                self.recalculate_subtree_size();
-                self.recompute_child_ranges();
-            }
+            self.remove_child(&id);
 
             // Remove from shortcuts
             self.shortcuts_mut().remove(&id);
