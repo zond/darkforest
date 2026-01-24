@@ -48,7 +48,7 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 ### 2.5 Fully Connected Small Network
 - **Setup:** 10 nodes, all in range
 - **Run:** 20τ
-- **Expect:** Single tree, wide and shallow (depth 2-3).
+- **Expect:** Single tree, wide and shallow (depth ≤3). May achieve depth 1 if all nodes join root directly.
 
 ### 2.6 Parent Selection Prefers Shallow
 - **Setup:** 3 nodes A, B, C all in range. A boots first (root). B joins A. C boots.
