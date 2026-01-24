@@ -37,8 +37,8 @@ use crate::traits::{
 };
 use crate::types::{
     ChildHash, Event, LocationEntry, NodeId, PublicKey, Routed, SecretKey, TransportMetrics,
-    MAX_DISTRUSTED, MAX_LOCATION_CACHE, MAX_LOCATION_STORE, MAX_NEIGHBORS, MAX_PENDING_LOOKUPS,
-    MAX_PENDING_PUBKEY, MAX_PUBKEY_CACHE, MAX_SHORTCUTS, MIN_PULSE_INTERVAL,
+    MAX_DISTRUSTED, MAX_LOCATION_CACHE, MAX_LOCATION_STORE, MAX_MSGS_PER_PENDING_PUBKEY,
+    MAX_NEIGHBORS, MAX_PENDING_LOOKUPS, MAX_PUBKEY_CACHE, MAX_SHORTCUTS, MIN_PULSE_INTERVAL,
 };
 
 /// Timing, signal, and tree information for a neighbor.
@@ -706,7 +706,7 @@ where
         }
 
         let queue = self.pending_pubkey.entry(needed_node_id).or_default();
-        if queue.len() >= MAX_PENDING_PUBKEY {
+        if queue.len() >= MAX_MSGS_PER_PENDING_PUBKEY {
             queue.pop_front();
         }
         queue.push_back(msg);

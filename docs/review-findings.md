@@ -19,20 +19,6 @@ The entire link-layer reliability system is missing:
 
 ---
 
-## High Priority Issues
-
-### Memory pressure from pending_pubkey
-**Source:** Embedded reviewer
-**Location:** `node.rs:167`
-
-Stores full `Routed` messages (up to 255 bytes each) for nodes awaiting pubkey. Bounded to MAX_PENDING_PUBKEY_NODES=32 nodes with MAX_PENDING_PUBKEY=16 messages each.
-
-**Worst case:** 32 nodes * 16 messages * 255 bytes = ~130KB
-
-**Fix:** Consider storing only essential fields, or reducing limits for memory-constrained targets.
-
----
-
 ## Medium Priority Issues
 
 ### Parent rejection tracking logic confusing

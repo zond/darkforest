@@ -17,8 +17,8 @@ pub const MAX_DISTRUSTED: usize = 64;
 pub const MAX_SHORTCUTS: usize = 64;
 pub const MAX_PACKET_SIZE: usize = 255;
 pub const MAX_PENDING_DATA: usize = 16;
-pub const MAX_PENDING_PUBKEY: usize = 16; // Messages awaiting pubkey per node
-pub const MAX_PENDING_PUBKEY_NODES: usize = 32; // Max distinct nodes awaiting pubkey
+pub const MAX_MSGS_PER_PENDING_PUBKEY: usize = 8; // Messages queued per node awaiting pubkey
+pub const MAX_PENDING_PUBKEY_NODES: usize = 16; // Max distinct nodes awaiting pubkey
 
 // Protocol constants
 pub const K_REPLICAS: usize = 3;
