@@ -26,7 +26,7 @@ pub const DEFAULT_TTL: u8 = 255; // Max hops
 
 // Timing constants as Durations
 pub const MIN_PULSE_INTERVAL: Duration = Duration::from_secs(10);
-pub const MAX_RETRIES: u8 = 3;
+pub const MAX_RETRIES: u8 = 8;
 pub const LOCATION_REFRESH: Duration = Duration::from_hours(8);
 pub const LOCATION_TTL: Duration = Duration::from_hours(12);
 pub const DISTRUST_TTL: Duration = Duration::from_hours(24);
