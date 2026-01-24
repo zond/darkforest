@@ -444,7 +444,7 @@ where
     ///
     /// Returns None if no pulse has been sent yet (send immediately).
     /// With bandwidth limits, interval is extended to keep pulse within budget.
-    /// Returns the earlier of regular scheduled pulse or proactive pulse.
+    /// Proactive pulses are batched (1-2τ delay) but still respect bandwidth budget.
     fn next_pulse_time(&self) -> Option<Timestamp> {
         use crate::types::PULSE_BW_DIVISOR;
 
@@ -461,12 +461,13 @@ where
             _ => MIN_PULSE_INTERVAL,
         };
 
-        let regular_time = last + interval;
+        let budget_time = last + interval;
 
-        // Return earlier of regular pulse or proactive pulse
+        // Proactive pulse can trigger early, but must still respect bandwidth budget.
+        // Use max to ensure we don't send before budget_time.
         match self.proactive_pulse_pending {
-            Some(proactive) => Some(regular_time.min(proactive)),
-            None => Some(regular_time),
+            Some(proactive) => Some(budget_time.max(proactive)),
+            None => Some(budget_time),
         }
     }
 

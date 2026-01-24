@@ -19,18 +19,6 @@ The entire link-layer reliability system is missing:
 
 ---
 
-## Medium Priority Issues
-
-### Bandwidth budget not explicitly tracked
-**Source:** Embedded reviewer
-**Location:** `node.rs:461-483`
-
-Design doc says proactive pulses should count toward bandwidth budget and be delayed if budget exhausted. Implementation only uses pulse interval calculation, no explicit budget tracking.
-
-**Impact:** Under rapid state changes, multiple proactive pulses could be scheduled in quick succession, exceeding bandwidth budget.
-
----
-
 ## Low Priority / Future Work
 
 ### Unbounded Vec allocations
