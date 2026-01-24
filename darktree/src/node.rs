@@ -87,12 +87,13 @@ pub type ChildRanges = HashMap<NodeId, (u32, u32)>;
 /// Shortcuts: shortcut_id -> (keyspace_lo, keyspace_hi).
 pub type ShortcutMap = HashMap<NodeId, (u32, u32)>;
 pub type NeighborTimingMap = HashMap<NodeId, NeighborTiming>;
-pub type PubkeyCache = HashMap<NodeId, PublicKey>;
+/// Pubkey cache: node_id -> (pubkey, last_used).
+pub type PubkeyCache = HashMap<NodeId, (PublicKey, Timestamp)>;
 pub type NeedPubkeySet = BTreeSet<NodeId>;
 pub type NeighborsNeedPubkeySet = BTreeSet<NodeId>;
 pub type LocationStore = HashMap<NodeId, LocationEntry>;
-/// Location cache: node_id -> keyspace_addr.
-pub type LocationCache = HashMap<NodeId, u32>;
+/// Location cache: node_id -> (keyspace_addr, last_used).
+pub type LocationCache = HashMap<NodeId, (u32, Timestamp)>;
 pub type PendingLookupMap = HashMap<NodeId, PendingLookup>;
 pub type PendingDataMap = HashMap<NodeId, Vec<u8>>;
 pub type DistrustedMap = HashMap<NodeId, Timestamp>;
@@ -504,8 +505,8 @@ where
     fn handle_app_send(&mut self, data: OutgoingData, now: Timestamp) {
         let OutgoingData { target, payload } = data;
 
-        // Check if we have the target's location cached
-        if let Some(addr) = self.location_cache.get(&target).copied() {
+        // Check if we have the target's location cached (marks as recently used)
+        if let Some(addr) = self.get_location_cache(&target, now) {
             // Send directly
             let _ = self.send_data_to(target, addr, payload, now);
         } else {
@@ -573,9 +574,24 @@ where
         self.pubkey_cache.contains_key(node_id)
     }
 
-    /// Get a cached public key.
-    pub fn get_pubkey(&self, node_id: &NodeId) -> Option<&PublicKey> {
-        self.pubkey_cache.get(node_id)
+    /// Get a cached public key and mark it as recently used.
+    pub fn get_pubkey(&mut self, node_id: &NodeId, now: Timestamp) -> Option<PublicKey> {
+        if let Some((pk, last_used)) = self.pubkey_cache.get_mut(node_id) {
+            *last_used = now;
+            Some(*pk)
+        } else {
+            None
+        }
+    }
+
+    /// Get a cached location and mark it as recently used.
+    pub fn get_location_cache(&mut self, node_id: &NodeId, now: Timestamp) -> Option<u32> {
+        if let Some((addr, last_used)) = self.location_cache.get_mut(node_id) {
+            *last_used = now;
+            Some(*addr)
+        } else {
+            None
+        }
     }
 
     /// Push an event to the events channel.
@@ -673,9 +689,19 @@ where
         if self.pending_pubkey.len() >= MAX_PENDING_PUBKEY_NODES
             && !self.pending_pubkey.contains_key(&needed_node_id)
         {
-            // Evict an arbitrary entry (first key found)
-            if let Some(key) = self.pending_pubkey.keys().next().copied() {
-                self.pending_pubkey.remove(&key);
+            // Evict the node we haven't heard from in the longest time
+            if let Some(oldest_key) = self
+                .pending_pubkey
+                .keys()
+                .min_by_key(|id| {
+                    self.neighbor_times
+                        .get(*id)
+                        .map(|t| t.last_seen)
+                        .unwrap_or(crate::time::Timestamp::ZERO)
+                })
+                .copied()
+            {
+                self.pending_pubkey.remove(&oldest_key);
             }
         }
 
@@ -817,14 +843,25 @@ where
 
     // --- Bounded insertion helpers ---
 
-    pub(crate) fn insert_pubkey_cache(&mut self, node_id: NodeId, pubkey: PublicKey) {
+    pub(crate) fn insert_pubkey_cache(
+        &mut self,
+        node_id: NodeId,
+        pubkey: PublicKey,
+        now: Timestamp,
+    ) {
         if self.pubkey_cache.len() >= MAX_PUBKEY_CACHE && !self.pubkey_cache.contains_key(&node_id)
         {
-            if let Some(key) = self.pubkey_cache.keys().next().copied() {
-                self.pubkey_cache.remove(&key);
+            // Evict the least recently used entry
+            if let Some(oldest_key) = self
+                .pubkey_cache
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(k, _)| *k)
+            {
+                self.pubkey_cache.remove(&oldest_key);
             }
         }
-        self.pubkey_cache.insert(node_id, pubkey);
+        self.pubkey_cache.insert(node_id, (pubkey, now));
     }
 
     pub(crate) fn insert_location_store(&mut self, node_id: NodeId, entry: LocationEntry) {
@@ -843,15 +880,21 @@ where
         self.location_store.insert(node_id, entry);
     }
 
-    pub(crate) fn insert_location_cache(&mut self, node_id: NodeId, addr: u32) {
+    pub(crate) fn insert_location_cache(&mut self, node_id: NodeId, addr: u32, now: Timestamp) {
         if self.location_cache.len() >= MAX_LOCATION_CACHE
             && !self.location_cache.contains_key(&node_id)
         {
-            if let Some(key) = self.location_cache.keys().next().copied() {
-                self.location_cache.remove(&key);
+            // Evict the least recently used entry
+            if let Some(oldest_key) = self
+                .location_cache
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(k, _)| *k)
+            {
+                self.location_cache.remove(&oldest_key);
             }
         }
-        self.location_cache.insert(node_id, addr);
+        self.location_cache.insert(node_id, (addr, now));
     }
 
     pub(crate) fn insert_neighbor_time(&mut self, node_id: NodeId, timing: NeighborTiming) {

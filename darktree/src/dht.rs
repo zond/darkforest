@@ -71,7 +71,7 @@ where
     /// Handle a PUBLISH message.
     pub(crate) fn handle_publish(&mut self, msg: Routed, now: Timestamp) {
         // Verify Routed signature (defense-in-depth; location signature is critical protection)
-        if self.verify_routed_signature(&msg).is_none() {
+        if self.verify_routed_signature(&msg, now).is_none() {
             return;
         }
 
@@ -114,7 +114,7 @@ where
         }
 
         // Cache the pubkey
-        self.insert_pubkey_cache(owner_node_id, pubkey);
+        self.insert_pubkey_cache(owner_node_id, pubkey, now);
 
         // Verify signature
         let sign_data = location_sign_data(&owner_node_id, keyspace_addr, seq);
@@ -169,9 +169,9 @@ where
     }
 
     /// Handle a LOOKUP message.
-    pub(crate) fn handle_lookup_msg(&mut self, msg: Routed, _now: Timestamp) {
+    pub(crate) fn handle_lookup_msg(&mut self, msg: Routed, now: Timestamp) {
         // Verify Routed signature before responding
-        if self.verify_routed_signature(&msg).is_none() {
+        if self.verify_routed_signature(&msg, now).is_none() {
             return;
         }
 
@@ -229,7 +229,7 @@ where
         }
 
         // Verify Routed signature (defense-in-depth; location signature is critical protection)
-        if self.verify_routed_signature(&msg).is_none() {
+        if self.verify_routed_signature(&msg, now).is_none() {
             return;
         }
 
@@ -281,10 +281,10 @@ where
         }
 
         // Cache the pubkey
-        self.insert_pubkey_cache(node_id, pubkey);
+        self.insert_pubkey_cache(node_id, pubkey, now);
 
         // Cache the location
-        self.insert_location_cache(node_id, keyspace_addr);
+        self.insert_location_cache(node_id, keyspace_addr, now);
 
         // Remove pending lookup
         self.pending_lookups_mut().remove(&node_id);

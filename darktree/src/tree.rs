@@ -80,8 +80,8 @@ where
         }
 
         // SECURITY: Require verified pubkey before processing tree operations
-        let pubkey = match self.pubkey_cache().get(&pulse.node_id) {
-            Some(pk) => *pk,
+        let pubkey = match self.get_pubkey(&pulse.node_id, now) {
+            Some(pk) => pk,
             None => {
                 // Don't have pubkey yet - we've already requested it via need_pubkey
                 // Don't process tree operations until we can verify signatures
@@ -167,7 +167,7 @@ where
         if let Some(pubkey) = pulse.pubkey {
             // CRITICAL: Verify cryptographic binding before caching
             if self.crypto().verify_pubkey_binding(&pulse.node_id, &pubkey) {
-                self.insert_pubkey_cache(pulse.node_id, pubkey);
+                self.insert_pubkey_cache(pulse.node_id, pubkey, now);
                 self.need_pubkey_mut().remove(&pulse.node_id);
 
                 // Process any messages that were waiting for this pubkey

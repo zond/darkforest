@@ -49,7 +49,7 @@ where
         }
 
         // Not for us - verify signature before forwarding to prevent bandwidth waste
-        if self.verify_routed_signature(&msg).is_none() {
+        if self.verify_routed_signature(&msg, now).is_none() {
             // Can't verify signature (no pubkey or invalid) - drop
             return;
         }
@@ -63,6 +63,7 @@ where
     pub(crate) fn verify_routed_signature(
         &mut self,
         msg: &Routed,
+        now: Timestamp,
     ) -> Option<crate::types::PublicKey> {
         // Get pubkey from message or cache
         let pubkey = match msg.src_pubkey {
@@ -72,13 +73,13 @@ where
                     return None;
                 }
                 // Cache for future use
-                self.insert_pubkey_cache(msg.src_node_id, pk);
+                self.insert_pubkey_cache(msg.src_node_id, pk, now);
                 pk
             }
             None => {
-                // Check cache
-                match self.pubkey_cache().get(&msg.src_node_id) {
-                    Some(&pk) => pk,
+                // Check cache (marks as recently used)
+                match self.get_pubkey(&msg.src_node_id, now) {
+                    Some(pk) => pk,
                     None => {
                         // No pubkey available - mark that we need it
                         self.need_pubkey_mut().insert(msg.src_node_id);
@@ -174,7 +175,7 @@ where
     }
 
     /// Handle incoming DATA message.
-    fn handle_data(&mut self, msg: Routed, _now: Timestamp) {
+    fn handle_data(&mut self, msg: Routed, now: Timestamp) {
         if !self.verify_dest_hash(&msg) {
             return; // Stale address - not the intended recipient
         }
@@ -184,7 +185,7 @@ where
         let needs_pubkey =
             msg.src_pubkey.is_none() && !self.pubkey_cache().contains_key(&msg.src_node_id);
 
-        if self.verify_routed_signature(&msg).is_none() {
+        if self.verify_routed_signature(&msg, now).is_none() {
             if needs_pubkey {
                 // Queue message to retry when pubkey arrives
                 self.queue_pending_pubkey(msg.src_node_id, msg);
@@ -389,7 +390,7 @@ where
         now: Timestamp,
     ) {
         // Cache the pubkey
-        self.insert_pubkey_cache(*node_id, *pubkey);
+        self.insert_pubkey_cache(*node_id, *pubkey, now);
 
         // Process pending messages
         if let Some(pending) = self.take_pending_pubkey(node_id) {
