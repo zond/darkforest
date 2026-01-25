@@ -1,6 +1,6 @@
 # darkforest
 
-[![CI](https://github.com/zond/darkforest/actions/workflows/ci.yml/badge.svg)](https://github.com/zond/darkforest/actions/workflows/ci.yml)
+[![CI](https://github.com/zond/darkforest/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zond/darkforest/actions/workflows/ci.yml)
 
 A spanning tree protocol for decentralized mesh networks, designed for bandwidth-constrained environments like LoRa.
 
