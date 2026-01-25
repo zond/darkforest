@@ -418,9 +418,10 @@ Verify protocol works correctly with constrained resources.
 
 ## 17. Robustness & Malformed Input
 
-### 17.1 Oversized Child Count
+### 17.1 Oversized Child Count ✓
 - **Setup:** Attacker sends pulse with child_count=20 (exceeds MAX_CHILDREN=12).
 - **Expect:** Rejected at decode. No allocation attempted.
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_oversized_child_count_rejected`
 
 ### 17.2 Non-Canonical Varint ✓
 - **Setup:** Message with non-canonical varint (0x80 0x00 for zero).
