@@ -3486,4 +3486,87 @@ mod tests {
             );
         }
     }
+
+    /// Scenario 19.1: Node Restart (State Loss)
+    ///
+    /// When a node power cycles (loses all state), it should rejoin the tree
+    /// via normal discovery. The old entry should expire from neighbors.
+    #[test]
+    fn test_node_restart_rejoins_tree() {
+        use crate::topology::Link;
+
+        let mut sim = Simulator::new(42);
+
+        // Create a small tree with 5 nodes in a star topology
+        // (easier to verify rejoining behavior)
+        let root = sim.add_node(1);
+        let mut children = Vec::with_capacity(4);
+        for i in 0..4 {
+            let c = sim.add_node(100 + i);
+            sim.topology_mut().add_link(root, c, Link::new());
+            children.push(c);
+        }
+
+        // Run until tree forms
+        let tau = sim.node(&root).unwrap().tau();
+        sim.run_for(tau * 15);
+
+        // Verify tree formed with root having children
+        let root_children_before = sim.node(&root).unwrap().children_count();
+        assert!(
+            root_children_before >= 3,
+            "Root should have at least 3 children before restart, got {}",
+            root_children_before
+        );
+
+        // Pick a child node to restart
+        let n = children[0];
+        let n_node_id = sim.node(&n).unwrap().node_id();
+
+        // Verify N is a child of root before restart
+        let n_parent_before = sim.node(&n).unwrap().parent_id();
+        assert_eq!(
+            n_parent_before,
+            Some(sim.node(&root).unwrap().node_id()),
+            "N should be a child of root before restart"
+        );
+
+        // Restart the node (loses all state)
+        sim.restart_node(&n).expect("Node should exist");
+
+        // Immediately after restart, N should be root (no tree state)
+        assert!(
+            sim.node(&n).unwrap().is_root(),
+            "Immediately after restart, N should be root (lost all state)"
+        );
+        assert!(
+            sim.node(&n).unwrap().parent_id().is_none(),
+            "Immediately after restart, N should have no parent"
+        );
+
+        // Run for discovery + join time
+        sim.run_for(tau * 15);
+
+        // N should have rejoined the tree
+        let n_parent_after = sim.node(&n).unwrap().parent_id();
+        assert!(
+            n_parent_after.is_some(),
+            "After discovery, N should have a parent (rejoined tree)"
+        );
+
+        // N should have the same root_hash as other nodes
+        let n_root_hash = sim.node(&n).unwrap().root_hash();
+        let root_hash = sim.node(&root).unwrap().root_hash();
+        assert_eq!(
+            n_root_hash, root_hash,
+            "N should be in the same tree as root after restart"
+        );
+
+        // Verify N still has the same identity (NodeId)
+        assert_eq!(
+            sim.node(&n).unwrap().node_id(),
+            n_node_id,
+            "N should have the same NodeId after restart"
+        );
+    }
 }

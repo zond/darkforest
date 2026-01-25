@@ -14,6 +14,8 @@ use crate::topology::Topology;
 pub struct Simulator {
     /// All nodes in the simulation.
     nodes: HashMap<NodeId, SimNode>,
+    /// Seed used to create each node (for restart support).
+    node_seeds: HashMap<NodeId, u64>,
     /// Network topology.
     topology: Topology,
     /// Current simulation time.
@@ -40,6 +42,7 @@ impl Simulator {
     pub fn new(seed: u64) -> Self {
         Self {
             nodes: HashMap::new(),
+            node_seeds: HashMap::new(),
             topology: Topology::new(),
             current_time: Timestamp::ZERO,
             event_queue: BinaryHeap::new(),
@@ -68,12 +71,37 @@ impl Simulator {
 
     /// Add a node to the simulation.
     pub fn add_node(&mut self, seed: u64) -> NodeId {
-        self.add_node_internal(SimNode::new(seed, self.current_time))
+        let node_id = self.add_node_internal(SimNode::new(seed, self.current_time));
+        self.node_seeds.insert(node_id, seed);
+        node_id
     }
 
     /// Add a node with bandwidth-limited transport (e.g., LoRa).
     pub fn add_node_with_bandwidth(&mut self, seed: u64, bw: u32) -> NodeId {
-        self.add_node_internal(SimNode::with_bandwidth(seed, self.current_time, bw))
+        let node_id = self.add_node_internal(SimNode::with_bandwidth(seed, self.current_time, bw));
+        self.node_seeds.insert(node_id, seed);
+        node_id
+    }
+
+    /// Restart a node, simulating a power cycle with complete state loss.
+    ///
+    /// The node keeps its identity (same NodeId derived from same seed) but loses
+    /// all tree state - it will rediscover neighbors and rejoin the tree.
+    /// Returns None if the node doesn't exist.
+    pub fn restart_node(&mut self, node_id: &NodeId) -> Option<NodeId> {
+        let seed = *self.node_seeds.get(node_id)?;
+
+        // Remove old node
+        self.nodes.remove(node_id);
+
+        // Create fresh node with same identity
+        let new_node_id = self.add_node_internal(SimNode::new(seed, self.current_time));
+        debug_assert_eq!(
+            *node_id, new_node_id,
+            "Restarted node should have same NodeId"
+        );
+
+        Some(new_node_id)
     }
 
     /// Internal helper to initialize and register a node.

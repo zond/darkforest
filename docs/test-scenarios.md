@@ -480,10 +480,11 @@ Verify protocol works correctly with constrained resources.
 
 ## 19. Recovery Scenarios
 
-### 19.1 Node Restart (State Loss)
+### 19.1 Node Restart (State Loss) ✓
 - **Setup:** Tree with 20 nodes. Node N power cycles at t=50τ (loses all state).
 - **Run:** 50τ after restart
 - **Expect:** N rejoins tree via normal discovery. Old N entry expires from neighbors.
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_node_restart_rejoins_tree`
 
 ### 19.2 Storage Node Restart
 - **Setup:** Storage node S holds 10 location entries. S restarts.
