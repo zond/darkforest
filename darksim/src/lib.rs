@@ -1035,4 +1035,85 @@ mod tests {
         let ra_tree_size = sim.node(&ra_root_id).unwrap().tree_size();
         assert_eq!(ra_tree_size, 2, "R-A tree should have size 2");
     }
+
+    /// Scenario 4.2: Partition Heals
+    /// Setup: After partition (4.1), restore the broken link.
+    /// Run: Until trees remerge (~10s provides ample margin).
+    /// Expect: Trees remerge into single tree.
+    #[test]
+    fn test_partition_heals() {
+        use crate::event::ScenarioAction;
+        use crate::topology::Link;
+
+        // Create simulator
+        let mut sim = Simulator::new(42);
+
+        // Create chain topology: R—A—C
+        let node_r = sim.add_node(1);
+        let node_a = sim.add_node(2);
+        let node_c = sim.add_node(3);
+
+        sim.topology_mut().add_link(node_r, node_a, Link::default());
+        sim.topology_mut().add_link(node_a, node_c, Link::default());
+
+        // Run to form the tree
+        sim.run_for(Duration::from_secs(5));
+
+        // Verify single tree formed
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(snapshot.tree_count(), 1, "Should have 1 tree initially");
+
+        // Break the A—C link (links are bidirectional with canonical ordering)
+        sim.schedule_action(
+            sim.current_time(),
+            ScenarioAction::DisableLink {
+                from: node_a,
+                to: node_c,
+            },
+        );
+
+        // Run for partition to occur
+        sim.run_for(Duration::from_secs(30));
+
+        // Verify partition happened (2 trees)
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(
+            snapshot.tree_count(),
+            2,
+            "Should have 2 trees after partition"
+        );
+
+        // Now restore the link
+        sim.schedule_action(
+            sim.current_time(),
+            ScenarioAction::EnableLink {
+                from: node_a,
+                to: node_c,
+            },
+        );
+
+        // Run for trees to remerge
+        sim.run_for(Duration::from_secs(10));
+
+        // Verify single tree again
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(
+            snapshot.tree_count(),
+            1,
+            "Should have 1 tree after partition heals"
+        );
+
+        // Verify tree has all 3 nodes
+        let root_id = [node_r, node_a, node_c]
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Should have a root");
+
+        let tree_size = sim.node(&root_id).unwrap().tree_size();
+        assert_eq!(tree_size, 3, "Healed tree should have all 3 nodes");
+    }
 }

@@ -108,10 +108,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Expect:** Two trees: R-A tree (size 2), C tree (C as root, size 1).
 - **Status:** Implemented in `test_link_break_creates_partition`
 
-### 4.2 Partition Heals
-- **Setup:** After 4.1, restore A—C link at t=50τ
-- **Run:** 30τ more
-- **Expect:** Trees remerge. Single tree again.
+### 4.2 Partition Heals ✓
+- **Setup:** After partition, restore A—C link.
+- **Run:** Until remerge occurs.
+- **Expect:** Trees remerge. Single tree with all 3 nodes.
+- **Status:** Implemented in `test_partition_heals`
 
 ### 4.3 Root Dies, Children Remerge
 - **Setup:** Tree: R—{A, B, C}. Remove R at t=10τ.
