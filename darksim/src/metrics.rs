@@ -1,7 +1,7 @@
 //! Metrics collection for simulation analysis.
 
 use darktree::{NodeId, Timestamp};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 /// A snapshot of tree state at a point in time.
 #[derive(Debug, Clone)]
@@ -42,19 +42,16 @@ impl TreeSnapshot {
 
     /// Check if all nodes have the same root hash.
     pub fn all_same_tree(&self) -> bool {
-        let hashes: Vec<_> = self.root_hashes.values().collect();
-        if hashes.is_empty() {
+        let mut iter = self.root_hashes.values();
+        let Some(first) = iter.next() else {
             return true;
-        }
-        hashes.windows(2).all(|w| w[0] == w[1])
+        };
+        iter.all(|hash| hash == first)
     }
 
     /// Count distinct trees (by root hash).
     pub fn tree_count(&self) -> usize {
-        let mut unique_hashes: Vec<[u8; 4]> = self.root_hashes.values().copied().collect();
-        unique_hashes.sort();
-        unique_hashes.dedup();
-        unique_hashes.len()
+        self.root_hashes.values().collect::<HashSet<_>>().len()
     }
 
     /// Get nodes that are roots.

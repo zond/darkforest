@@ -152,36 +152,10 @@ impl ScenarioBuilder {
             sim = sim.with_snapshot_interval(interval);
         }
 
-        // First, we need to predict node IDs based on seeds
-        // This is deterministic because SimCrypto.generate_keypair is deterministic
-        let mut predicted_node_ids = Vec::with_capacity(self.num_nodes);
-        for i in 0..self.num_nodes {
-            let node_seed = self.seed.wrapping_add(i as u64 * 1000);
-            let seed_byte = (node_seed & 0xFF) as u8;
-
-            // SimCrypto generates secret, then pubkey = hash(secret), then node_id = hash(pubkey)[..16]
-            let mut secret = [seed_byte; 32];
-            secret[0] = seed_byte;
-            secret[1] = seed_byte.wrapping_add(1);
-
-            // Hash function (matches SimCrypto.hash)
-            let hash_fn = |data: &[u8]| -> [u8; 32] {
-                let mut hash = [0u8; 32];
-                for (j, &byte) in data.iter().enumerate() {
-                    hash[j % 32] ^= byte;
-                    hash[(j + 1) % 32] = hash[(j + 1) % 32].wrapping_add(byte);
-                }
-                hash
-            };
-
-            // pubkey = hash(secret)
-            let pubkey = hash_fn(&secret);
-            // node_id = hash(pubkey)[..16]
-            let pubkey_hash = hash_fn(&pubkey);
-            let mut node_id = [0u8; 16];
-            node_id.copy_from_slice(&pubkey_hash[..16]);
-            predicted_node_ids.push(node_id);
-        }
+        // Predict node IDs deterministically (matches SimCrypto.generate_keypair behavior)
+        let predicted_node_ids: Vec<NodeId> = (0..self.num_nodes)
+            .map(|i| predict_node_id(self.seed.wrapping_add(i as u64 * 1000)))
+            .collect();
 
         // Build topology with predicted node IDs
         let mut topo = match self.topology_type {
@@ -275,6 +249,33 @@ pub fn simple_scenario(num_nodes: usize) -> ScenarioBuilder {
 /// Convenience function for LoRa-like simulation (38 bytes/sec bandwidth).
 pub fn lora_scenario(num_nodes: usize) -> ScenarioBuilder {
     ScenarioBuilder::new(num_nodes).with_bandwidth(38)
+}
+
+/// Predict a node's ID from its seed (matches SimCrypto deterministic keypair generation).
+fn predict_node_id(node_seed: u64) -> NodeId {
+    let seed_byte = (node_seed & 0xFF) as u8;
+
+    // SimCrypto generates: secret -> pubkey = hash(secret) -> node_id = hash(pubkey)[..16]
+    let mut secret = [seed_byte; 32];
+    secret[0] = seed_byte;
+    secret[1] = seed_byte.wrapping_add(1);
+
+    let pubkey = sim_hash(&secret);
+    let pubkey_hash = sim_hash(&pubkey);
+
+    let mut node_id = [0u8; 16];
+    node_id.copy_from_slice(&pubkey_hash[..16]);
+    node_id
+}
+
+/// Hash function matching SimCrypto.hash for deterministic ID prediction.
+fn sim_hash(data: &[u8]) -> [u8; 32] {
+    let mut hash = [0u8; 32];
+    for (i, &byte) in data.iter().enumerate() {
+        hash[i % 32] ^= byte;
+        hash[(i + 1) % 32] = hash[(i + 1) % 32].wrapping_add(byte);
+    }
+    hash
 }
 
 #[cfg(test)]

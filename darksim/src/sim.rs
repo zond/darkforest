@@ -68,34 +68,21 @@ impl Simulator {
 
     /// Add a node to the simulation.
     pub fn add_node(&mut self, seed: u64) -> NodeId {
-        let mut node = SimNode::new(seed, self.current_time);
-        let node_id = node.node_id();
-
-        // Initialize the node (sends first pulse, starts discovery)
-        node.inner_mut().initialize(self.current_time);
-
-        // Get tau for scheduling
-        let tau = node.tau();
-        self.nodes.insert(node_id, node);
-
-        // Collect and route the initial pulse
-        self.collect_outgoing(node_id);
-
-        // Schedule timer for this node (tau interval)
-        self.schedule_timer(node_id, self.current_time + tau);
-
-        node_id
+        self.add_node_internal(SimNode::new(seed, self.current_time))
     }
 
     /// Add a node with bandwidth-limited transport (e.g., LoRa).
     pub fn add_node_with_bandwidth(&mut self, seed: u64, bw: u32) -> NodeId {
-        let mut node = SimNode::with_bandwidth(seed, self.current_time, bw);
+        self.add_node_internal(SimNode::with_bandwidth(seed, self.current_time, bw))
+    }
+
+    /// Internal helper to initialize and register a node.
+    fn add_node_internal(&mut self, mut node: SimNode) -> NodeId {
         let node_id = node.node_id();
 
         // Initialize the node (sends first pulse, starts discovery)
         node.inner_mut().initialize(self.current_time);
 
-        // Get tau for scheduling
         let tau = node.tau();
         self.nodes.insert(node_id, node);
 
@@ -276,7 +263,7 @@ impl Simulator {
         }
 
         // Collect and route outgoing messages (separate borrow)
-        let _collected = self.collect_outgoing_count(node_id);
+        self.collect_outgoing(node_id);
 
         // Schedule next timer
         if let Some(tau) = tau {
@@ -296,24 +283,14 @@ impl Simulator {
 
     /// Collect outgoing messages from a node and route them.
     fn collect_outgoing(&mut self, sender: NodeId) {
-        self.collect_outgoing_count(sender);
-    }
-
-    /// Collect outgoing messages from a node and route them, returning count.
-    fn collect_outgoing_count(&mut self, sender: NodeId) -> usize {
-        // Get outgoing messages
-        let messages = if let Some(node) = self.nodes.get(&sender) {
-            node.take_outgoing()
-        } else {
-            return 0;
+        let messages = match self.nodes.get(&sender) {
+            Some(node) => node.take_outgoing(),
+            None => return,
         };
 
-        let count = messages.len();
-        // Route each message through topology
         for msg in messages {
             self.route_message(sender, msg);
         }
-        count
     }
 
     /// Route a message from sender to all reachable neighbors.
@@ -324,7 +301,7 @@ impl Simulator {
         let current_time = self.current_time;
 
         // Collect link info first to avoid borrow conflicts
-        let mut deliveries: Vec<(NodeId, Duration, i16)> = Vec::new();
+        let mut deliveries = Vec::with_capacity(neighbors.len());
         let mut dropped_count = 0u64;
 
         for neighbor in neighbors {
