@@ -12,9 +12,34 @@
 //! - Ed25519 signatures prevent impersonation
 //! - No clock synchronization required
 //!
-//! # Example
+//! # Example (basic usage)
 //!
-//! ```ignore
+//! ```
+//! use darktree::{Node, DefaultConfig};
+//! use darktree::traits::test_impls::{MockTransport, MockCrypto, MockRandom, MockClock};
+//!
+//! // Create a node with mock implementations
+//! let node = Node::<_, _, _, _, DefaultConfig>::new(
+//!     MockTransport::new(),
+//!     MockCrypto::new(),
+//!     MockRandom::new(),
+//!     MockClock::new(),
+//! );
+//!
+//! // Node starts as root of its own single-node tree
+//! assert!(node.is_root());
+//! assert_eq!(node.tree_size(), 1);
+//! assert_eq!(node.subtree_size(), 1);
+//!
+//! // Node owns the full keyspace initially
+//! let (lo, hi) = node.keyspace_range();
+//! assert_eq!(lo, 0);
+//! assert_eq!(hi, u32::MAX);
+//! ```
+//!
+//! # Example (integration pattern)
+//!
+//! ```text
 //! use darktree::{Node, Transport, Crypto, Random, Clock, OutgoingData};
 //!
 //! // Implement traits for your platform...

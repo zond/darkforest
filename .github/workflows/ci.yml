@@ -37,7 +37,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --all
+        run: cargo test --all --features test-support
 
   slow-tests:
     name: Slow Tests
@@ -60,4 +60,4 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run slow tests
-        run: cargo test --all -- --ignored
+        run: cargo test --all --features test-support -- --ignored

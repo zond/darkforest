@@ -17,14 +17,14 @@ cargo build --all
 
 ## Testing
 
-Run all tests:
+Run all tests (including doc tests):
 ```bash
-cargo test --all
+cargo test-all
 ```
 
 Run slow/ignored tests (e.g., 100-node convergence):
 ```bash
-cargo test --all -- --ignored
+cargo test-slow
 ```
 
 Check formatting and lints:

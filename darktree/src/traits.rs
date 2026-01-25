@@ -84,35 +84,52 @@ pub type EventChannel = Channel<ChannelMutex, Event, EVENT_QUEUE_SIZE>;
 ///
 /// # Usage Pattern
 ///
-/// ```ignore
+/// ```
+/// use darktree::traits::test_impls::MockTransport;
+/// use darktree::Transport;
+///
+/// let transport = MockTransport::new();
+///
 /// // Node sends protocol message (Pulse, LOOKUP, etc.)
-/// transport.protocol_outgoing().try_send(data).ok();
+/// transport.protocol_outgoing().try_send(vec![1, 2, 3]).ok();
 ///
 /// // Node sends application data
-/// transport.app_outgoing().try_send(data).ok();
+/// transport.app_outgoing().try_send(vec![4, 5, 6]).ok();
 ///
-/// // Node receives messages (async)
-/// let msg = transport.incoming().receive().await;
-///
-/// // Radio task transmits - check protocol queue first
+/// // Radio task transmits - check protocol queue first (priority)
 /// let data = transport.protocol_outgoing().try_receive()
 ///     .or_else(|_| transport.app_outgoing().try_receive());
+/// assert_eq!(data.unwrap(), vec![1, 2, 3]); // Protocol message first
 /// ```
 ///
 /// # Simulation
 ///
 /// For simulation, the simulator reads from both outgoing queues:
 ///
-/// ```ignore
-/// // Simulator distributes messages between nodes
-/// for queue in [node_a.transport().protocol_outgoing(), node_a.transport().app_outgoing()] {
+/// ```
+/// use darktree::traits::test_impls::MockTransport;
+/// use darktree::{Transport, Received};
+///
+/// let transport_a = MockTransport::new();
+/// let transport_b = MockTransport::new();
+///
+/// // Node A sends a message
+/// transport_a.protocol_outgoing().try_send(vec![1, 2, 3]).ok();
+///
+/// // Simulator delivers from A to B
+/// for queue in [transport_a.protocol_outgoing(), transport_a.app_outgoing()] {
 ///     while let Ok(msg) = queue.try_receive() {
-///         node_b.transport().incoming().try_send(Received {
+///         transport_b.incoming().try_send(Received {
 ///             data: msg,
 ///             rssi: Some(-50),
 ///         }).ok();
 ///     }
 /// }
+///
+/// // Node B receives the message
+/// let received = transport_b.incoming().try_receive().unwrap();
+/// assert_eq!(received.data, vec![1, 2, 3]);
+/// assert_eq!(received.rssi, Some(-50));
 /// ```
 pub trait Transport {
     /// Maximum transmission unit for this transport.
@@ -163,9 +180,27 @@ pub trait Transport {
 /// - Real hardware time (embassy_time, std::time)
 /// - Simulated time (controlled by simulator for deterministic testing)
 ///
+/// # Example (testing with MockClock)
+///
+/// ```
+/// use darktree::traits::test_impls::MockClock;
+/// use darktree::{Clock, Duration, Timestamp};
+///
+/// let clock = MockClock::new();
+/// assert_eq!(clock.now(), Timestamp::ZERO);
+///
+/// // Advance time manually
+/// clock.advance(Duration::from_secs(10));
+/// assert_eq!(clock.now(), Timestamp::from_secs(10));
+///
+/// // Set to specific time
+/// clock.set(Timestamp::from_millis(5000));
+/// assert_eq!(clock.now().as_millis(), 5000);
+/// ```
+///
 /// # Example (embedded with embassy)
 ///
-/// ```ignore
+/// ```text
 /// struct EmbassyClock;
 ///
 /// impl Clock for EmbassyClock {
@@ -265,9 +300,11 @@ pub trait Random {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_impls {
-    //! Test implementations of traits for unit testing.
+    //! Mock implementations of traits for unit testing and doc tests.
+    //!
+    //! Available when running tests or with the `test-support` feature enabled.
 
     use core::cell::Cell;
     use core::future::{ready, Ready};

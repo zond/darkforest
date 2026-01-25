@@ -6,9 +6,31 @@
 //! - Application sends via outgoing channel trigger routing/lookup
 //! - Internal timers trigger Pulse broadcasts
 //!
-//! # Usage
+//! # Example (node creation and state)
 //!
-//! ```ignore
+//! ```
+//! use darktree::{Node, DefaultConfig};
+//! use darktree::traits::test_impls::{MockTransport, MockCrypto, MockRandom, MockClock};
+//!
+//! let node = Node::<_, _, _, _, DefaultConfig>::new(
+//!     MockTransport::new(),
+//!     MockCrypto::new(),
+//!     MockRandom::new(),
+//!     MockClock::new(),
+//! );
+//!
+//! // Query node state
+//! let node_id = node.node_id();
+//! let pubkey = node.pubkey();
+//! let tau = node.tau(); // Bandwidth-aware time unit
+//!
+//! assert!(node.is_root());
+//! assert_eq!(node.tree_size(), 1);
+//! ```
+//!
+//! # Example (async integration)
+//!
+//! ```text
 //! let node = Node::new(transport, crypto, random, clock);
 //!
 //! // Spawn the node's run loop

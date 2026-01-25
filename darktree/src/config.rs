@@ -21,21 +21,41 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use darktree::{Node, DefaultConfig, SmallConfig};
+//! ```
+//! use darktree::{Node, DefaultConfig, SmallConfig, NodeConfig};
+//! use darktree::traits::test_impls::{MockTransport, MockCrypto, MockRandom, MockClock};
 //!
 //! // For 256KB+ RAM devices (default)
-//! let node = Node::<_, _, _, _, DefaultConfig>::new(transport, crypto, random, clock);
+//! let node = Node::<_, _, _, _, DefaultConfig>::new(
+//!     MockTransport::new(), MockCrypto::new(), MockRandom::new(), MockClock::new()
+//! );
+//! assert_eq!(node.tree_size(), 1);
 //!
 //! // For 64KB RAM devices
-//! let node = Node::<_, _, _, _, SmallConfig>::new(transport, crypto, random, clock);
+//! let node = Node::<_, _, _, _, SmallConfig>::new(
+//!     MockTransport::new(), MockCrypto::new(), MockRandom::new(), MockClock::new()
+//! );
+//! assert!(node.is_root());
 //!
 //! // Custom configuration
 //! struct MyConfig;
 //! impl NodeConfig for MyConfig {
 //!     const MAX_NEIGHBORS: usize = 16;
-//!     // ... other constants
+//!     const MAX_PUBKEY_CACHE: usize = 16;
+//!     const MAX_LOCATION_STORE: usize = 32;
+//!     const MAX_LOCATION_CACHE: usize = 8;
+//!     const MAX_PENDING_LOOKUPS: usize = 4;
+//!     const MAX_DISTRUSTED: usize = 8;
+//!     const MAX_SHORTCUTS: usize = 8;
+//!     const MAX_PENDING_DATA: usize = 4;
+//!     const MAX_MSGS_PER_PENDING_PUBKEY: usize = 2;
+//!     const MAX_PENDING_PUBKEY_NODES: usize = 4;
+//!     const MAX_PENDING_ACKS: usize = 8;
+//!     const MAX_RECENTLY_FORWARDED: usize = 32;
 //! }
+//! let node = Node::<_, _, _, _, MyConfig>::new(
+//!     MockTransport::new(), MockCrypto::new(), MockRandom::new(), MockClock::new()
+//! );
 //! ```
 
 /// Configuration trait for compile-time memory tuning.
