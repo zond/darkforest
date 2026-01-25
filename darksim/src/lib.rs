@@ -943,4 +943,96 @@ mod tests {
             "Merged tree should have 10 nodes (5 + 5)"
         );
     }
+
+    /// Scenario 4.1: Link Break Creates Partition
+    /// Setup: Tree with root R, child A, grandchild C. Break A—C link.
+    /// Run: 40τ (need 8 missed pulses ≈ 24τ for timeout)
+    /// Expect: Two trees: R's tree (R and A), C's tree (C as root).
+    #[test]
+    fn test_link_break_creates_partition() {
+        use crate::event::ScenarioAction;
+        use crate::topology::Link;
+
+        // Create simulator
+        let mut sim = Simulator::new(42);
+
+        // Create chain topology: R—A—C
+        let node_r = sim.add_node(1);
+        let node_a = sim.add_node(2);
+        let node_c = sim.add_node(3);
+
+        // R can see A, A can see both R and C, C can only see A
+        sim.topology_mut().add_link(node_r, node_a, Link::default());
+        sim.topology_mut().add_link(node_a, node_c, Link::default());
+
+        // Run to form the tree
+        sim.run_for(Duration::from_secs(5));
+
+        // Verify single tree formed with 3 nodes
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(snapshot.tree_count(), 1, "Should have 1 tree initially");
+
+        // Find the root (should be one of the nodes)
+        let root_id = [node_r, node_a, node_c]
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Should have a root");
+
+        let root_tree_size = sim.node(&root_id).unwrap().tree_size();
+        assert_eq!(root_tree_size, 3, "Initial tree should have 3 nodes");
+
+        // Break the A—C link (bidirectional)
+        sim.schedule_action(
+            sim.current_time(),
+            ScenarioAction::DisableLink {
+                from: node_a,
+                to: node_c,
+            },
+        );
+        sim.schedule_action(
+            sim.current_time(),
+            ScenarioAction::DisableLink {
+                from: node_c,
+                to: node_a,
+            },
+        );
+
+        // Run for timeout period (8 missed pulses × ~3τ = 24τ ≈ 2.4s at default τ=100ms)
+        // Using 30s to be safe
+        sim.run_for(Duration::from_secs(30));
+
+        // Verify two separate trees now exist
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(
+            snapshot.tree_count(),
+            2,
+            "Should have 2 trees after link break and timeout"
+        );
+
+        // C should now be root of its own tree
+        let c_node = sim.node(&node_c).unwrap();
+        assert!(
+            c_node.is_root(),
+            "C should become root after losing parent connection"
+        );
+        assert_eq!(c_node.tree_size(), 1, "C's tree should have size 1");
+
+        // R and A should still be connected (one is root, one is child)
+        let r_is_root = sim.node(&node_r).unwrap().is_root();
+        let a_is_root = sim.node(&node_a).unwrap().is_root();
+
+        // Exactly one of R or A is root
+        assert!(
+            (r_is_root && !a_is_root) || (!r_is_root && a_is_root),
+            "Exactly one of R/A should be root"
+        );
+
+        // The root's tree should have size 2
+        let ra_root_id = if r_is_root { node_r } else { node_a };
+        let ra_tree_size = sim.node(&ra_root_id).unwrap().tree_size();
+        assert_eq!(ra_tree_size, 2, "R-A tree should have size 2");
+    }
 }

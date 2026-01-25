@@ -102,10 +102,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 
 ## 4. Partitions & Recovery
 
-### 4.1 Link Break Creates Partition
-- **Setup:** Tree with root R, child A, grandchild C. Break A—C link at t=10τ.
-- **Run:** 40τ (need 8 missed pulses ≈ 24τ)
-- **Expect:** Two trees: R's tree (without C), C's tree (C as root of subtree).
+### 4.1 Link Break Creates Partition ✓
+- **Setup:** Tree with chain R—A—C. Break A—C link.
+- **Run:** 40τ (need 8 missed pulses ≈ 24τ for timeout)
+- **Expect:** Two trees: R-A tree (size 2), C tree (C as root, size 1).
+- **Status:** Implemented in `test_link_break_creates_partition`
 
 ### 4.2 Partition Heals
 - **Setup:** After 4.1, restore A—C link at t=50τ
