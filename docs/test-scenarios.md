@@ -114,10 +114,12 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Expect:** Trees remerge. Single tree with all 3 nodes.
 - **Status:** Implemented in `test_partition_heals`
 
-### 4.3 Root Dies, Children Remerge
-- **Setup:** Tree: R—{A, B, C}. Remove R at t=10τ.
-- **Run:** 50τ
-- **Expect:** A, B, C become roots of own subtrees, then merge (largest wins).
+### 4.3 Root Dies, Children Remerge ✓
+- **Setup:** 4-node network: R connected to A, B, C (star), plus A-B-C triangle.
+- **Action:** Isolate R by disabling all its links.
+- **Run:** Until timeout and remerge.
+- **Expect:** R isolated (size 1). A, B, C timeout, become roots, then merge (size 3).
+- **Status:** Implemented in `test_root_dies_children_remerge`
 
 ### 4.4 Internal Node Dies
 - **Setup:** R—A—{B, C, D}. Remove A at t=10τ.

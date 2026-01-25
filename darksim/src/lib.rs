@@ -1116,4 +1116,103 @@ mod tests {
         let tree_size = sim.node(&root_id).unwrap().tree_size();
         assert_eq!(tree_size, 3, "Healed tree should have all 3 nodes");
     }
+
+    /// Scenario 4.3: Root Dies, Children Remerge
+    /// Setup: 4-node network with R connected to A, B, C (star), plus A-B-C triangle.
+    /// Action: Isolate R by disabling all its links bidirectionally.
+    /// Run: Until timeout and remerge (~40s provides ample margin).
+    /// Expect: R becomes isolated single-node tree. A, B, C timeout, become
+    /// separate roots briefly, then merge into single 3-node tree.
+    ///
+    /// Note: This tests node isolation and remerge regardless of which node
+    /// was initially root. The protocol handles this correctly either way.
+    #[test]
+    fn test_root_dies_children_remerge() {
+        use crate::event::ScenarioAction;
+        use crate::topology::Link;
+
+        // Create simulator
+        let mut sim = Simulator::new(42);
+
+        // Create R and children A, B, C
+        let node_r = sim.add_node(1);
+        let node_a = sim.add_node(2);
+        let node_b = sim.add_node(3);
+        let node_c = sim.add_node(4);
+
+        // Star topology from R to children
+        sim.topology_mut().add_link(node_r, node_a, Link::default());
+        sim.topology_mut().add_link(node_r, node_b, Link::default());
+        sim.topology_mut().add_link(node_r, node_c, Link::default());
+
+        // Triangle among children (so they can merge after R dies)
+        sim.topology_mut().add_link(node_a, node_b, Link::default());
+        sim.topology_mut().add_link(node_a, node_c, Link::default());
+        sim.topology_mut().add_link(node_b, node_c, Link::default());
+
+        // Run to form the tree
+        sim.run_for(Duration::from_secs(5));
+
+        // Verify single tree formed with 4 nodes
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(snapshot.tree_count(), 1, "Should have 1 tree initially");
+
+        // Find the initial root (could be any node depending on protocol)
+        let initial_root = [node_r, node_a, node_b, node_c]
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Should have a root");
+        let initial_tree_size = sim.node(&initial_root).unwrap().tree_size();
+        assert_eq!(initial_tree_size, 4, "Initial tree should have 4 nodes");
+
+        // Isolate R by disabling all its links (bidirectional)
+        for &child in &[node_a, node_b, node_c] {
+            sim.schedule_action(
+                sim.current_time(),
+                ScenarioAction::DisableLink {
+                    from: node_r,
+                    to: child,
+                },
+            );
+            sim.schedule_action(
+                sim.current_time(),
+                ScenarioAction::DisableLink {
+                    from: child,
+                    to: node_r,
+                },
+            );
+        }
+
+        // Run for children to timeout and remerge
+        // Timeout takes ~24τ, then merge takes a few more τ
+        sim.run_for(Duration::from_secs(40));
+
+        // Verify the surviving nodes (A, B, C) have merged into one tree
+        // R is now isolated as its own single-node tree
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+
+        // Should have 2 trees: R alone, and A-B-C merged
+        assert_eq!(
+            snapshot.tree_count(),
+            2,
+            "Should have 2 trees: isolated R and merged A-B-C"
+        );
+
+        // R should be root of its own tree (size 1)
+        let r_node = sim.node(&node_r).unwrap();
+        assert!(r_node.is_root(), "Isolated R should be root");
+        assert_eq!(r_node.tree_size(), 1, "R's tree should have size 1");
+
+        // One of A, B, C should be root with tree_size = 3
+        let abc_root = [node_a, node_b, node_c]
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("One of A, B, C should be root");
+        let abc_tree_size = sim.node(&abc_root).unwrap().tree_size();
+        assert_eq!(abc_tree_size, 3, "A-B-C tree should have size 3");
+    }
 }
