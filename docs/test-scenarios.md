@@ -435,9 +435,10 @@ Verify protocol works correctly with constrained resources.
 - **Expect:** Rejected immediately.
 - **Status:** Implemented in `test_invalid_wire_type_rejected`
 
-### 17.5 Invalid Signature Algorithm
+### 17.5 Invalid Signature Algorithm ✓
 - **Setup:** Pulse with signature algorithm=0x99 (not Ed25519).
 - **Expect:** Rejected at decode or signature verification.
+- **Status:** Implemented in `test_invalid_signature_algorithm_rejected`
 
 ### 17.6 Children Not Sorted
 - **Setup:** Pulse with children in non-ascending hash order.

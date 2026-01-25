@@ -2636,4 +2636,67 @@ mod tests {
             "MessageDecodeFailed event should be emitted for invalid wire type"
         );
     }
+
+    /// Scenario 17.5: Invalid signature algorithm should be rejected.
+    #[test]
+    fn test_invalid_signature_algorithm_rejected() {
+        use darktree::debug::DebugEvent;
+        use darktree::wire::{Decode, DecodeError, Reader};
+
+        // Create a node
+        let mut sim = Simulator::new(42);
+        let n = sim.add_node(1);
+
+        // Get tau and trigger a pulse
+        let tau = sim.node(&n).unwrap().tau();
+        let future_time = sim.current_time() + tau * 3;
+        sim.node_mut(&n).unwrap().handle_timer(future_time);
+
+        // Capture the valid pulse
+        let pulses = sim.node(&n).unwrap().take_outgoing();
+        assert!(!pulses.is_empty(), "Node should have sent a pulse");
+        let valid_pulse = &pulses[0];
+
+        // A valid pulse has a signature at the end: 1 byte algorithm + 64 bytes sig = 65 bytes.
+        // The algorithm byte is at offset len - SIG_WIRE_SIZE.
+        const SIG_WIRE_SIZE: usize = 1 + 64; // algorithm byte + Ed25519 signature
+        let sig_algo_offset = valid_pulse.len() - SIG_WIRE_SIZE;
+
+        // Verify the original algorithm byte is 0x01 (ALGORITHM_ED25519)
+        assert_eq!(
+            valid_pulse[sig_algo_offset], 0x01,
+            "Expected ALGORITHM_ED25519 (0x01)"
+        );
+
+        // Create a message with invalid signature algorithm (0x99)
+        let mut invalid_msg = valid_pulse.clone();
+        invalid_msg[sig_algo_offset] = 0x99; // Invalid algorithm
+
+        // Verify the decode fails with InvalidSignature
+        let mut reader = Reader::new(&invalid_msg[1..]); // Skip wire_type byte
+        let result = darktree::types::Pulse::decode(&mut reader);
+
+        assert!(
+            matches!(result, Err(DecodeError::InvalidSignature)),
+            "Decode should fail with InvalidSignature for algorithm=0x99, got {:?}",
+            result
+        );
+
+        // Also verify that delivering this invalid message to a node
+        // results in MessageDecodeFailed event
+        sim.node(&n).unwrap().take_debug_events(); // Clear events
+        sim.node_mut(&n)
+            .unwrap()
+            .handle_transport_rx(&invalid_msg, None, future_time);
+
+        let events = sim.node(&n).unwrap().take_debug_events();
+        let decode_failed = events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::MessageDecodeFailed { .. }));
+
+        assert!(
+            decode_failed,
+            "MessageDecodeFailed event should be emitted for invalid signature algorithm"
+        );
+    }
 }
