@@ -283,13 +283,15 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 
 ## 11. Rate Limiting
 
-### 11.1 Pulse Rate Limit (2τ)
+### 11.1 Pulse Rate Limit (2τ) ✓
 - **Setup:** Node receives pulses from same neighbor faster than 2τ.
 - **Expect:** Excess pulses ignored (rate limited).
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_pulse_rate_limit`
 
-### 11.2 Rate Limit Scales with Bandwidth
+### 11.2 Rate Limit Scales with Bandwidth ✓
 - **Setup:** Low bandwidth (τ=6.7s) vs high bandwidth (τ=0.1s).
 - **Expect:** Rate limit is 13.4s vs 0.2s respectively.
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_rate_limit_scales_with_bandwidth`
 
 ---
 
