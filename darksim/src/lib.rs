@@ -1783,9 +1783,8 @@ mod tests {
     /// it sends a proactive pulse to inform neighbors. The pulse is scheduled
     /// in the range [τ, 2τ] to allow batching of multiple state changes.
     ///
-    /// Verification approach: After a state change (new child joins), we verify
-    /// that the child receives updated tree_size in P's pulse (tree_size=2),
-    /// proving P sent a pulse containing the new child info.
+    /// Verification approach: Using timestamps in DebugEvents, we verify that
+    /// after ChildAdded, a PulseSent with child_count >= 1 occurs within [τ, 2τ].
     #[test]
     fn test_proactive_pulse_on_state_change() {
         use crate::topology::Link;
@@ -1794,6 +1793,9 @@ mod tests {
         // Create parent node P alone
         let mut sim = Simulator::new(42);
         let p = sim.add_node(1);
+
+        // Get tau for timing verification
+        let tau = sim.node(&p).unwrap().tau();
 
         // Let P stabilize as root for 1 second
         sim.run_for(Duration::from_secs(1));
@@ -1807,9 +1809,6 @@ mod tests {
         // Drain P's debug events to clear history
         sim.node(&p).unwrap().take_debug_events();
 
-        // Record time before adding child
-        let t_before = sim.current_time();
-
         // Create child node C and connect to P
         let c = sim.add_node(2);
         sim.topology_mut().add_link(p, c, Link::default());
@@ -1819,21 +1818,53 @@ mod tests {
         // plus parent exchange takes a few more τ
         sim.run_for(Duration::from_secs(2));
 
-        // Now check P's debug events - should see ChildAdded
+        // Now check P's debug events - should see ChildAdded and PulseSent
         let p_events = sim.node(&p).unwrap().take_debug_events();
 
-        // Look for ChildAdded event - this indicates P accepted C as child
-        let child_added = p_events
-            .iter()
-            .any(|e| matches!(e, DebugEvent::ChildAdded { .. }));
+        // Find the ChildAdded timestamp
+        let child_added_time = p_events.iter().find_map(|e| match e {
+            DebugEvent::ChildAdded { timestamp, .. } => Some(*timestamp),
+            _ => None,
+        });
 
         assert!(
-            child_added,
+            child_added_time.is_some(),
             "P should have emitted ChildAdded event after C joined"
         );
+        let child_added_time = child_added_time.unwrap();
 
-        // Check that C received pulses from P showing tree_size=2
-        // This proves P sent a proactive pulse after adding C as child
+        // Find first PulseSent with child_count >= 1 AFTER ChildAdded
+        let proactive_pulse_time = p_events.iter().find_map(|e| match e {
+            DebugEvent::PulseSent {
+                timestamp,
+                child_count,
+                ..
+            } if *child_count >= 1 && *timestamp >= child_added_time => Some(*timestamp),
+            _ => None,
+        });
+
+        assert!(
+            proactive_pulse_time.is_some(),
+            "P should have sent a pulse with child_count >= 1 after adding child"
+        );
+        let proactive_pulse_time = proactive_pulse_time.unwrap();
+
+        // Verify timing: proactive pulse should be within [τ, 2τ] of state change
+        let delay = proactive_pulse_time - child_added_time;
+        let min_delay = tau;
+        let max_delay = tau * 2;
+
+        assert!(
+            delay >= min_delay && delay <= max_delay,
+            "Proactive pulse should be sent within [τ, 2τ] of state change. \
+             τ={:?}, delay={:?}, expected [{:?}, {:?}]",
+            tau,
+            delay,
+            min_delay,
+            max_delay
+        );
+
+        // Also verify C received the updated pulse
         let c_events = sim.node(&c).unwrap().take_debug_events();
         let received_updated_pulse_from_p = c_events.iter().any(|e| {
             matches!(
@@ -1844,16 +1875,7 @@ mod tests {
 
         assert!(
             received_updated_pulse_from_p,
-            "C should have received pulse from P with tree_size=2 (proves proactive pulse sent)"
-        );
-
-        // Verify the timing - the total elapsed time should be reasonable
-        let elapsed = sim.current_time() - t_before;
-        let expected_max = Duration::from_secs(2);
-        assert!(
-            elapsed <= expected_max,
-            "Tree should form within 2 seconds (elapsed: {:?})",
-            elapsed
+            "C should have received pulse from P with tree_size=2"
         );
 
         // Verify tree formed correctly

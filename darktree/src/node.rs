@@ -671,6 +671,7 @@ where
 
                 #[cfg(feature = "debug")]
                 self.emit_debug(crate::debug::DebugEvent::ShoppingEnded {
+                    timestamp: now,
                     neighbor_count: self.neighbor_times.len(),
                 });
 
@@ -1076,7 +1077,10 @@ where
         self.shopping_deadline = Some(deadline);
 
         #[cfg(feature = "debug")]
-        self.emit_debug(crate::debug::DebugEvent::ShoppingStarted { deadline });
+        self.emit_debug(crate::debug::DebugEvent::ShoppingStarted {
+            timestamp: now,
+            deadline,
+        });
     }
 
     pub(crate) fn secret(&self) -> &SecretKey {

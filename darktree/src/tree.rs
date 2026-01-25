@@ -183,6 +183,7 @@ where
 
         #[cfg(feature = "debug")]
         self.emit_debug(crate::debug::DebugEvent::PulseReceived {
+            timestamp: now,
             from: pulse.node_id,
             tree_size: pulse.tree_size,
             root_hash: pulse.root_hash,
@@ -415,6 +416,7 @@ where
         #[cfg(feature = "debug")]
         if is_new {
             self.emit_debug(crate::debug::DebugEvent::ChildAdded {
+                timestamp: now,
                 child_id: pulse.node_id,
                 subtree_size: pulse.subtree_size,
             });
@@ -789,6 +791,16 @@ where
     pub(crate) fn send_pulse(&mut self, now: Timestamp) {
         let pulse = self.build_pulse();
 
+        // Extract info for debug event before encoding consumes the pulse
+        #[cfg(feature = "debug")]
+        let debug_info = (
+            pulse.tree_size,
+            pulse.root_hash,
+            pulse.child_count(),
+            pulse.has_pubkey(),
+            pulse.need_pubkey(),
+        );
+
         // Encode with message type
         let msg = Message::Pulse(pulse);
         let encoded = msg.encode_to_vec();
@@ -804,7 +816,19 @@ where
 
         // Send via protocol queue (high priority)
         match self.transport().protocol_outgoing().try_send(encoded) {
-            Ok(()) => self.record_protocol_sent(),
+            Ok(()) => {
+                self.record_protocol_sent();
+
+                #[cfg(feature = "debug")]
+                self.emit_debug(crate::debug::DebugEvent::PulseSent {
+                    timestamp: now,
+                    tree_size: debug_info.0,
+                    root_hash: debug_info.1,
+                    child_count: debug_info.2,
+                    has_pubkey: debug_info.3,
+                    need_pubkey: debug_info.4,
+                });
+            }
             Err(_) => self.record_protocol_dropped(),
         }
         self.set_last_pulse(Some(now));

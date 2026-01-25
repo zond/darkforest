@@ -18,9 +18,15 @@ pub type DebugChannel = Channel<ChannelMutex, DebugEvent, DEBUG_QUEUE_SIZE>;
 #[derive(Debug, Clone)]
 pub enum DebugEvent {
     /// Shopping phase started (first boot or merge).
-    ShoppingStarted { deadline: Timestamp },
+    ShoppingStarted {
+        timestamp: Timestamp,
+        deadline: Timestamp,
+    },
     /// Shopping phase ended, calling select_best_parent.
-    ShoppingEnded { neighbor_count: usize },
+    ShoppingEnded {
+        timestamp: Timestamp,
+        neighbor_count: usize,
+    },
     /// select_best_parent found candidates.
     SelectBestParent {
         candidate_count: usize,
@@ -40,6 +46,7 @@ pub enum DebugEvent {
     PendingParentTimeout { parent_id: NodeId, attempts: u8 },
     /// Received pulse from a node.
     PulseReceived {
+        timestamp: Timestamp,
         from: NodeId,
         tree_size: u32,
         root_hash: [u8; 4],
@@ -57,9 +64,14 @@ pub enum DebugEvent {
         reason: &'static str,
     },
     /// Child added to our tree.
-    ChildAdded { child_id: NodeId, subtree_size: u32 },
+    ChildAdded {
+        timestamp: Timestamp,
+        child_id: NodeId,
+        subtree_size: u32,
+    },
     /// Pulse sent.
     PulseSent {
+        timestamp: Timestamp,
         tree_size: u32,
         root_hash: [u8; 4],
         child_count: u8,
