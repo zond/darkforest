@@ -3569,4 +3569,154 @@ mod tests {
             "N should have the same NodeId after restart"
         );
     }
+
+    /// Scenario 18.1: Simultaneous Three-Way Merge
+    /// Setup: Three separate trees (A: 10, B: 8, C: 6 nodes) all connect simultaneously.
+    /// Run: 50τ
+    /// Expect: Single tree with A's root. No oscillation or split-brain.
+    ///
+    /// Uses smaller node counts (10, 8, 6 vs spec's 100, 80, 60) for test efficiency
+    /// while preserving the relative size proportions.
+    #[test]
+    fn test_simultaneous_three_way_merge() {
+        use crate::topology::Link;
+
+        let mut sim = Simulator::new(42);
+
+        // Create Group A: 10 nodes, fully connected within group
+        let mut group_a = Vec::with_capacity(10);
+        for i in 0..10 {
+            group_a.push(sim.add_node(1000 + i));
+        }
+        for i in 0..group_a.len() {
+            for j in (i + 1)..group_a.len() {
+                sim.topology_mut()
+                    .add_link(group_a[i], group_a[j], Link::default());
+            }
+        }
+
+        // Create Group B: 8 nodes, fully connected within group
+        let mut group_b = Vec::with_capacity(8);
+        for i in 0..8 {
+            group_b.push(sim.add_node(2000 + i));
+        }
+        for i in 0..group_b.len() {
+            for j in (i + 1)..group_b.len() {
+                sim.topology_mut()
+                    .add_link(group_b[i], group_b[j], Link::default());
+            }
+        }
+
+        // Create Group C: 6 nodes, fully connected within group
+        let mut group_c = Vec::with_capacity(6);
+        for i in 0..6 {
+            group_c.push(sim.add_node(3000 + i));
+        }
+        for i in 0..group_c.len() {
+            for j in (i + 1)..group_c.len() {
+                sim.topology_mut()
+                    .add_link(group_c[i], group_c[j], Link::default());
+            }
+        }
+
+        // No links between groups initially (partitioned)
+
+        // Run to let each group form its own tree (5 seconds = ~50τ at default tau)
+        sim.run_for(Duration::from_secs(5));
+
+        // Verify three separate trees formed
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(snapshot.tree_count(), 3, "Should have 3 separate trees");
+
+        // Find the roots
+        let group_a_root = group_a
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Group A should have a root");
+        let group_b_root = group_b
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Group B should have a root");
+        let group_c_root = group_c
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Group C should have a root");
+
+        // Verify tree sizes
+        assert_eq!(sim.node(&group_a_root).unwrap().tree_size(), 10);
+        assert_eq!(sim.node(&group_b_root).unwrap().tree_size(), 8);
+        assert_eq!(sim.node(&group_c_root).unwrap().tree_size(), 6);
+
+        // Connect ALL groups SIMULTANEOUSLY:
+        // A-B link, B-C link, A-C link (creates a triangle between groups)
+        sim.topology_mut()
+            .add_link(group_a[0], group_b[0], Link::default());
+        sim.topology_mut()
+            .add_link(group_b[0], group_c[0], Link::default());
+        sim.topology_mut()
+            .add_link(group_a[1], group_c[1], Link::default());
+
+        // Run for merge to complete (50τ ~ 5 seconds at default tau)
+        sim.run_for(Duration::from_secs(5));
+
+        // Verify single tree formed (no split-brain)
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(
+            snapshot.tree_count(),
+            1,
+            "Should have merged to 1 tree (no split-brain)"
+        );
+
+        // Find the final root
+        let all_nodes: Vec<_> = group_a
+            .iter()
+            .chain(group_b.iter())
+            .chain(group_c.iter())
+            .copied()
+            .collect();
+
+        let final_root = all_nodes
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Should have a root");
+
+        // The largest tree (A) should win - its root should be the final root
+        assert!(
+            group_a.contains(&final_root),
+            "Final root should be from largest group A (size 10)"
+        );
+
+        // Verify former roots of B and C are no longer roots
+        assert!(
+            !sim.node(&group_b_root).unwrap().is_root(),
+            "Group B's former root should have been inverted"
+        );
+        assert!(
+            !sim.node(&group_c_root).unwrap().is_root(),
+            "Group C's former root should have been inverted"
+        );
+
+        // Verify final tree size is 24 (10 + 8 + 6)
+        let final_tree_size = sim.node(&final_root).unwrap().tree_size();
+        assert_eq!(
+            final_tree_size, 24,
+            "Merged tree should have 24 nodes (10 + 8 + 6)"
+        );
+
+        // Verify all nodes are in the same tree (no oscillation)
+        let expected_root_hash = sim.node(&final_root).unwrap().root_hash();
+        for node_id in &all_nodes {
+            let root_hash = sim.node(node_id).unwrap().root_hash();
+            assert_eq!(
+                root_hash, expected_root_hash,
+                "All nodes should have the same root_hash (no oscillation)"
+            );
+        }
+    }
 }

@@ -461,10 +461,11 @@ Verify protocol works correctly with constrained resources.
 
 ## 18. Race Conditions
 
-### 18.1 Simultaneous Three-Way Merge
+### 18.1 Simultaneous Three-Way Merge ✓
 - **Setup:** Three separate trees (A: 100, B: 80, C: 60 nodes) all connect simultaneously.
 - **Run:** 50τ
 - **Expect:** Single tree with A's root. No oscillation or split-brain.
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_simultaneous_three_way_merge` (uses 10/8/6 nodes for efficiency)
 
 ### 18.2 Simultaneous Child Joins ✓
 - **Setup:** Parent P with 10 children. 5 new nodes try to join P simultaneously.
