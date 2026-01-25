@@ -389,26 +389,49 @@ where
         }
     }
 
-    /// Handle timeouts for pending lookups and other operations.
-    pub(crate) fn handle_timeouts(&mut self, now: Timestamp) {
-        use crate::types::{Event, K_REPLICAS};
+    /// Check lookup timeouts, returning entries needing action and next timeout.
+    ///
+    /// Returns ((retry_list, failed_list), next_timeout_time).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn check_lookup_timeouts(
+        &self,
+        now: Timestamp,
+    ) -> ((Vec<([u8; 16], usize)>, Vec<[u8; 16]>), Option<Timestamp>) {
+        use crate::types::K_REPLICAS;
 
-        let timeout = self.lookup_timeout();
+        let timeout_duration = self.lookup_timeout();
 
-        // Collect lookups that need action
         let mut retry_lookups = Vec::new();
         let mut failed_lookups = Vec::new();
+        let mut next_timeout: Option<Timestamp> = None;
 
         for (target, lookup) in self.pending_lookups().iter() {
-            let elapsed = now.saturating_sub(lookup.last_query_at);
-            if elapsed >= timeout {
+            let timeout_at = lookup.last_query_at + timeout_duration;
+            if now >= timeout_at {
                 if lookup.replica_index + 1 < K_REPLICAS {
                     retry_lookups.push((*target, lookup.replica_index + 1));
                 } else {
                     failed_lookups.push(*target);
                 }
+            } else {
+                // Track earliest future timeout
+                next_timeout = Some(match next_timeout {
+                    Some(t) => t.min(timeout_at),
+                    None => timeout_at,
+                });
             }
         }
+
+        ((retry_lookups, failed_lookups), next_timeout)
+    }
+
+    /// Handle timeouts for pending lookups and other operations.
+    ///
+    /// Returns the next timeout time (if any pending lookups remain).
+    pub(crate) fn handle_timeouts(&mut self, now: Timestamp) -> Option<Timestamp> {
+        use crate::types::Event;
+
+        let ((retry_lookups, failed_lookups), next_timeout) = self.check_lookup_timeouts(now);
 
         // Process retries
         for (target, next_replica) in retry_lookups {
@@ -425,6 +448,8 @@ where
             self.pending_data_mut().remove(&target);
             self.push_event(Event::LookupFailed { node_id: target });
         }
+
+        next_timeout
     }
 
     /// Hash a node_id with replica index to get DHT key.

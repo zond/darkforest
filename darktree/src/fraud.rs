@@ -33,17 +33,17 @@ const HLL_REGISTERS: usize = 256;
 const MIN_RESET_INTERVAL_SECS: u64 = 3600;
 
 /// Secret key size for SipHash.
-pub const HLL_SECRET_KEY_SIZE: usize = 16;
+pub(crate) const HLL_SECRET_KEY_SIZE: usize = 16;
 
 /// HyperLogLog secret key type.
-pub type HllSecretKey = [u8; HLL_SECRET_KEY_SIZE];
+pub(crate) type HllSecretKey = [u8; HLL_SECRET_KEY_SIZE];
 
 /// Fraud detection state using HyperLogLog.
 ///
 /// Uses PUBLISH traffic to verify claimed tree sizes by estimating unique publishers.
 /// See docs/design.md "Tree Size Verification" for the statistical model.
 #[derive(Clone, Debug)]
-pub struct FraudDetection {
+pub(crate) struct FraudDetection {
     /// HyperLogLog registers for cardinality estimation.
     /// Each register stores the maximum leading zeros seen (0-64, fits in u8).
     hll_registers: [u8; HLL_REGISTERS],

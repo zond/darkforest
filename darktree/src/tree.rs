@@ -909,22 +909,46 @@ where
         pulse
     }
 
-    /// Handle timeouts for neighbors, pending operations, etc.
-    pub(crate) fn handle_neighbor_timeouts(&mut self, now: Timestamp) {
-        // Collect timed out neighbors
+    /// Calculate timeout timestamp for a neighbor based on their pulse interval.
+    fn neighbor_timeout(&self, timing: &NeighborTiming) -> Timestamp {
+        let interval = timing
+            .prev_seen
+            .map(|prev| timing.last_seen.saturating_sub(prev))
+            .unwrap_or_else(|| self.tau() * 5);
+        timing.last_seen + interval * MISSED_PULSES_TIMEOUT
+    }
+
+    /// Check neighbor timeouts, returning timed out IDs and next timeout time.
+    ///
+    /// Returns (timed_out_neighbors, next_timeout_time).
+    pub(crate) fn check_neighbor_timeouts(
+        &self,
+        now: Timestamp,
+    ) -> (Vec<[u8; 16]>, Option<Timestamp>) {
         let mut timed_out: Vec<[u8; 16]> = Vec::new();
+        let mut next_timeout: Option<Timestamp> = None;
 
         for (id, timing) in self.neighbor_times().iter() {
-            let interval = timing
-                .prev_seen
-                .map(|prev| timing.last_seen.saturating_sub(prev))
-                .unwrap_or_else(|| self.tau() * 5);
-
-            let timeout = timing.last_seen + interval * MISSED_PULSES_TIMEOUT;
+            let timeout = self.neighbor_timeout(timing);
             if now > timeout {
                 timed_out.push(*id);
+            } else {
+                // Track earliest future timeout
+                next_timeout = Some(match next_timeout {
+                    Some(t) => t.min(timeout),
+                    None => timeout,
+                });
             }
         }
+
+        (timed_out, next_timeout)
+    }
+
+    /// Handle timeouts for neighbors, pending operations, etc.
+    ///
+    /// Returns the next timeout time (if any neighbors remain).
+    pub(crate) fn handle_neighbor_timeouts(&mut self, now: Timestamp) -> Option<Timestamp> {
+        let (timed_out, next_timeout) = self.check_neighbor_timeouts(now);
 
         // Process timeouts
         for id in timed_out {
@@ -950,6 +974,8 @@ where
             self.pubkey_cache_mut().remove(&id);
             self.need_pubkey_mut().remove(&id);
         }
+
+        next_timeout
     }
 
     /// Handle location entry expiration.

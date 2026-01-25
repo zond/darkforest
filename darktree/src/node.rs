@@ -66,7 +66,7 @@ use crate::types::{
 
 /// Timing, signal, and tree information for a neighbor.
 #[derive(Clone, Debug)]
-pub struct NeighborTiming {
+pub(crate) struct NeighborTiming {
     /// Last time we received a Pulse from this neighbor.
     pub last_seen: Timestamp,
     /// Previous Pulse time (for interval estimation).
@@ -85,10 +85,11 @@ pub struct NeighborTiming {
 
 /// Pending lookup state.
 #[derive(Clone, Debug)]
-pub struct PendingLookup {
+pub(crate) struct PendingLookup {
     /// Current replica index being tried (0, 1, or 2).
     pub replica_index: usize,
     /// When the lookup started.
+    #[allow(dead_code)] // Reserved for future debugging/metrics
     pub started_at: Timestamp,
     /// When current replica query was sent.
     pub last_query_at: Timestamp,
@@ -96,41 +97,42 @@ pub struct PendingLookup {
 
 /// Context for fraud detection when joining a tree.
 #[derive(Clone, Copy, Debug)]
-pub struct JoinContext {
+pub(crate) struct JoinContext {
     /// Parent node when we joined.
     pub parent_at_join: NodeId,
     /// Time when we joined.
+    #[allow(dead_code)] // Reserved for fraud detection timing
     pub join_time: Timestamp,
 }
 
 // Type aliases for collections
-pub type ChildMap = BTreeMap<NodeId, u32>;
+pub(crate) type ChildMap = BTreeMap<NodeId, u32>;
 /// Child ranges: child_id -> (keyspace_lo, keyspace_hi).
-pub type ChildRanges = HashMap<NodeId, (u32, u32)>;
+pub(crate) type ChildRanges = HashMap<NodeId, (u32, u32)>;
 /// Shortcuts: shortcut_id -> (keyspace_lo, keyspace_hi).
-pub type ShortcutMap = HashMap<NodeId, (u32, u32)>;
-pub type NeighborTimingMap = HashMap<NodeId, NeighborTiming>;
+pub(crate) type ShortcutMap = HashMap<NodeId, (u32, u32)>;
+pub(crate) type NeighborTimingMap = HashMap<NodeId, NeighborTiming>;
 /// Pubkey cache: node_id -> (pubkey, last_used).
-pub type PubkeyCache = HashMap<NodeId, (PublicKey, Timestamp)>;
-pub type NeedPubkeySet = BTreeSet<NodeId>;
-pub type NeighborsNeedPubkeySet = BTreeSet<NodeId>;
-pub type LocationStore = HashMap<NodeId, LocationEntry>;
+pub(crate) type PubkeyCache = HashMap<NodeId, (PublicKey, Timestamp)>;
+pub(crate) type NeedPubkeySet = BTreeSet<NodeId>;
+pub(crate) type NeighborsNeedPubkeySet = BTreeSet<NodeId>;
+pub(crate) type LocationStore = HashMap<NodeId, LocationEntry>;
 /// Location cache: node_id -> (keyspace_addr, last_used).
-pub type LocationCache = HashMap<NodeId, (u32, Timestamp)>;
-pub type PendingLookupMap = HashMap<NodeId, PendingLookup>;
-pub type PendingDataMap = HashMap<NodeId, Vec<u8>>;
-pub type DistrustedMap = HashMap<NodeId, Timestamp>;
+pub(crate) type LocationCache = HashMap<NodeId, (u32, Timestamp)>;
+pub(crate) type PendingLookupMap = HashMap<NodeId, PendingLookup>;
+pub(crate) type PendingDataMap = HashMap<NodeId, Vec<u8>>;
+pub(crate) type DistrustedMap = HashMap<NodeId, Timestamp>;
 /// Messages awaiting pubkey for a specific node_id (keyed by the node whose pubkey is needed).
-pub type PendingPubkeyMap = HashMap<NodeId, VecDeque<Routed>>;
+pub(crate) type PendingPubkeyMap = HashMap<NodeId, VecDeque<Routed>>;
 
 /// 8-byte hash used for ACK identification.
-pub type AckHash = [u8; 8];
+pub(crate) type AckHash = [u8; 8];
 
 /// Pending ACK entry for link-layer reliability.
 ///
 /// Tracks a message awaiting acknowledgment with exponential backoff retry.
 #[derive(Clone, Debug)]
-pub struct PendingAck {
+pub(crate) struct PendingAck {
     /// Original encoded message bytes for retransmission.
     pub original_bytes: Vec<u8>,
     /// Number of retries attempted so far.
@@ -140,10 +142,10 @@ pub struct PendingAck {
 }
 
 /// Map of pending ACKs keyed by message hash.
-pub type PendingAckMap = HashMap<AckHash, PendingAck>;
+pub(crate) type PendingAckMap = HashMap<AckHash, PendingAck>;
 
 /// Map of recently forwarded message hashes for duplicate detection.
-pub type RecentlyForwardedMap = HashMap<AckHash, Timestamp>;
+pub(crate) type RecentlyForwardedMap = HashMap<AckHash, Timestamp>;
 
 /// The main protocol node.
 ///
@@ -358,7 +360,7 @@ where
     }
 
     /// Compute the 4-byte hash of a node_id.
-    pub fn compute_node_hash(&self, node_id: &NodeId) -> ChildHash {
+    pub(crate) fn compute_node_hash(&self, node_id: &NodeId) -> ChildHash {
         Self::compute_node_hash_static(&self.crypto, node_id)
     }
 
@@ -477,7 +479,7 @@ where
     /// Lookup timeout: 32τ per replica
     /// For LoRa (τ=6.7s): ~3.5 minutes
     /// For UDP (τ=0.1s): ~3 seconds
-    pub fn lookup_timeout(&self) -> Duration {
+    pub(crate) fn lookup_timeout(&self) -> Duration {
         self.tau() * 32
     }
 
@@ -611,11 +613,27 @@ where
         Some(next)
     }
 
-    /// Calculate next timeout time (lookups, neighbors, locations).
+    /// Calculate next timeout time based on pending operations.
+    ///
+    /// Returns the earliest of: neighbor timeouts, pending ACK retries,
+    /// and pending lookup timeouts.
     fn next_timeout_time(&self) -> Option<Timestamp> {
-        // For now, check timeouts every 10 seconds
-        // A more sophisticated implementation would track exact timeout times
-        Some(self.clock.now() + Duration::from_secs(10))
+        let now = self.clock.now();
+
+        // Get next neighbor timeout
+        let (_, neighbor_timeout) = self.check_neighbor_timeouts(now);
+
+        // Get next ACK timeout
+        let (_, ack_timeout) = self.check_ack_timeouts(now);
+
+        // Get next lookup timeout
+        let (_, lookup_timeout) = self.check_lookup_timeouts(now);
+
+        // Return minimum of all timeouts
+        [neighbor_timeout, ack_timeout, lookup_timeout]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Handle incoming transport message.
@@ -729,13 +747,22 @@ where
         self.handle_fraud_check(now);
     }
 
-    /// Handle ACK timeouts - retransmit or give up on pending messages.
-    fn handle_ack_timeouts(&mut self, now: Timestamp) {
+    /// Check ACK timeouts, returning entries needing action and next timeout.
+    ///
+    /// Returns ((retransmit_list, give_up_list), next_timeout_time).
+    #[allow(clippy::type_complexity)]
+    fn check_ack_timeouts(
+        &self,
+        now: Timestamp,
+    ) -> (
+        (Vec<(AckHash, Vec<u8>, u8)>, Vec<AckHash>),
+        Option<Timestamp>,
+    ) {
         use crate::types::MAX_RETRIES;
 
-        // Collect entries that need action to avoid borrow issues
         let mut retransmit = Vec::new();
         let mut give_up = Vec::new();
+        let mut next_timeout: Option<Timestamp> = None;
 
         for (&hash, pending) in self.pending_acks.iter() {
             if now >= pending.next_retry_at {
@@ -744,8 +771,23 @@ where
                 } else {
                     give_up.push(hash);
                 }
+            } else {
+                // Track earliest future timeout
+                next_timeout = Some(match next_timeout {
+                    Some(t) => t.min(pending.next_retry_at),
+                    None => pending.next_retry_at,
+                });
             }
         }
+
+        ((retransmit, give_up), next_timeout)
+    }
+
+    /// Handle ACK timeouts - retransmit or give up on pending messages.
+    ///
+    /// Returns the next timeout time (if any pending ACKs remain).
+    fn handle_ack_timeouts(&mut self, now: Timestamp) -> Option<Timestamp> {
+        let ((retransmit, give_up), next_timeout) = self.check_ack_timeouts(now);
 
         // Process retransmissions
         for (hash, bytes, retries) in retransmit {
@@ -771,6 +813,8 @@ where
         for hash in give_up {
             self.pending_acks.remove(&hash);
         }
+
+        next_timeout
     }
 
     /// Clean up old entries from recently_forwarded.
