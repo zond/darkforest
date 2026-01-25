@@ -300,9 +300,10 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Setup:** Parent has 12 children. 13th node tries to join.
 - **Expect:** 13th node rejected (implicit, via missing from children list).
 
-### 12.3 Keyspace Rebalance on Child Join
+### 12.3 Keyspace Rebalance on Child Join ✓
 - **Setup:** P has children C1, C2. C3 joins.
 - **Expect:** P recomputes keyspace ranges for all children.
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_keyspace_rebalance_on_child_join`
 
 ### 12.4 Proactive Pulse on State Change ✓
 - **Setup:** Node's tree state changes (new child, new parent, etc.)

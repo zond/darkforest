@@ -2778,4 +2778,197 @@ mod tests {
             "MessageDecodeFailed event should be emitted for unsorted children"
         );
     }
+
+    /// Scenario 12.3: Keyspace rebalances when a new child joins.
+    ///
+    /// Per design doc, keyspace division works as:
+    /// 1. Parent keeps first slice: [lo, lo + range/subtree_size)
+    /// 2. Children divide remainder proportionally by subtree_size
+    /// 3. Children sorted by hash get contiguous slices
+    ///
+    /// For 2 children (each subtree_size=1): parent subtree_size=3, each gets ~range/3
+    /// For 3 children (each subtree_size=1): parent subtree_size=4, each gets ~range/4
+    ///
+    /// When C3 joins, BOTH C1 and C2 should shrink to make room.
+    #[test]
+    fn test_keyspace_rebalance_on_child_join() {
+        use crate::topology::Link;
+
+        // Setup: Parent P with children C1, C2. Then C3 joins.
+        // Expect: P recomputes keyspace ranges for all children.
+
+        let mut sim = Simulator::new(42);
+
+        // Add P first (will be oldest, likely to be root)
+        let p = sim.add_node(100);
+        let c1 = sim.add_node(101);
+        let c2 = sim.add_node(102);
+
+        // Connect C1 and C2 to P (but not to each other)
+        sim.topology_mut().add_link(p, c1, Link::new());
+        sim.topology_mut().add_link(p, c2, Link::new());
+
+        // Run until tree forms with P as parent of C1 and C2
+        let tau = sim.node(&p).unwrap().tau();
+        sim.run_for(tau * 20);
+
+        // Verify P is root
+        assert!(
+            sim.node(&p).unwrap().is_root(),
+            "P should be root after initial tree formation"
+        );
+
+        // Verify C1 and C2 have P as parent
+        assert!(
+            sim.node(&c1).unwrap().parent_id().is_some(),
+            "C1 should have a parent"
+        );
+        assert!(
+            sim.node(&c2).unwrap().parent_id().is_some(),
+            "C2 should have a parent"
+        );
+
+        // Record keyspace ranges after initial formation (2 children)
+        let p_range_before = sim.node(&p).unwrap().keyspace_range();
+        let c1_range_before = sim.node(&c1).unwrap().keyspace_range();
+        let c2_range_before = sim.node(&c2).unwrap().keyspace_range();
+
+        // Verify P has full keyspace (it's root)
+        assert_eq!(
+            p_range_before,
+            (0, u32::MAX),
+            "P (root) should have full keyspace"
+        );
+
+        // Verify C1 and C2 have non-full keyspace
+        assert!(
+            c1_range_before != (0, u32::MAX),
+            "C1 should not have full keyspace"
+        );
+        assert!(
+            c2_range_before != (0, u32::MAX),
+            "C2 should not have full keyspace"
+        );
+
+        // With 2 children, subtree_size=3. Each child should get ~1/3 of keyspace.
+        // Allow 1% tolerance for rounding.
+        let expected_child_width = u32::MAX as u64 / 3;
+        let c1_width_before = c1_range_before.1 as u64 - c1_range_before.0 as u64;
+        let c2_width_before = c2_range_before.1 as u64 - c2_range_before.0 as u64;
+        let tolerance = expected_child_width / 100 + 1;
+
+        assert!(
+            (c1_width_before as i64 - expected_child_width as i64).unsigned_abs() <= tolerance,
+            "C1 should have ~1/3 keyspace. Expected ~{}, got {}",
+            expected_child_width,
+            c1_width_before
+        );
+        assert!(
+            (c2_width_before as i64 - expected_child_width as i64).unsigned_abs() <= tolerance,
+            "C2 should have ~1/3 keyspace. Expected ~{}, got {}",
+            expected_child_width,
+            c2_width_before
+        );
+
+        // Now add C3 and connect it to P
+        let c3 = sim.add_node(103);
+        sim.topology_mut().add_link(p, c3, Link::new());
+
+        // Run until C3 joins as a child of P
+        sim.run_for(tau * 20);
+
+        // Verify C3 joined P
+        assert!(
+            sim.node(&c3).unwrap().parent_id().is_some(),
+            "C3 should have a parent"
+        );
+
+        // Get new keyspace ranges
+        let c1_range_after = sim.node(&c1).unwrap().keyspace_range();
+        let c2_range_after = sim.node(&c2).unwrap().keyspace_range();
+        let c3_range_after = sim.node(&c3).unwrap().keyspace_range();
+
+        // Verify C3 has non-full keyspace (it joined the tree)
+        assert!(
+            c3_range_after != (0, u32::MAX),
+            "C3 should not have full keyspace after joining"
+        );
+
+        // BOTH C1 and C2 should have changed - they shrink from 1/3 to 1/4
+        assert!(
+            c1_range_before != c1_range_after,
+            "C1's keyspace should change when C3 joins. Before: {:?}, after: {:?}",
+            c1_range_before,
+            c1_range_after
+        );
+        assert!(
+            c2_range_before != c2_range_after,
+            "C2's keyspace should change when C3 joins. Before: {:?}, after: {:?}",
+            c2_range_before,
+            c2_range_after
+        );
+
+        // With 3 children, subtree_size=4. Each child should get ~1/4 of keyspace.
+        let expected_child_width_after = u32::MAX as u64 / 4;
+        let c1_width_after = c1_range_after.1 as u64 - c1_range_after.0 as u64;
+        let c2_width_after = c2_range_after.1 as u64 - c2_range_after.0 as u64;
+        let c3_width_after = c3_range_after.1 as u64 - c3_range_after.0 as u64;
+        let tolerance_after = expected_child_width_after / 100 + 1;
+
+        assert!(
+            (c1_width_after as i64 - expected_child_width_after as i64).unsigned_abs()
+                <= tolerance_after,
+            "C1 should have ~1/4 keyspace after. Expected ~{}, got {}",
+            expected_child_width_after,
+            c1_width_after
+        );
+        assert!(
+            (c2_width_after as i64 - expected_child_width_after as i64).unsigned_abs()
+                <= tolerance_after,
+            "C2 should have ~1/4 keyspace after. Expected ~{}, got {}",
+            expected_child_width_after,
+            c2_width_after
+        );
+        assert!(
+            (c3_width_after as i64 - expected_child_width_after as i64).unsigned_abs()
+                <= tolerance_after,
+            "C3 should have ~1/4 keyspace after. Expected ~{}, got {}",
+            expected_child_width_after,
+            c3_width_after
+        );
+
+        // Verify all three children have disjoint keyspace ranges (half-open intervals)
+        let mut ranges = [
+            ("C1", c1_range_after),
+            ("C2", c2_range_after),
+            ("C3", c3_range_after),
+        ];
+        ranges.sort_by_key(|(_, r)| r.0);
+
+        for i in 0..ranges.len() {
+            for j in (i + 1)..ranges.len() {
+                let (name_i, (lo_i, hi_i)) = ranges[i];
+                let (name_j, (lo_j, hi_j)) = ranges[j];
+                // Ranges [lo_i, hi_i) and [lo_j, hi_j) are disjoint if hi_i <= lo_j or hi_j <= lo_i
+                let disjoint = hi_i <= lo_j || hi_j <= lo_i;
+                assert!(
+                    disjoint,
+                    "Children's keyspace ranges should be disjoint. \
+                     {} [{}, {}), {} [{}, {})",
+                    name_i, lo_i, hi_i, name_j, lo_j, hi_j
+                );
+            }
+        }
+
+        // Verify ranges are contiguous (no gaps between sorted children)
+        for i in 0..(ranges.len() - 1) {
+            let (name_i, (_, hi_i)) = ranges[i];
+            let (name_j, (lo_j, _)) = ranges[i + 1];
+            assert_eq!(
+                hi_i, lo_j,
+                "Children's ranges should be contiguous. {} ends at {}, {} starts at {}",
+                name_i, hi_i, name_j, lo_j
+            );
+        }
+    }
 }
