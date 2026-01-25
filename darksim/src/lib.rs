@@ -3132,17 +3132,17 @@ mod tests {
 
         // Now add X to N's distrusted set BEFORE N selects a parent
         let now = sim.current_time();
-        sim.node_mut(&n).unwrap().inner_mut().add_distrust(x_node_id, now);
+        sim.node_mut(&n)
+            .unwrap()
+            .inner_mut()
+            .add_distrust(x_node_id, now);
 
         // Run for more time - N should NOT select X as parent (X is distrusted)
         sim.run_for(tau * 10);
 
         // Verify N is still root (did not join X)
         let n_node = sim.node(&n).unwrap();
-        assert!(
-            n_node.is_root(),
-            "N should remain root (X is distrusted)"
-        );
+        assert!(n_node.is_root(), "N should remain root (X is distrusted)");
         assert!(
             n_node.parent_id().is_none(),
             "N should have no parent (X is distrusted)"
@@ -3192,7 +3192,10 @@ mod tests {
 
         // Add B to A1's distrusted set (before connecting)
         let now = sim.current_time();
-        sim.node_mut(&a1).unwrap().inner_mut().add_distrust(b_node_id, now);
+        sim.node_mut(&a1)
+            .unwrap()
+            .inner_mut()
+            .add_distrust(b_node_id, now);
 
         // Now connect B to A1 (B can see A1's tree)
         sim.topology_mut().add_link(a1, b, Link::new());
@@ -3279,7 +3282,10 @@ mod tests {
 
         // Now add X to A's distrusted set BEFORE connecting them
         let now = sim.current_time();
-        sim.node_mut(&a).unwrap().inner_mut().add_distrust(x_node_id, now);
+        sim.node_mut(&a)
+            .unwrap()
+            .inner_mut()
+            .add_distrust(x_node_id, now);
 
         // Clear any existing debug events
         sim.node(&a).unwrap().take_debug_events();
@@ -3311,6 +3317,78 @@ mod tests {
             distrusted_merge_rejected,
             "ConsiderMerge should have been rejected due to distrust. Events: {:?}",
             events
+        );
+    }
+
+    /// Scenario 9.3: Distrust TTL Expiry
+    ///
+    /// A distrusted node should be removed from the distrusted set after
+    /// DISTRUST_TTL (24 hours) expires. After expiry, the node can be
+    /// selected as a parent or have its merge offers accepted.
+    #[test]
+    fn test_distrust_ttl_expiry() {
+        use crate::topology::Link;
+        use darktree::DISTRUST_TTL;
+
+        let mut sim = Simulator::new(42);
+
+        // Use low bandwidth nodes (1 byte/sec) to get large tau (~255 seconds).
+        // This dramatically reduces the number of events when simulating 25 hours.
+        let x = sim.add_node_with_bandwidth(1, 1); // tau = MTU/bandwidth = 255s
+        let n = sim.add_node_with_bandwidth(2, 1);
+
+        let x_node_id = sim.node(&x).unwrap().node_id();
+
+        // Connect them
+        sim.topology_mut().add_link(x, n, Link::new());
+
+        // Let them discover each other briefly
+        let tau = sim.node(&x).unwrap().tau();
+        sim.run_for(tau * 2);
+
+        // Add X to N's distrusted set
+        let distrust_time = sim.current_time();
+        sim.node_mut(&n)
+            .unwrap()
+            .inner_mut()
+            .add_distrust(x_node_id, distrust_time);
+
+        // Run for a while - N should NOT select X as parent (X is distrusted)
+        sim.run_for(tau * 10);
+
+        // Verify N is still root (X is distrusted)
+        assert!(
+            sim.node(&n).unwrap().is_root(),
+            "N should remain root while X is distrusted"
+        );
+
+        // Now fast forward past DISTRUST_TTL (24 hours)
+        // We run for DISTRUST_TTL + 1 hour to ensure TTL has expired
+        let time_to_expire = DISTRUST_TTL + Duration::from_hours(1);
+        sim.run_for(time_to_expire);
+
+        // After TTL expiry, N should be able to select X as parent
+        // Run for more time to allow discovery and parent selection
+        sim.run_for(tau * 10);
+
+        // Verify that one joined the other (they should form a tree)
+        let n_is_root = sim.node(&n).unwrap().is_root();
+        let x_is_root = sim.node(&x).unwrap().is_root();
+
+        // At least one should have joined the other
+        assert!(
+            !n_is_root || !x_is_root,
+            "After distrust TTL expiry, nodes should be able to form a tree. N is_root={}, X is_root={}",
+            n_is_root,
+            x_is_root
+        );
+
+        // Verify they're in the same tree (same root_hash)
+        let n_root_hash = sim.node(&n).unwrap().root_hash();
+        let x_root_hash = sim.node(&x).unwrap().root_hash();
+        assert_eq!(
+            n_root_hash, x_root_hash,
+            "After distrust TTL expiry, N and X should have the same root_hash"
         );
     }
 }
