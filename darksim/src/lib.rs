@@ -2367,4 +2367,72 @@ mod tests {
             "Valid pulse should be received after corrupted one was rejected"
         );
     }
+
+    /// Scenario 17.1: Oversized Child Count
+    /// Setup: Attacker sends pulse with child_count=20 (exceeds MAX_CHILDREN=12).
+    /// Expect: Rejected at decode. No allocation attempted.
+    ///
+    /// Tests that malformed pulses with excessive child counts are rejected
+    /// at the wire format decode stage before any memory allocation.
+    #[test]
+    fn test_oversized_child_count_rejected() {
+        use darktree::debug::DebugEvent;
+        use darktree::types::PULSE_CHILD_COUNT_SHIFT;
+        use darktree::wire::{Decode, DecodeError, Reader};
+
+        // Create a node
+        let mut sim = Simulator::new(42);
+        let n = sim.add_node(1);
+
+        // Get tau and trigger a pulse
+        let tau = sim.node(&n).unwrap().tau();
+        let future_time = sim.current_time() + tau * 3;
+        sim.node_mut(&n).unwrap().handle_timer(future_time);
+
+        // Capture the valid pulse
+        let pulses = sim.node(&n).unwrap().take_outgoing();
+        assert!(!pulses.is_empty(), "Node should have sent a pulse");
+        let mut malformed_pulse = pulses[0].clone();
+
+        // Pulse wire format: wire_type(1) + node_id(16) + flags(1) + ...
+        // flags byte is at index 17
+        // flags format: bit 0 = has_parent, bit 1 = need_pubkey, bit 2 = has_pubkey
+        //               bits 3-7 = child_count (0-31 range, but MAX_CHILDREN=12)
+        let flags_index = 17;
+        let original_flags = malformed_pulse[flags_index];
+
+        // Set child_count to 20 (exceeds MAX_CHILDREN=12)
+        // child_count is stored in bits 3-7, so child_count=20 means 20 << 3 = 160
+        let malicious_child_count: u8 = 20;
+        let new_flags =
+            (original_flags & 0x07) | (malicious_child_count << PULSE_CHILD_COUNT_SHIFT);
+        malformed_pulse[flags_index] = new_flags;
+
+        // Verify the decode fails with CapacityExceeded
+        let mut reader = Reader::new(&malformed_pulse[1..]); // Skip wire_type byte
+        let result = darktree::types::Pulse::decode(&mut reader);
+
+        assert!(
+            matches!(result, Err(DecodeError::CapacityExceeded)),
+            "Decode should fail with CapacityExceeded for child_count=20, got {:?}",
+            result
+        );
+
+        // Also verify that delivering this malformed pulse to a node
+        // results in MessageDecodeFailed event
+        sim.node(&n).unwrap().take_debug_events(); // Clear events
+        sim.node_mut(&n)
+            .unwrap()
+            .handle_transport_rx(&malformed_pulse, None, future_time);
+
+        let events = sim.node(&n).unwrap().take_debug_events();
+        let decode_failed = events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::MessageDecodeFailed { .. }));
+
+        assert!(
+            decode_failed,
+            "MessageDecodeFailed event should be emitted for oversized child count"
+        );
+    }
 }
