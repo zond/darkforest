@@ -2064,7 +2064,7 @@ mod tests {
         // Verify ratio between different bandwidths
         // LoRa should be ~67x slower than UDP (6710/100 ≈ 67)
         let ratio = lora_tau.as_millis() / udp_tau.as_millis();
-        assert!(ratio >= 65 && ratio <= 70, "LoRa τ should be ~67x UDP τ");
+        assert!((65..=70).contains(&ratio), "LoRa τ should be ~67x UDP τ");
     }
 
     /// Scenario 10.1: Pubkey Cached on First Pulse
