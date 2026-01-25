@@ -245,9 +245,9 @@ where
             }
         }
         // Check for pending parent acknowledgment
-        if let Some((pending, _)) = self.pending_parent() {
+        if let Some((pending, count)) = self.pending_parent() {
             if pulse.node_id == pending {
-                self.handle_pending_parent_pulse(&pulse, &sender_hash, now);
+                self.handle_pending_parent_pulse(&pulse, count, now);
             }
         }
 
@@ -381,12 +381,10 @@ where
 
     /// Handle a pulse from a node claiming us as parent.
     fn handle_child_pulse(&mut self, pulse: &Pulse, sender_hash: &ChildHash, now: Timestamp) {
-        // Check if this is an existing child (update) vs new child (join)
-        let is_existing = self.children().contains_key(&pulse.node_id);
+        let is_new = !self.children().contains_key(&pulse.node_id);
 
         // Only check capacity for NEW children - existing children must be able to update
-        if !is_existing && self.children().len() >= MAX_CHILDREN {
-            // At capacity, silently reject new child
+        if is_new && self.children().len() >= MAX_CHILDREN {
             return;
         }
 
@@ -397,7 +395,6 @@ where
             if *existing_id != pulse.node_id {
                 let existing_hash = self.compute_node_hash(existing_id);
                 if existing_hash == *sender_hash {
-                    // Hash collision - reject this child
                     return;
                 }
             }
@@ -409,9 +406,6 @@ where
         if estimated_pulse_size > self.transport().mtu() {
             return;
         }
-
-        // Track if this is a new child (computed earlier)
-        let is_new = !is_existing;
 
         #[cfg(feature = "debug")]
         if is_new {
@@ -451,12 +445,7 @@ where
     }
 
     /// Handle a pulse from our pending parent candidate.
-    fn handle_pending_parent_pulse(
-        &mut self,
-        pulse: &Pulse,
-        _sender_hash: &ChildHash,
-        now: Timestamp,
-    ) {
+    fn handle_pending_parent_pulse(&mut self, pulse: &Pulse, current_count: u8, now: Timestamp) {
         // Check if we're in the children list (by our hash)
         let my_hash = self.compute_node_hash(self.node_id());
         if let Some(my_idx) = self.find_child_index(pulse, &my_hash) {
@@ -492,12 +481,12 @@ where
             self.rebalance_keyspace(now);
         } else {
             // Not acknowledged yet, increment counter
-            let (_, count) = self.pending_parent().unwrap();
-            if count >= PARENT_ACK_PULSES {
+            let new_count = current_count + 1;
+            if new_count >= PARENT_ACK_PULSES {
                 // Give up on this parent, try another
                 self.set_pending_parent(None);
             } else {
-                self.set_pending_parent(Some((pulse.node_id, count + 1)));
+                self.set_pending_parent(Some((pulse.node_id, new_count)));
             }
         }
     }

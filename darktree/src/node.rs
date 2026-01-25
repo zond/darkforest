@@ -582,10 +582,11 @@ where
 
         // Proactive pulse can trigger early, but must still respect bandwidth budget.
         // Use max to ensure we don't send before budget_time.
-        match self.proactive_pulse_pending {
-            Some(proactive) => Some(budget_time.max(proactive)),
-            None => Some(budget_time),
-        }
+        let next = match self.proactive_pulse_pending {
+            Some(proactive) => budget_time.max(proactive),
+            None => budget_time,
+        };
+        Some(next)
     }
 
     /// Calculate next timeout time (lookups, neighbors, locations).
