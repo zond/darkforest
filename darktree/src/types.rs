@@ -6,12 +6,13 @@ use core::fmt;
 use crate::time::{Duration, Timestamp};
 
 // Protocol limits (not configurable via NodeConfig)
-pub const MAX_TREE_DEPTH: usize = 127; // TTL 255 / 2 for round-trip
+#[allow(dead_code)] // Reserved for future depth validation
+pub(crate) const MAX_TREE_DEPTH: usize = 127; // TTL 255 / 2 for round-trip
 pub const MAX_CHILDREN: usize = 12; // Guarantees worst-case Pulse fits in 252 bytes
 pub const MAX_PACKET_SIZE: usize = 255;
 /// Recently forwarded entries expire after 300τ to allow for slow multi-hop ACKs.
 /// On LoRa (τ=6.7s) this is ~33 minutes; on UDP (τ=100ms) this is 30 seconds.
-pub const RECENTLY_FORWARDED_TTL_MULTIPLIER: u64 = 300;
+pub(crate) const RECENTLY_FORWARDED_TTL_MULTIPLIER: u64 = 300;
 
 // Protocol constants
 pub const K_REPLICAS: usize = 3;
@@ -27,11 +28,11 @@ pub const DISTRUST_TTL: Duration = Duration::from_hours(24);
 
 // Bandwidth budget: Pulse traffic should use at most 1/PULSE_BW_DIVISOR of available bandwidth.
 // With divisor=5, pulse is limited to 20% of bandwidth, leaving 80% for application data.
-pub const PULSE_BW_DIVISOR: u32 = 5;
+pub(crate) const PULSE_BW_DIVISOR: u32 = 5;
 
 /// Minimum tau value in milliseconds (floor for high-bandwidth transports).
 /// tau = max(MTU/bandwidth, MIN_TAU_MS).
-pub const MIN_TAU_MS: u64 = 100;
+pub(crate) const MIN_TAU_MS: u64 = 100;
 
 // Routed message types (0-3 valid; 4-15 rejected at parse time)
 // Note: ACK is a separate top-level message type (wire_type 0x03), not a Routed subtype
@@ -43,10 +44,10 @@ pub const MSG_DATA: u8 = 3;
 // Algorithm identifiers
 pub const ALGORITHM_ED25519: u8 = 0x01;
 
-// Domain separation prefixes
-pub const DOMAIN_PULSE: &[u8] = b"PULSE:";
-pub const DOMAIN_ROUTE: &[u8] = b"ROUTE:";
-pub const DOMAIN_LOC: &[u8] = b"LOC:";
+// Domain separation prefixes (internal for signing)
+pub(crate) const DOMAIN_PULSE: &[u8] = b"PULSE:";
+pub(crate) const DOMAIN_ROUTE: &[u8] = b"ROUTE:";
+pub(crate) const DOMAIN_LOC: &[u8] = b"LOC:";
 
 /// 16-byte node identifier derived from public key hash.
 pub type NodeId = [u8; 16];
@@ -101,10 +102,10 @@ impl fmt::Debug for Signature {
 // - bit 1: need_pubkey
 // - bit 2: has_pubkey
 // - bits 3-7: child_count (0-12, max MAX_CHILDREN)
-pub const PULSE_FLAG_HAS_PARENT: u8 = 0x01;
-pub const PULSE_FLAG_NEED_PUBKEY: u8 = 0x02;
-pub const PULSE_FLAG_HAS_PUBKEY: u8 = 0x04;
-pub const PULSE_CHILD_COUNT_SHIFT: u8 = 3;
+pub(crate) const PULSE_FLAG_HAS_PARENT: u8 = 0x01;
+pub(crate) const PULSE_FLAG_NEED_PUBKEY: u8 = 0x02;
+pub(crate) const PULSE_FLAG_HAS_PUBKEY: u8 = 0x04;
+pub(crate) const PULSE_CHILD_COUNT_SHIFT: u8 = 3;
 
 /// Periodic broadcast message for tree maintenance.
 ///
@@ -202,10 +203,10 @@ impl Default for Pulse {
 // - bit 5: has_src_addr
 // - bit 6: has_src_pubkey
 // - bit 7: reserved
-pub const ROUTED_MSG_TYPE_MASK: u8 = 0x0F;
-pub const ROUTED_FLAG_HAS_DEST_HASH: u8 = 0x10;
-pub const ROUTED_FLAG_HAS_SRC_ADDR: u8 = 0x20;
-pub const ROUTED_FLAG_HAS_SRC_PUBKEY: u8 = 0x40;
+pub(crate) const ROUTED_MSG_TYPE_MASK: u8 = 0x0F;
+pub(crate) const ROUTED_FLAG_HAS_DEST_HASH: u8 = 0x10;
+pub(crate) const ROUTED_FLAG_HAS_SRC_ADDR: u8 = 0x20;
+pub(crate) const ROUTED_FLAG_HAS_SRC_PUBKEY: u8 = 0x40;
 
 /// Unicast routed message using keyspace addressing.
 #[derive(Clone, Debug)]

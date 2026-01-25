@@ -55,3 +55,5 @@ This project targets embedded devices. Follow these rules:
 - **Limit call depth** - avoid deeply nested function calls (>8 levels)
 - **Prefer bounded collections** - validate sizes at decode time, use MAX_* constants
 - **No floating point in hot paths** - integer arithmetic preferred (libm only for fraud detection)
+- **Keep the API and the binary lean** - don't expose API functions (pub, pub(crate)) unnecessarily,
+  and when reasonable protect it with #[cfg(test)].

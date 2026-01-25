@@ -16,16 +16,16 @@ use crate::time::Timestamp;
 use crate::types::{Event, NodeId, Payload, PublicKey, SecretKey, Signature};
 
 /// Queue size for transport channels.
-pub const TRANSPORT_QUEUE_SIZE: usize = 8;
+pub(crate) const TRANSPORT_QUEUE_SIZE: usize = 8;
 
 /// Queue size for application-level channels.
-pub const APP_QUEUE_SIZE: usize = 8;
+pub(crate) const APP_QUEUE_SIZE: usize = 8;
 
 /// Queue size for event channel.
-pub const EVENT_QUEUE_SIZE: usize = 16;
+pub(crate) const EVENT_QUEUE_SIZE: usize = 16;
 
 /// Mutex type used for channels.
-pub type ChannelMutex = CriticalSectionRawMutex;
+pub(crate) type ChannelMutex = CriticalSectionRawMutex;
 
 /// Received message with optional signal strength.
 #[derive(Debug, Clone)]

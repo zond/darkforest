@@ -399,7 +399,7 @@ const WIRE_TYPE_ROUTED: u8 = 0x02;
 const WIRE_TYPE_ACK: u8 = 0x03;
 
 /// Size of ACK hash in bytes.
-pub const ACK_HASH_SIZE: usize = 8;
+pub(crate) const ACK_HASH_SIZE: usize = 8;
 
 /// Explicit ACK message for link-layer reliability.
 ///
@@ -723,7 +723,7 @@ impl Decode for LocationEntry {
 }
 
 /// Build the data to be signed for a Pulse message.
-pub fn pulse_sign_data(pulse: &Pulse) -> Writer {
+pub(crate) fn pulse_sign_data(pulse: &Pulse) -> Writer {
     let mut w = Writer::new();
     w.write_bytes(crate::types::DOMAIN_PULSE);
     w.write_node_id(&pulse.node_id);
@@ -756,7 +756,7 @@ pub fn pulse_sign_data(pulse: &Pulse) -> Writer {
 }
 
 /// Build the data to be signed for a Routed message (excludes ttl).
-pub fn routed_sign_data(routed: &Routed) -> Writer {
+pub(crate) fn routed_sign_data(routed: &Routed) -> Writer {
     let mut w = Writer::new();
     w.write_bytes(crate::types::DOMAIN_ROUTE);
     w.write_u8(routed.flags_and_type);
@@ -787,7 +787,7 @@ pub fn routed_sign_data(routed: &Routed) -> Writer {
 }
 
 /// Build the data to be signed for a LocationEntry.
-pub fn location_sign_data(node_id: &[u8; 16], keyspace_addr: u32, seq: u32) -> Writer {
+pub(crate) fn location_sign_data(node_id: &[u8; 16], keyspace_addr: u32, seq: u32) -> Writer {
     let mut w = Writer::new();
     w.write_bytes(crate::types::DOMAIN_LOC);
     w.write_node_id(node_id);

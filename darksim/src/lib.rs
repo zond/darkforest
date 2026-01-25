@@ -2377,8 +2377,10 @@ mod tests {
     #[test]
     fn test_oversized_child_count_rejected() {
         use darktree::debug::DebugEvent;
-        use darktree::types::PULSE_CHILD_COUNT_SHIFT;
         use darktree::wire::{Decode, DecodeError, Reader};
+
+        // Wire format constant: child_count is stored in bits 3-7 of the flags byte
+        const PULSE_CHILD_COUNT_SHIFT: u8 = 3;
 
         // Create a node
         let mut sim = Simulator::new(42);
