@@ -2435,4 +2435,94 @@ mod tests {
             "MessageDecodeFailed event should be emitted for oversized child count"
         );
     }
+
+    /// Scenario 17.2: Non-canonical varint encoding should be rejected.
+    #[test]
+    fn test_non_canonical_varint_rejected() {
+        use darktree::debug::DebugEvent;
+        use darktree::wire::DecodeError;
+
+        // Create a node
+        let mut sim = Simulator::new(42);
+        let n = sim.add_node(1);
+
+        // Get tau and trigger a pulse
+        let tau = sim.node(&n).unwrap().tau();
+        let future_time = sim.current_time() + tau * 3;
+        sim.node_mut(&n).unwrap().handle_timer(future_time);
+
+        // Capture the valid pulse
+        let pulses = sim.node(&n).unwrap().take_outgoing();
+        assert!(!pulses.is_empty(), "Node should have sent a pulse");
+        let valid_pulse = &pulses[0];
+
+        // Pulse wire format after wire_type(1) + node_id(16) + flags(1) = 18 bytes:
+        // - [parent_hash: 4 bytes if has_parent flag set]
+        // - root_hash: 4 bytes
+        // - subtree_size: varint (1 byte for small values)
+        // - tree_size: varint
+        // - keyspace_lo: u32 big-endian (4 bytes)
+        // - keyspace_hi: u32 big-endian (4 bytes)
+        // ...
+
+        // Verify our assumption: this is a root node (no parent)
+        // If has_parent were set, the offset would shift by 4 bytes
+        let flags_index = 17; // wire_type(1) + node_id(16)
+        assert_eq!(
+            valid_pulse[flags_index] & 0x01,
+            0,
+            "Test assumes node has no parent"
+        );
+
+        // The subtree_size is at offset 22 (18 + 4 for root_hash, no parent_hash).
+        // For a single node, subtree_size=1, encoded as 0x01.
+        let subtree_size_offset = 22; // wire_type(1) + node_id(16) + flags(1) + root_hash(4)
+        assert_eq!(
+            valid_pulse[subtree_size_offset], 0x01,
+            "Expected subtree_size=1 for single node"
+        );
+
+        // Create malformed pulse with non-canonical varint for subtree_size
+        // A non-canonical encoding of 1 would be 0x81 0x00 instead of 0x01.
+        let mut malformed_pulse = Vec::with_capacity(valid_pulse.len() + 1);
+
+        // Copy bytes up to subtree_size position
+        malformed_pulse.extend_from_slice(&valid_pulse[..subtree_size_offset]);
+
+        // Insert non-canonical encoding of 1: 0x81 0x00 instead of 0x01
+        malformed_pulse.push(0x81);
+        malformed_pulse.push(0x00);
+
+        // Skip the original subtree_size byte and copy the rest
+        // Original subtree_size for a single node is 1 byte (value 1 = 0x01)
+        malformed_pulse.extend_from_slice(&valid_pulse[subtree_size_offset + 1..]);
+
+        // Verify the decode fails with NonCanonicalVarint
+        use darktree::wire::{Decode, Reader};
+        let mut reader = Reader::new(&malformed_pulse[1..]); // Skip wire_type byte
+        let result = darktree::types::Pulse::decode(&mut reader);
+
+        assert!(
+            matches!(result, Err(DecodeError::NonCanonicalVarint)),
+            "Decode should fail with NonCanonicalVarint, got {:?}",
+            result
+        );
+
+        // Also verify that delivering this malformed pulse to a node
+        // results in MessageDecodeFailed event
+        sim.node(&n).unwrap().take_debug_events(); // Clear events
+        sim.node_mut(&n)
+            .unwrap()
+            .handle_transport_rx(&malformed_pulse, None, future_time);
+
+        let events = sim.node(&n).unwrap().take_debug_events();
+        let decode_failed = events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::MessageDecodeFailed { .. }));
+
+        assert!(
+            decode_failed,
+            "MessageDecodeFailed event should be emitted for non-canonical varint"
+        );
+    }
 }

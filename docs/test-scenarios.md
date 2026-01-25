@@ -420,9 +420,10 @@ Verify protocol works correctly with constrained resources.
 - **Setup:** Attacker sends pulse with child_count=20 (exceeds MAX_CHILDREN=12).
 - **Expect:** Rejected at decode. No allocation attempted.
 
-### 17.2 Non-Canonical Varint
+### 17.2 Non-Canonical Varint ✓
 - **Setup:** Message with non-canonical varint (0x80 0x00 for zero).
 - **Expect:** Rejected with decode error.
+- **Status:** Implemented in `test_non_canonical_varint_rejected`
 
 ### 17.3 Truncated Message
 - **Setup:** Valid message header but truncated before signature.
