@@ -90,10 +90,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Expect:** Inversion propagates up B (~1.5τ per hop). All nodes under A's root.
 - **Status:** Implemented in `test_tree_inversion_propagation`
 
-### 3.4 Bridge Node Triggers Merge
+### 3.4 Bridge Node Triggers Merge ✓
 - **Setup:** Tree A, Tree B (both separate). Node N can reach both.
 - **Run:** 30τ
 - **Expect:** N joins larger tree, other tree eventually merges via N.
+- **Status:** Implemented in `test_bridge_node_triggers_merge`
 
 ### 3.5 No Merge During Shopping ✓
 - **Setup:** N is in shopping phase. Receives pulse from larger tree.

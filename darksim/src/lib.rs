@@ -1359,6 +1359,99 @@ mod tests {
         );
     }
 
+    /// Scenario 3.4: Bridge Node Triggers Merge
+    /// Setup: Tree A, Tree B (both separate). Node N can reach both.
+    /// Run: 30τ
+    /// Expect: N joins larger tree, other tree eventually merges via N.
+    ///
+    /// This tests that a bridge node connecting two separate trees causes
+    /// them to merge, with the larger tree absorbing the smaller.
+    #[test]
+    fn test_bridge_node_triggers_merge() {
+        use crate::topology::Link;
+
+        let mut sim = Simulator::new(42);
+
+        // Create Tree A with 5 nodes (star topology around a_root)
+        let a_root = sim.add_node(100);
+        let mut tree_a = vec![a_root];
+        for i in 1..5 {
+            let node = sim.add_node(100 + i);
+            sim.topology_mut().add_link(a_root, node, Link::default());
+            tree_a.push(node);
+        }
+
+        // Create Tree B with 3 nodes (star topology around b_root)
+        let b_root = sim.add_node(200);
+        let mut tree_b = vec![b_root];
+        for i in 1..3 {
+            let node = sim.add_node(200 + i);
+            sim.topology_mut().add_link(b_root, node, Link::default());
+            tree_b.push(node);
+        }
+
+        // Trees are NOT connected yet - run to form separate trees
+        sim.run_for(Duration::from_secs(3));
+
+        // Verify we have 2 separate trees
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(snapshot.tree_count(), 2, "Should have 2 separate trees");
+
+        // Create bridge node N that connects to both trees
+        let bridge = sim.add_node(500);
+        sim.topology_mut()
+            .add_link(bridge, tree_a[1], Link::default()); // Connect to a leaf of A
+        sim.topology_mut()
+            .add_link(bridge, tree_b[1], Link::default()); // Connect to a leaf of B
+
+        // Run for 100τ (10 seconds) to allow merge and tree_size propagation
+        // Bridge needs to join larger tree (3τ shopping), then smaller tree
+        // nodes need to detect domination and merge (another 3τ shopping each),
+        // plus time for tree_size to propagate from root to leaves
+        sim.run_for(Duration::from_secs(10));
+
+        // All nodes should now be in a single tree
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(
+            snapshot.tree_count(),
+            1,
+            "Should have merged to 1 tree via bridge"
+        );
+
+        // The tree should have 9 nodes (5 from A + 3 from B + 1 bridge)
+        let all_nodes: Vec<_> = tree_a
+            .iter()
+            .chain(tree_b.iter())
+            .chain(std::iter::once(&bridge))
+            .collect();
+
+        // All nodes should have the same root_hash
+        let first_hash = sim.node(all_nodes[0]).unwrap().root_hash();
+        for &node_id in &all_nodes {
+            assert_eq!(
+                sim.node(node_id).unwrap().root_hash(),
+                first_hash,
+                "All nodes should have same root_hash after merge"
+            );
+        }
+
+        // Find the actual root and verify tree size
+        let root = all_nodes
+            .iter()
+            .find(|&&id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Should have a root");
+
+        // Tree size should be 9
+        assert_eq!(
+            sim.node(root).unwrap().tree_size(),
+            9,
+            "Merged tree should have 9 nodes"
+        );
+    }
+
     /// Scenario 3.5: No Merge During Shopping
     /// Setup: N is in shopping phase. Receives pulse from larger tree.
     /// Expect: N waits until shopping ends before merging (doesn't interrupt shopping).
