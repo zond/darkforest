@@ -2002,4 +2002,68 @@ mod tests {
             "Pulse after 2τ interval should not be rate limited"
         );
     }
+
+    /// Scenario 11.2: Rate Limit Scales with Bandwidth
+    /// Setup: Low bandwidth (τ=6.7s) vs high bandwidth (τ=0.1s).
+    /// Expect: Rate limit is 13.4s vs 0.2s respectively.
+    ///
+    /// Tests that the rate limiting window (2τ) correctly scales with
+    /// the bandwidth-aware tau value. LoRa's 38 bytes/sec gives τ=6.71s,
+    /// while unlimited bandwidth gives τ=100ms.
+    #[test]
+    fn test_rate_limit_scales_with_bandwidth() {
+        use crate::node::SimNode;
+
+        // Test 1: LoRa bandwidth (38 bytes/sec)
+        // τ = MTU / BW = 255 / 38 = 6.71s
+        let lora_node = SimNode::with_bandwidth(1, Timestamp::ZERO, 38);
+        let lora_tau = lora_node.tau();
+        let lora_rate_limit = lora_tau * 2;
+
+        assert_eq!(
+            lora_tau.as_millis(),
+            6710,
+            "LoRa τ should be 6710ms (255/38)"
+        );
+        assert_eq!(
+            lora_rate_limit.as_millis(),
+            13420,
+            "LoRa rate limit should be 13420ms (2τ)"
+        );
+
+        // Test 2: Default (unlimited) bandwidth
+        // τ = 100ms default
+        let udp_node = SimNode::new(1, Timestamp::ZERO);
+        let udp_tau = udp_node.tau();
+        let udp_rate_limit = udp_tau * 2;
+
+        assert_eq!(udp_tau.as_millis(), 100, "Default τ should be 100ms");
+        assert_eq!(
+            udp_rate_limit.as_millis(),
+            200,
+            "Default rate limit should be 200ms (2τ)"
+        );
+
+        // Test 3: Custom bandwidth (100 bytes/sec)
+        // τ = 255 / 100 = 2.55s
+        let custom_node = SimNode::with_bandwidth(1, Timestamp::ZERO, 100);
+        let custom_tau = custom_node.tau();
+        let custom_rate_limit = custom_tau * 2;
+
+        assert_eq!(
+            custom_tau.as_millis(),
+            2550,
+            "Custom τ should be 2550ms (255/100)"
+        );
+        assert_eq!(
+            custom_rate_limit.as_millis(),
+            5100,
+            "Custom rate limit should be 5100ms (2τ)"
+        );
+
+        // Verify ratio between different bandwidths
+        // LoRa should be ~67x slower than UDP (6710/100 ≈ 67)
+        let ratio = lora_tau.as_millis() / udp_tau.as_millis();
+        assert!(ratio >= 65 && ratio <= 70, "LoRa τ should be ~67x UDP τ");
+    }
 }
