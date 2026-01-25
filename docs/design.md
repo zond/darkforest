@@ -983,6 +983,7 @@ Unicast messages route through the tree using keyspace addresses:
 ```rust
 struct Routed {
     flags_and_type: u8,             // combined flags + message type (see below)
+    next_hop: [u8; 4],              // truncated hash of intended forwarder (see below)
     dest_addr: u32,                 // keyspace location to route toward
     dest_hash: Option<[u8; 4]>,     // truncated hash(node_id) for recipient verification
     src_addr: Option<u32>,          // sender's keyspace address for replies
@@ -999,6 +1000,13 @@ struct Routed {
 // - bit 5: has_src_addr (1 = src_addr present for replies)
 // - bit 6: has_src_pubkey (1 = src_pubkey present for signature verification)
 // - bit 7: reserved (must be 0)
+
+// next_hop identifies which node should forward this message:
+// - Computed as hash(next_hop_node_id)[..4] (same format as dest_hash, child hashes)
+// - Each forwarder sets next_hop to the hash of the next node in the route
+// - Nodes that receive a message but don't match next_hop ignore it (don't forward)
+// - This prevents message amplification in dense networks where broadcasts reach many nodes
+// - The destination node (who owns dest_addr) always handles the message regardless of next_hop
 
 // msg_type values: 0=PUBLISH, 1=LOOKUP, 2=FOUND, 3=DATA
 // Messages with undefined msg_type MUST be dropped silently (future extensions)
@@ -1027,7 +1035,7 @@ struct Routed {
 // - FOUND:   has_dest_hash=1, has_src_addr=0, has_src_pubkey=0 (requester has target's pubkey)
 // - DATA:    has_dest_hash=1, has_src_addr=0/1, has_src_pubkey=0/1 (app decides)
 
-// Signature covers all fields EXCEPT ttl (forwarders must decrement it):
+// Signature covers all fields EXCEPT ttl and next_hop (forwarders must modify these):
 // "ROUTE:" || flags_and_type || dest_addr || dest_hash || src_addr || src_node_id || payload
 // Note: src_pubkey not signed (bound to src_node_id via hash)
 
@@ -1037,7 +1045,7 @@ fn routed_sign_data(msg: &Routed) -> Vec<u8> {
 }
 ```
 
-The signature covers all fields except `ttl` to prevent:
+The signature covers all fields except `ttl` and `next_hop` to prevent:
 - Routing manipulation (changing dest_addr)
 - Reply redirection (changing src_addr)
 - Type confusion (changing msg_type)
@@ -1045,13 +1053,15 @@ The signature covers all fields except `ttl` to prevent:
 
 The `ttl` field is not signed because forwarders must decrement it. An attacker could reset TTL to extend message lifetime, but cannot forge the message itself. TTL exists to prevent routing loops during tree restructuring.
 
+The `next_hop` field is not signed because forwarders must update it at each hop to specify the next forwarder. An attacker could change `next_hop` to route through a different path, but cannot change the destination (`dest_addr` is signed) or impersonate the sender.
+
 The `dest_hash` field indicates recipient verification:
 - `None` — message is for whoever owns the keyspace location (PUBLISH)
 - `Some(hash)` — message is for a specific node/entry matching the hash (LOOKUP/DATA/FOUND)
 
 ### Routing Algorithm
 
-Messages route toward `dest_addr` using keyspace ranges. Each hop forwards to the neighbor with the tightest range containing the destination, or upward to parent:
+Messages route toward `dest_addr` using keyspace ranges. Each hop forwards to the neighbor with the tightest range containing the destination, or upward to parent. The `next_hop` field ensures only the intended forwarder processes each hop, preventing message amplification in dense networks.
 
 ```rust
 const DEFAULT_TTL: u8 = 255;  // max hops
@@ -1084,11 +1094,20 @@ impl Node {
             return;
         }
 
+        // Am I the intended forwarder? If not, ignore (don't forward).
+        // This prevents message amplification when broadcasts reach multiple nodes.
+        let my_hash = hash(&self.node_id)[..4];
+        if msg.next_hop != my_hash {
+            return;
+        }
+
         // Find best next hop among children and shortcuts whose range contains dest
         if let Some(next) = self.best_downward_hop(dest) {
+            msg.next_hop = hash(&next)[..4];
             self.send_to(next, msg);
         } else if let Some(parent) = self.parent {
             // No child/shortcut contains dest → route up
+            msg.next_hop = hash(&parent)[..4];
             self.send_to(parent, msg);
         }
         // else: we're root and no child contains dest - shouldn't happen
@@ -1131,11 +1150,62 @@ Root (subtree_size=201) owns [0, 2³²):
   B: [~2.1B, ~3.2B)              subtree_size=50
   C: [~3.2B, 2³²)                subtree_size=50
 
-Node in A's subtree sends to dest_addr = 0xC0000000 (in C's range):
-  Sender → A (up)       dest not in sender's or children's range
-  A → Root (up)         dest not in A's range, route to parent
-  Root → C (down)       C's range contains dest, tightest match
+Node X in A's subtree sends to dest_addr = 0xC0000000 (in C's range):
+  X sends with next_hop=hash(A)     A is X's parent
+  A receives, matches next_hop      A forwards with next_hop=hash(Root)
+  Root receives, matches next_hop   Root forwards with next_hop=hash(C)
+  C receives, owns dest_addr        C handles locally
+
+All nodes in radio range hear each broadcast, but only the node matching
+next_hop forwards. Others may use the overheard message for implicit ACKs.
 ```
+
+### Originating a Routed Message
+
+When a node originates a message (rather than forwarding), it must compute the initial `next_hop`:
+
+```rust
+impl Node {
+    fn send_routed(&mut self, dest_addr: u32, dest_hash: Option<[u8; 4]>,
+                   src_addr: Option<u32>, msg_type: u8, payload: Vec<u8>) {
+        // Handle locally if we own the destination
+        if self.owns_key(dest_addr) {
+            self.handle_locally_originated(dest_addr, dest_hash, msg_type, payload);
+            return;
+        }
+
+        // Determine first hop
+        let first_hop = if let Some(next) = self.best_downward_hop(dest_addr) {
+            next
+        } else if let Some(parent) = self.parent {
+            parent
+        } else {
+            return;  // Isolated node, cannot send
+        };
+
+        let msg = Routed {
+            flags_and_type: msg_type | compute_flags(dest_hash, src_addr, ...),
+            next_hop: hash(&first_hop)[..4],
+            dest_addr,
+            dest_hash,
+            src_addr,
+            src_node_id: self.node_id,
+            src_pubkey: ...,  // include if needed
+            ttl: DEFAULT_TTL,
+            payload,
+            signature: self.sign(&routed_sign_data(...)),
+        };
+
+        self.send_to(first_hop, msg);
+        self.track_pending_ack(msg, first_hop);  // for implicit ACK
+    }
+}
+```
+
+**Note on implicit ACKs at final hop:** When the next hop is the final destination (owns `dest_addr`), that node handles the message locally and doesn't forward. The sender won't receive an implicit ACK from overhearing a forward. In this case:
+- The sender times out and may retransmit
+- The destination can send an explicit ACK if it detects a duplicate
+- For end-to-end reliability, applications should implement acknowledgment at the DATA message level
 
 ---
 
@@ -1568,14 +1638,14 @@ Without acknowledgment, A doesn't know if B received the message. For multi-hop 
 Since all transmissions are broadcasts, A can overhear when B forwards A's message. This serves as an implicit acknowledgment.
 
 **For Routed messages:**
-1. A sends `Routed` with TTL=X to B
-2. A stores `hash(Routed with TTL=X-1)` in pending set
+1. A sends `Routed` with TTL=X, next_hop=hash(B) to B
+2. A computes expected forwarded hash (with TTL=X-1 and next_hop updated to B's next hop)
 3. A starts exponential backoff timer
 4. If A hears B's forwarded message (matching hash): implicit ACK, done
 5. If timeout without ACK: A resends original (TTL=X), up to 8 retries
 
 **Hash comparison:**
-The sender computes the expected hash by taking the message with TTL decremented. When overhearing any broadcast, nodes compare hashes against their pending set to detect if it's a forwarded version of a pending message.
+The ACK hash is computed over all message fields **including** `ttl` and `next_hop`. This means A must predict what B's forwarded message will look like: TTL decremented, and next_hop set to B's chosen next hop. In practice, A knows the route (same routing algorithm), so A can compute B's next_hop. When overhearing any broadcast, nodes compare hashes against their pending set to detect if it's a forwarded version of a pending message.
 
 ### Explicit ACK Messages
 
@@ -1591,14 +1661,15 @@ struct Ack {
 **Why ACK is a top-level message type:** ACK is intentionally minimal (9 bytes: 1 type + 8 hash) rather than a Routed message subtype. On half-duplex radios, the original sender may have missed the forward because it was transmitting a retry. A smaller ACK has shorter time-on-air, reducing the chance of another collision. ACK needs no routing (strictly local within radio range), no signature (the hash itself proves knowledge of the forwarded message), and no addressing (broadcast to all neighbors).
 
 **Forwarder (B) behavior:**
-1. B receives `Routed` with TTL=X from A
-2. B decrements TTL to X-1 and forwards
-3. B stores `hash(Routed with TTL=X)` in recently_forwarded set
-4. If B receives same message again (same hash, same TTL=X):
-   - Send `ACK(hash(Routed with TTL=X-1))` back
+1. B receives `Routed` with TTL=X, next_hop=hash(B) from A
+2. B verifies next_hop matches hash(B.node_id) — if not, ignore (not the intended forwarder)
+3. B decrements TTL to X-1, sets next_hop to hash(C) where C is B's next hop, and forwards
+4. B stores `hash(original Routed with TTL=X, next_hop=hash(B))` in recently_forwarded set
+5. If B receives same message again (same hash):
+   - Send `ACK(hash(forwarded Routed with TTL=X-1, next_hop=hash(C)))` back
    - Do NOT re-forward (duplicate suppression)
 
-The ACK contains the hash A is waiting for (the forwarded version with TTL-1).
+The ACK contains the hash A is waiting for (the forwarded version with TTL-1 and updated next_hop).
 
 ### Timing Considerations
 
@@ -1629,7 +1700,7 @@ const MAX_RETRIES: u8 = 8;
 // For UDP (τ=0.1s): ~28 seconds
 
 struct PendingAck {
-    expected_hash: [u8; 8],  // hash of message with TTL-1
+    expected_hash: [u8; 8],  // hash of forwarded message (TTL-1, next_hop updated)
     original_msg: Vec<u8>,   // for retransmission
     retries: u8,
     next_retry: Instant,
@@ -1681,6 +1752,15 @@ When collections are full, oldest entries are evicted (LRU). This may cause:
 4. **Bounded memory:** Fixed-size hash storage, LRU eviction
 5. **Graceful degradation:** After max retries, message is dropped (application can retry)
 
+### Stale Route Recovery
+
+When retransmissions fail repeatedly (e.g., MAX_RETRIES reached), the sender should invalidate the route:
+
+1. **Shortcut used:** Remove the shortcut from the routing table. The shortcut target may have left the network or moved out of range.
+2. **Parent used:** This indicates potential partition. The node should start monitoring parent liveness more aggressively.
+
+After invalidation, the next send attempt will recompute the route using remaining valid neighbors.
+
 ### What This Doesn't Provide
 
 - **End-to-end reliability:** Only hop-by-hop. Multi-hop messages may still fail if every hop loses 50%.
@@ -1715,7 +1795,8 @@ Applications needing stronger guarantees should implement their own ack/retry at
 
 | Field | Size |
 |-------|------|
-| flags_and_type | 1 (bits 0-3: msg_type; bit 4: has_dest_hash; bit 5: has_src_addr; bit 6: has_src_pubkey) |
+| flags_and_type | 1 (bits 0-3: msg_type; bit 4: has_dest_hash; bit 5: has_src_addr; bit 6: has_src_pubkey; bit 7: reserved) |
+| next_hop | 4 (truncated hash of intended forwarder) |
 | dest_addr | 4 (u32 keyspace location) |
 | dest_hash | 0 or 4 |
 | src_addr | 0 or 4 (u32 keyspace location) |
