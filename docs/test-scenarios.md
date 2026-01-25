@@ -329,9 +329,10 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Run:** 500τ
 - **Expect:** Single tree. Convergence within reasonable time.
 
-### 13.3 Tree Depth Bounded
+### 13.3 Tree Depth Bounded ✓
 - **Setup:** 100 nodes in various topologies
 - **Expect:** Tree depth ≤ O(log N) due to shallow preference.
+- **Status:** Implemented within `test_100_nodes_converge` - verifies depth ≤ 10 for 100 nodes
 
 ---
 
