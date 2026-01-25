@@ -1888,4 +1888,118 @@ mod tests {
             assert!(c_node.is_root(), "If P is not root, C should be");
         }
     }
+
+    /// Scenario 11.1: Pulse Rate Limit (2τ)
+    /// Setup: Node receives pulses from same neighbor faster than 2τ.
+    /// Expect: Excess pulses ignored (rate limited).
+    ///
+    /// This tests the rate limiting mechanism that prevents a neighbor from
+    /// flooding us with pulses. Pulses arriving faster than 2τ apart are dropped.
+    #[test]
+    fn test_pulse_rate_limit() {
+        use crate::topology::Link;
+        use darktree::debug::DebugEvent;
+
+        // Create two connected nodes
+        let mut sim = Simulator::new(42);
+        let a = sim.add_node(1);
+        let b = sim.add_node(2);
+        sim.topology_mut().add_link(a, b, Link::default());
+
+        // Get tau for timing calculations
+        let tau = sim.node(&a).unwrap().tau();
+        let min_interval = tau * 2; // Rate limit is 2τ
+
+        // Run until they've exchanged pulses and know each other
+        sim.run_for(Duration::from_secs(2));
+
+        // Drain debug events to clear history
+        sim.node(&a).unwrap().take_debug_events();
+        sim.node(&b).unwrap().take_debug_events();
+
+        // Trigger A to send a pulse by calling handle_timer at a future time
+        // (past the next scheduled pulse time)
+        let future_time = sim.current_time() + tau * 3; // Well past next pulse time
+        sim.node_mut(&a).unwrap().handle_timer(future_time);
+
+        // Capture A's outgoing pulse from the transport
+        let a_pulses = sim.node(&a).unwrap().take_outgoing();
+        assert!(!a_pulses.is_empty(), "A should have sent a pulse");
+        let pulse_data = a_pulses[0].clone();
+
+        // Use this future time as our reference point
+        let now = future_time;
+
+        // Deliver the pulse to B - first delivery should succeed
+        sim.node_mut(&b)
+            .unwrap()
+            .handle_transport_rx(&pulse_data, None, now);
+
+        // Check B's events - should have PulseReceived, no rate limiting
+        let b_events = sim.node(&b).unwrap().take_debug_events();
+        let pulse_received = b_events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::PulseReceived { .. }));
+        let rate_limited = b_events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::PulseRateLimited { .. }));
+
+        assert!(pulse_received, "First pulse should be received");
+        assert!(!rate_limited, "First pulse should not be rate limited");
+
+        // Now deliver the SAME pulse again immediately (within 2τ)
+        // This simulates a duplicate or rapid re-transmission
+        let now_plus_small = now + Duration::from_millis(10); // Much less than 2τ
+        sim.node_mut(&b)
+            .unwrap()
+            .handle_transport_rx(&pulse_data, None, now_plus_small);
+
+        // Check B's events - should be rate limited
+        let b_events = sim.node(&b).unwrap().take_debug_events();
+        let rate_limited = b_events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::PulseRateLimited { .. }));
+
+        assert!(
+            rate_limited,
+            "Second pulse arriving within 2τ should be rate limited"
+        );
+
+        // Verify the rate limited event has correct timing info
+        let rate_limit_event = b_events
+            .iter()
+            .find(|e| matches!(e, DebugEvent::PulseRateLimited { .. }));
+
+        if let Some(DebugEvent::PulseRateLimited {
+            min_interval_ms, ..
+        }) = rate_limit_event
+        {
+            assert_eq!(
+                *min_interval_ms,
+                min_interval.as_millis(),
+                "Rate limit interval should be 2τ"
+            );
+        }
+
+        // Now wait for 2τ and try again - should NOT be rate limited
+        let now_after_interval = now + min_interval + Duration::from_millis(10);
+        sim.node_mut(&b)
+            .unwrap()
+            .handle_transport_rx(&pulse_data, None, now_after_interval);
+
+        // Check B's events - should have PulseReceived, no rate limiting
+        let b_events = sim.node(&b).unwrap().take_debug_events();
+        let pulse_received = b_events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::PulseReceived { .. }));
+        let rate_limited = b_events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::PulseRateLimited { .. }));
+
+        assert!(pulse_received, "Pulse after 2τ interval should be received");
+        assert!(
+            !rate_limited,
+            "Pulse after 2τ interval should not be rate limited"
+        );
+    }
 }
