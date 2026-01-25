@@ -2583,4 +2583,57 @@ mod tests {
             "MessageDecodeFailed event should be emitted for truncated message"
         );
     }
+
+    /// Scenario 17.4: Invalid wire type should be rejected.
+    #[test]
+    fn test_invalid_wire_type_rejected() {
+        use darktree::debug::DebugEvent;
+        use darktree::wire::{Decode, DecodeError, Message, Reader};
+
+        // Create a node
+        let mut sim = Simulator::new(42);
+        let n = sim.add_node(1);
+
+        // Get tau and trigger a pulse to get a valid message
+        let tau = sim.node(&n).unwrap().tau();
+        let future_time = sim.current_time() + tau * 3;
+        sim.node_mut(&n).unwrap().handle_timer(future_time);
+
+        // Capture the valid pulse
+        let pulses = sim.node(&n).unwrap().take_outgoing();
+        assert!(!pulses.is_empty(), "Node should have sent a pulse");
+        let valid_pulse = &pulses[0];
+
+        // Create a message with invalid wire type (0x99)
+        // Valid wire types are: 0x01 (Pulse), 0x02 (Routed), 0x03 (Ack)
+        let mut invalid_msg = valid_pulse.clone();
+        invalid_msg[0] = 0x99; // Invalid wire type
+
+        // Verify the decode fails with InvalidMessageType
+        let mut reader = Reader::new(&invalid_msg);
+        let result = Message::decode(&mut reader);
+
+        assert!(
+            matches!(result, Err(DecodeError::InvalidMessageType)),
+            "Decode should fail with InvalidMessageType for wire_type=0x99, got {:?}",
+            result
+        );
+
+        // Also verify that delivering this invalid message to a node
+        // results in MessageDecodeFailed event
+        sim.node(&n).unwrap().take_debug_events(); // Clear events
+        sim.node_mut(&n)
+            .unwrap()
+            .handle_transport_rx(&invalid_msg, None, future_time);
+
+        let events = sim.node(&n).unwrap().take_debug_events();
+        let decode_failed = events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::MessageDecodeFailed { .. }));
+
+        assert!(
+            decode_failed,
+            "MessageDecodeFailed event should be emitted for invalid wire type"
+        );
+    }
 }

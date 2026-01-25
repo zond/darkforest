@@ -430,9 +430,10 @@ Verify protocol works correctly with constrained resources.
 - **Expect:** Rejected at decode. No partial processing.
 - **Status:** Implemented in `test_truncated_message_rejected`
 
-### 17.4 Invalid Wire Type
+### 17.4 Invalid Wire Type ✓
 - **Setup:** Message with wire_type=0x99 (unknown).
 - **Expect:** Rejected immediately.
+- **Status:** Implemented in `test_invalid_wire_type_rejected`
 
 ### 17.5 Invalid Signature Algorithm
 - **Setup:** Pulse with signature algorithm=0x99 (not Ed25519).
