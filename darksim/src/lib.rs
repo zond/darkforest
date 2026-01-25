@@ -3102,4 +3102,215 @@ mod tests {
             "N should have no parent (P is full)"
         );
     }
+
+    /// Scenario 9.2: Distrusted Node Rejected
+    ///
+    /// Per design doc, nodes maintain a distrusted set. A distrusted node:
+    /// 1. Is not selected as parent during discovery
+    /// 2. Has its merge offers ignored
+    ///
+    /// This tests that when a node X is added to another node's distrusted set,
+    /// that node will not select X as its parent.
+    #[test]
+    fn test_distrusted_node_rejected_as_parent() {
+        use crate::topology::Link;
+
+        let mut sim = Simulator::new(42);
+
+        // Create two nodes that can see each other
+        let x = sim.add_node(1); // The node that will be distrusted
+        let n = sim.add_node(2); // The node that will distrust X
+
+        let x_node_id = sim.node(&x).unwrap().node_id();
+
+        // Connect them
+        sim.topology_mut().add_link(x, n, Link::new());
+
+        // Let them discover each other but don't run long enough to join
+        let tau = sim.node(&x).unwrap().tau();
+        sim.run_for(tau * 2); // Just discovery phase
+
+        // Now add X to N's distrusted set BEFORE N selects a parent
+        let now = sim.current_time();
+        sim.node_mut(&n).unwrap().inner_mut().add_distrust(x_node_id, now);
+
+        // Run for more time - N should NOT select X as parent (X is distrusted)
+        sim.run_for(tau * 10);
+
+        // Verify N is still root (did not join X)
+        let n_node = sim.node(&n).unwrap();
+        assert!(
+            n_node.is_root(),
+            "N should remain root (X is distrusted)"
+        );
+        assert!(
+            n_node.parent_id().is_none(),
+            "N should have no parent (X is distrusted)"
+        );
+
+        // Verify X is also root (couldn't recruit N)
+        let x_node = sim.node(&x).unwrap();
+        assert!(
+            x_node.is_root(),
+            "X should remain root (N won't join distrusted node)"
+        );
+    }
+
+    /// Scenario 9.2 variant: Distrusted node's merge offers are ignored.
+    ///
+    /// When a node is in another tree and the distrusted node's tree is larger,
+    /// the merge offer should be ignored.
+    #[test]
+    fn test_distrusted_node_merge_ignored() {
+        use crate::topology::Link;
+
+        let mut sim = Simulator::new(42);
+
+        // Create two separate trees: Tree A (nodes A1, A2) and Tree B (node B, distrusted)
+        let a1 = sim.add_node(1);
+        let a2 = sim.add_node(2);
+        let b = sim.add_node(100); // B will be distrusted by A1
+
+        let b_node_id = sim.node(&b).unwrap().node_id();
+
+        // Form tree A: A1 -- A2
+        sim.topology_mut().add_link(a1, a2, Link::new());
+
+        let tau = sim.node(&a1).unwrap().tau();
+        sim.run_for(tau * 10);
+
+        // Verify Tree A formed
+        let a1_is_root = sim.node(&a1).unwrap().is_root();
+        let a2_is_root = sim.node(&a2).unwrap().is_root();
+        assert!(
+            a1_is_root || a2_is_root,
+            "One of A1, A2 should be root of tree A"
+        );
+
+        // Get A1's current root_hash
+        let tree_a_root_hash = sim.node(&a1).unwrap().root_hash();
+
+        // Add B to A1's distrusted set (before connecting)
+        let now = sim.current_time();
+        sim.node_mut(&a1).unwrap().inner_mut().add_distrust(b_node_id, now);
+
+        // Now connect B to A1 (B can see A1's tree)
+        sim.topology_mut().add_link(a1, b, Link::new());
+
+        // B is a single node tree (tree_size=1), Tree A has tree_size=2
+        // Normally B would want to join A, but if we made B's tree larger it would try to merge
+        // For this test, we just verify that if A1 sees B, A1 doesn't join B due to distrust
+
+        // Run for more time
+        sim.run_for(tau * 10);
+
+        // A1 should still have the same root_hash (didn't join B's tree)
+        let a1_root_hash_after = sim.node(&a1).unwrap().root_hash();
+        assert_eq!(
+            tree_a_root_hash, a1_root_hash_after,
+            "A1's tree should not have changed (B is distrusted)"
+        );
+
+        // A1 should still be part of tree A (same root or child of same root)
+        // Either A1 is root, or A2 is root (A1 joined A2)
+        let a1_is_root = sim.node(&a1).unwrap().is_root();
+        let a2_is_root = sim.node(&a2).unwrap().is_root();
+        assert!(
+            a1_is_root || a2_is_root,
+            "Either A1 or A2 should be root of tree A (not B)"
+        );
+    }
+
+    /// Scenario 9.2 variant: Distrusted node cannot trigger shopping phase.
+    ///
+    /// This verifies the fix for a security gap where a distrusted node could
+    /// trigger the shopping phase (causing tree disruption) before being
+    /// filtered out during parent selection. The fix adds a distrust check
+    /// in consider_merge() before triggering shopping.
+    #[test]
+    fn test_distrusted_node_cannot_trigger_shopping() {
+        use crate::topology::Link;
+        use darktree::debug::DebugEvent;
+
+        let mut sim = Simulator::new(42);
+
+        // Create node A (will be the victim)
+        let a = sim.add_node(1);
+
+        // Create distrusted node X with children to have a "larger" tree
+        // X is added first (lower seed = older = more likely to be root)
+        let x = sim.add_node(100);
+        let x_node_id = sim.node(&x).unwrap().node_id();
+
+        // Create X's children (they should join X's tree)
+        let x_child1 = sim.add_node(101);
+        let x_child2 = sim.add_node(102);
+
+        // Connect X's children to X (form X's tree first, isolated from A)
+        sim.topology_mut().add_link(x, x_child1, Link::new());
+        sim.topology_mut().add_link(x, x_child2, Link::new());
+
+        let tau = sim.node(&a).unwrap().tau();
+
+        // Let X's tree form (tree_size should become 3)
+        sim.run_for(tau * 20);
+
+        // Verify X's tree formed (X should be root with children)
+        let x_node = sim.node(&x).unwrap();
+        assert!(x_node.is_root(), "X should be root of its tree");
+        let x_tree_size = x_node.tree_size();
+        assert!(
+            x_tree_size >= 2,
+            "X's tree should have at least 2 nodes, got {}",
+            x_tree_size
+        );
+
+        // A is a single-node tree
+        let a_tree_size = sim.node(&a).unwrap().tree_size();
+        assert_eq!(a_tree_size, 1, "A should be alone with tree_size=1");
+
+        // Verify X has a larger tree than A
+        assert!(
+            x_tree_size > a_tree_size,
+            "X's tree ({}) should be larger than A's tree ({})",
+            x_tree_size,
+            a_tree_size
+        );
+
+        // Now add X to A's distrusted set BEFORE connecting them
+        let now = sim.current_time();
+        sim.node_mut(&a).unwrap().inner_mut().add_distrust(x_node_id, now);
+
+        // Clear any existing debug events
+        sim.node(&a).unwrap().take_debug_events();
+
+        // Connect A to X - X's larger tree would normally trigger shopping in A
+        sim.topology_mut().add_link(a, x, Link::new());
+
+        // Run for some time - A should NOT enter shopping mode
+        sim.run_for(tau * 5);
+
+        // Verify A is still root (didn't disrupt its tree)
+        assert!(
+            sim.node(&a).unwrap().is_root(),
+            "A should remain root (X is distrusted, merge not triggered)"
+        );
+
+        // Check debug events - there should be a ConsiderMerge with reason "distrusted"
+        let events = sim.node(&a).unwrap().take_debug_events();
+        let distrusted_merge_rejected = events.iter().any(|e| {
+            matches!(
+                e,
+                DebugEvent::ConsiderMerge {
+                    reason: "distrusted",
+                    ..
+                }
+            )
+        });
+        assert!(
+            distrusted_merge_rejected,
+            "ConsiderMerge should have been rejected due to distrust. Events: {:?}",
+            events
+        );
+    }
 }

@@ -519,6 +519,17 @@ where
             return;
         }
 
+        // Ignore merge offers from distrusted nodes
+        if self.is_distrusted(&pulse.node_id, now) {
+            #[cfg(feature = "debug")]
+            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
+                from: pulse.node_id,
+                dominated: false,
+                reason: "distrusted",
+            });
+            return;
+        }
+
         // Same tree? No merge needed.
         if pulse.root_hash == *self.root_hash() {
             #[cfg(feature = "debug")]

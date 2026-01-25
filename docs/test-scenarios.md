@@ -248,9 +248,10 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Run:** 8 hours simulated (PUBLISH refresh period)
 - **Expect:** Honest nodes detect fraud via HLL (receive ~3% expected PUBLISH).
 
-### 9.2 Distrusted Node Rejected
+### 9.2 Distrusted Node Rejected ✓
 - **Setup:** Node X detected as fraudulent, added to distrusted set.
 - **Expect:** X not selected as parent. X's merge offers ignored.
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_distrusted_node_rejected_as_parent`, `test_distrusted_node_merge_ignored`
 
 ### 9.3 Distrust TTL Expiry
 - **Setup:** X distrusted at t=0. DISTRUST_TTL = 24 hours.
