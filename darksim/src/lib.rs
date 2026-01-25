@@ -3445,7 +3445,7 @@ mod tests {
 
         // P should have at most MAX_CHILDREN (12)
         assert!(
-            p_children_after <= MAX_CHILDREN as usize,
+            p_children_after <= MAX_CHILDREN,
             "P should not exceed MAX_CHILDREN ({}), got {}",
             MAX_CHILDREN,
             p_children_after
@@ -3483,7 +3483,7 @@ mod tests {
         for &node_id in initial_children.iter().chain(new_nodes.iter()).chain(&[p]) {
             let node = sim.node(&node_id).unwrap();
             assert!(
-                node.children_count() <= MAX_CHILDREN as usize,
+                node.children_count() <= MAX_CHILDREN,
                 "No node should exceed MAX_CHILDREN"
             );
         }
@@ -3767,8 +3767,10 @@ mod tests {
         let initial_tree_size = sim.node(&r).unwrap().tree_size();
         assert_eq!(initial_tree_size, 5, "Initial tree should have 5 nodes");
 
+        // Get R's node_id for comparisons (SimNode::node_id() returns by value)
+        let r_node_id = sim.node(&r).unwrap().node_id();
+
         // Verify all children have R as parent
-        let r_node_id = sim.node(&r).unwrap().node_id().clone();
         for c in &children {
             assert_eq!(
                 sim.node(c).unwrap().parent_id(),
@@ -3812,7 +3814,9 @@ mod tests {
         );
 
         // Find the final root
-        let all_nodes: Vec<_> = core::iter::once(r).chain(children.iter().copied()).collect();
+        let all_nodes: Vec<_> = core::iter::once(r)
+            .chain(children.iter().copied())
+            .collect();
         let final_root = all_nodes
             .iter()
             .find(|id| sim.node(id).unwrap().is_root())
@@ -3824,9 +3828,8 @@ mod tests {
         assert_eq!(final_tree_size, 5, "Final tree should have all 5 nodes");
 
         // Verify R still has the same identity
-        assert_eq!(
-            sim.node(&r).unwrap().node_id().clone(),
-            r_node_id_before,
+        assert!(
+            sim.node(&r).unwrap().node_id() == r_node_id_before,
             "R should have the same NodeId after restart"
         );
 
