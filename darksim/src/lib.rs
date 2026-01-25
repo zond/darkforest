@@ -1444,6 +1444,127 @@ mod tests {
         );
     }
 
+    /// Scenario 4.4: Internal Node Dies
+    /// Setup: R—A—{B, C, D}. Remove A at t=10τ.
+    /// Run: 50τ
+    /// Expect: B, C, D become separate subtrees, rejoin R if in range.
+    ///
+    /// This tests tree recovery when an internal node (not root, not leaf) dies.
+    /// Children should timeout and become roots, then rejoin if they can reach
+    /// another node in the surviving tree.
+    #[test]
+    fn test_internal_node_dies() {
+        use crate::topology::Link;
+
+        let mut sim = Simulator::new(42);
+
+        // Create topology: R—A—{B, C, D}
+        // R is root, A is internal node, B/C/D are leaves
+        let r = sim.add_node(1);
+        let a = sim.add_node(2);
+        let b = sim.add_node(3);
+        let c = sim.add_node(4);
+        let d = sim.add_node(5);
+
+        // R connects to A
+        sim.topology_mut().add_link(r, a, Link::default());
+        // A connects to B, C, D
+        sim.topology_mut().add_link(a, b, Link::default());
+        sim.topology_mut().add_link(a, c, Link::default());
+        sim.topology_mut().add_link(a, d, Link::default());
+
+        // Also connect B, C, D directly to R so they can rejoin after A dies
+        sim.topology_mut().add_link(r, b, Link::default());
+        sim.topology_mut().add_link(r, c, Link::default());
+        sim.topology_mut().add_link(r, d, Link::default());
+
+        // Form tree - run for 30τ (3 seconds) to ensure convergence
+        sim.run_for(Duration::from_secs(3));
+
+        // Verify tree formed with 5 nodes
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(snapshot.tree_count(), 1, "Should have 1 tree initially");
+
+        // Find the root (should be R or whichever has lowest root_hash)
+        let root_id = [r, a, b, c, d]
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Should have a root");
+        assert_eq!(
+            sim.node(&root_id).unwrap().tree_size(),
+            5,
+            "Tree should have 5 nodes"
+        );
+
+        // Now remove A by deactivating all its links
+        if let Some(link) = sim.topology_mut().get_link_mut(r, a) {
+            link.active = false;
+        }
+        if let Some(link) = sim.topology_mut().get_link_mut(a, b) {
+            link.active = false;
+        }
+        if let Some(link) = sim.topology_mut().get_link_mut(a, c) {
+            link.active = false;
+        }
+        if let Some(link) = sim.topology_mut().get_link_mut(a, d) {
+            link.active = false;
+        }
+
+        // Run for 50τ (5 seconds) to allow timeout and rejoin
+        // Parent timeout is 8 missed pulses at ~2τ interval = ~16τ
+        sim.run_for(Duration::from_secs(5));
+
+        // B, C, D should have timed out and rejoined via R
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+
+        // Should have 1 tree with 4 nodes (R + B + C + D, minus dead A)
+        // A is isolated (no links), so it may be a separate size-1 tree
+        let tree_count = snapshot.tree_count();
+
+        // The key assertion: B, C, D should have rejoined SOME tree
+        // (either R's tree or formed a new tree among themselves)
+        // Since they can all reach R, they should all be in one tree
+        assert!(
+            tree_count <= 2,
+            "Should have at most 2 trees (main tree + possibly dead A)"
+        );
+
+        // Count how many of R, B, C, D are in the same tree
+        let surviving_nodes = [r, b, c, d];
+        let mut root_hashes: std::collections::HashSet<[u8; 4]> = std::collections::HashSet::new();
+        for &node_id in &surviving_nodes {
+            let node = sim.node(&node_id).unwrap();
+            root_hashes.insert(node.root_hash());
+        }
+
+        // All surviving nodes should have the same root_hash (same tree)
+        assert_eq!(
+            root_hashes.len(),
+            1,
+            "All surviving nodes (R, B, C, D) should be in the same tree"
+        );
+
+        // The tree should have 4 nodes
+        let any_surviving = sim.node(&r).unwrap();
+        assert_eq!(
+            any_surviving.tree_size(),
+            4,
+            "Surviving tree should have 4 nodes"
+        );
+
+        // Verify node A is now isolated (its own size-1 tree)
+        let node_a = sim.node(&a).unwrap();
+        assert!(node_a.is_root(), "Isolated node A should be root");
+        assert_eq!(
+            node_a.tree_size(),
+            1,
+            "Isolated node A should have tree_size=1"
+        );
+    }
+
     /// Scenario 13.1: 100 Nodes Converge
     /// Setup: 100 nodes added gradually, random mesh topology
     /// Run: Add 10 nodes at a time, run 5τ between batches

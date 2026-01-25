@@ -123,10 +123,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Expect:** R isolated (size 1). A, B, C timeout, become roots, then merge (size 3).
 - **Status:** Implemented in `test_root_dies_children_remerge`
 
-### 4.4 Internal Node Dies
+### 4.4 Internal Node Dies ✓
 - **Setup:** R—A—{B, C, D}. Remove A at t=10τ.
 - **Run:** 50τ
 - **Expect:** B, C, D become separate subtrees, rejoin R if in range.
+- **Status:** Implemented in `test_internal_node_dies`
 
 ---
 
