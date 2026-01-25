@@ -84,10 +84,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Expect:** Single tree with root whose hash is lexicographically lower.
 - **Status:** Implemented in `test_equal_size_lower_root_hash_wins` (uses 5+5 nodes for efficiency)
 
-### 3.3 Tree Inversion Propagation
+### 3.3 Tree Inversion Propagation ✓
 - **Setup:** Tree B with depth 5 (chain). Tree A (larger) connects to leaf of B.
 - **Run:** 30τ
 - **Expect:** Inversion propagates up B (~1.5τ per hop). All nodes under A's root.
+- **Status:** Implemented in `test_tree_inversion_propagation`
 
 ### 3.4 Bridge Node Triggers Merge
 - **Setup:** Tree A, Tree B (both separate). Node N can reach both.

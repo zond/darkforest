@@ -1215,4 +1215,150 @@ mod tests {
         let abc_tree_size = sim.node(&abc_root).unwrap().tree_size();
         assert_eq!(abc_tree_size, 3, "A-B-C tree should have size 3");
     }
+
+    /// Scenario 3.3: Tree Inversion Propagation
+    /// Setup: Tree B is a chain of 5 nodes (depth 5). Tree A is larger (10 nodes).
+    ///        Connect Tree A to the LEAF of Tree B.
+    /// Run: Until merge completes.
+    /// Expect: Inversion propagates up the chain. All 15 nodes under A's root.
+    ///
+    /// This tests that when a larger tree connects to the deepest node of a
+    /// chain, the inversion correctly propagates up through all ancestors.
+    #[test]
+    fn test_tree_inversion_propagation() {
+        use crate::topology::Link;
+
+        // Create simulator
+        let mut sim = Simulator::new(42);
+
+        // Create Tree A: 10 nodes fully connected (will be the larger tree)
+        let mut tree_a = Vec::with_capacity(10);
+        for i in 0..10 {
+            tree_a.push(sim.add_node(1000 + i));
+        }
+        for i in 0..tree_a.len() {
+            for j in (i + 1)..tree_a.len() {
+                sim.topology_mut()
+                    .add_link(tree_a[i], tree_a[j], Link::default());
+            }
+        }
+
+        // Create Tree B: chain of 5 nodes (B0—B1—B2—B3—B4, where B4 is leaf)
+        let mut chain_b = Vec::with_capacity(5);
+        for i in 0..5 {
+            chain_b.push(sim.add_node(2000 + i));
+        }
+        for i in 0..4 {
+            sim.topology_mut()
+                .add_link(chain_b[i], chain_b[i + 1], Link::default());
+        }
+
+        // No links between trees initially
+
+        // Run to let each group form its own tree
+        sim.run_for(Duration::from_secs(10));
+
+        // Verify two separate trees formed
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(snapshot.tree_count(), 2, "Should have 2 separate trees");
+
+        // Verify Tree A has 10 nodes
+        let tree_a_root = tree_a
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Tree A should have a root");
+        assert_eq!(
+            sim.node(&tree_a_root).unwrap().tree_size(),
+            10,
+            "Tree A should have 10 nodes"
+        );
+
+        // Verify Tree B (chain) has 5 nodes
+        let chain_b_root = chain_b
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Chain B should have a root");
+        assert_eq!(
+            sim.node(&chain_b_root).unwrap().tree_size(),
+            5,
+            "Chain B should have 5 nodes"
+        );
+
+        // Find the leaf of chain B (the node that is NOT root and has no children)
+        // In a chain, the leaf should be one of the endpoints
+        let chain_b_leaf = chain_b
+            .iter()
+            .find(|id| {
+                let node = sim.node(id).unwrap();
+                !node.is_root() && node.children_count() == 0
+            })
+            .copied()
+            .expect("Chain B should have a leaf (non-root with no children)");
+
+        // Connect Tree A to the LEAF of chain B
+        // This forces inversion to propagate up the entire chain
+        sim.topology_mut()
+            .add_link(tree_a[0], chain_b_leaf, Link::default());
+
+        // Run for merge and inversion to complete
+        // Inversion propagates ~1.5τ per hop, chain has 4 hops, so ~6τ minimum
+        // Plus merge time. Using 30s for ample margin.
+        sim.run_for(Duration::from_secs(30));
+
+        // Verify single tree formed
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(
+            snapshot.tree_count(),
+            1,
+            "Should have merged to 1 tree after connecting"
+        );
+
+        // Find the final root
+        let final_root = tree_a
+            .iter()
+            .chain(chain_b.iter())
+            .copied()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .expect("Should have a root");
+
+        // The root should be from Tree A (the larger tree)
+        assert!(
+            tree_a.contains(&final_root),
+            "Final root should be from larger Tree A"
+        );
+
+        // Verify tree size is now 15 (10 + 5)
+        let final_tree_size = sim.node(&final_root).unwrap().tree_size();
+        assert_eq!(
+            final_tree_size, 15,
+            "Merged tree should have 15 nodes (10 + 5)"
+        );
+
+        // Verify all chain B nodes are now in the tree (not roots)
+        for &node_id in &chain_b {
+            let node = sim.node(&node_id).unwrap();
+            if node_id != final_root {
+                assert!(
+                    !node.is_root(),
+                    "Chain B node should not be root after merge"
+                );
+            }
+        }
+
+        // Verify the depth structure - compute depths to ensure inversion happened
+        // Collect all node IDs for depth computation
+        let all_node_ids: Vec<_> = tree_a.iter().chain(chain_b.iter()).copied().collect();
+        let depths = compute_depths(&sim, &all_node_ids);
+
+        // The key assertion: all 15 nodes should have computed depths
+        assert_eq!(
+            depths.len(),
+            15,
+            "All 15 nodes should have computable depths (all connected)"
+        );
+    }
 }
