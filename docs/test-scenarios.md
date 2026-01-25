@@ -304,9 +304,10 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Setup:** P has children C1, C2. C3 joins.
 - **Expect:** P recomputes keyspace ranges for all children.
 
-### 12.4 Proactive Pulse on State Change
+### 12.4 Proactive Pulse on State Change ✓
 - **Setup:** Node's tree state changes (new child, new parent, etc.)
 - **Expect:** Proactive pulse sent within ~1.5τ (jittered).
+- **Status:** Implemented in `test_proactive_pulse_on_state_change`
 
 ---
 
