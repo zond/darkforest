@@ -2271,4 +2271,100 @@ mod tests {
             "N should now have P's pubkey cached"
         );
     }
+
+    /// Scenario 10.3: Signature Verification Failure
+    /// Setup: Attacker sends pulse with wrong signature.
+    /// Expect: Pulse rejected after signature check.
+    ///
+    /// Tests that pulses with invalid signatures are rejected and
+    /// the SignatureVerifyFailed debug event is emitted.
+    #[test]
+    fn test_signature_verification_failure() {
+        use crate::topology::Link;
+        use darktree::debug::DebugEvent;
+
+        // Create two connected nodes
+        let mut sim = Simulator::new(42);
+        let n = sim.add_node(1);
+        let p = sim.add_node(2);
+        sim.topology_mut().add_link(n, p, Link::default());
+
+        // Run briefly so they exchange pubkeys
+        sim.run_for(Duration::from_secs(2));
+
+        // Verify N has P's pubkey (required for signature verification)
+        assert!(
+            sim.node(&n).unwrap().inner().has_pubkey(&p),
+            "N should have P's pubkey cached"
+        );
+
+        // Clear debug events
+        sim.node(&n).unwrap().take_debug_events();
+
+        // Trigger P to send a pulse
+        let tau = sim.node(&p).unwrap().tau();
+        let future_time = sim.current_time() + tau * 3;
+        sim.node_mut(&p).unwrap().handle_timer(future_time);
+
+        // Capture P's valid pulse
+        let p_pulses = sim.node(&p).unwrap().take_outgoing();
+        assert!(!p_pulses.is_empty(), "P should have sent a pulse");
+        let mut corrupted_pulse = p_pulses[0].clone();
+
+        // Corrupt the signature to fail SimCrypto's verify check
+        // Signature format: algorithm (1 byte) + sig (64 bytes) = 65 bytes at end
+        // SimCrypto.verify checks: sig.sig[..32] != [0u8; 32]
+        // To fail this check, we set the first 32 bytes of sig to all zeros
+        let len = corrupted_pulse.len();
+        assert!(len > 65, "Pulse should be longer than signature");
+        // sig bytes are at positions len-64 to len-1 (after algorithm byte)
+        // Set first 32 bytes of sig to zero to fail the verify check
+        for i in 0..32 {
+            corrupted_pulse[len - 64 + i] = 0;
+        }
+
+        // Deliver the corrupted pulse to N
+        sim.node_mut(&n)
+            .unwrap()
+            .handle_transport_rx(&corrupted_pulse, None, future_time);
+
+        // Check N's events - should have SignatureVerifyFailed
+        let n_events = sim.node(&n).unwrap().take_debug_events();
+
+        let sig_failed = n_events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::SignatureVerifyFailed { node_id } if *node_id == p));
+        let pulse_received = n_events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::PulseReceived { from, .. } if *from == p));
+
+        assert!(
+            sig_failed,
+            "SignatureVerifyFailed event should be emitted for corrupted pulse"
+        );
+        assert!(
+            !pulse_received,
+            "PulseReceived should NOT be emitted for corrupted pulse"
+        );
+
+        // Verify that N's state was not affected by the corrupted pulse
+        // (the corrupted pulse should not update neighbor timing or tree state)
+        // We can verify this by delivering a valid pulse and checking it's processed normally
+        let valid_pulse = p_pulses[0].clone();
+        sim.node_mut(&n).unwrap().handle_transport_rx(
+            &valid_pulse,
+            None,
+            future_time + Duration::from_millis(500),
+        );
+
+        let n_events = sim.node(&n).unwrap().take_debug_events();
+        let pulse_received = n_events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::PulseReceived { from, .. } if *from == p));
+
+        assert!(
+            pulse_received,
+            "Valid pulse should be received after corrupted one was rejected"
+        );
+    }
 }
