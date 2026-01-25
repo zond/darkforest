@@ -277,9 +277,10 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Expect:** N sets need_pubkey=true in next pulse. P includes pubkey.
 - **Status:** Implemented in `darksim/src/lib.rs` - `test_need_pubkey_flag`
 
-### 10.3 Signature Verification Failure
+### 10.3 Signature Verification Failure ✓
 - **Setup:** Attacker sends pulse with wrong signature.
 - **Expect:** Pulse rejected after signature check.
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_signature_verification_failure`
 
 ---
 

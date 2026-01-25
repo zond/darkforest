@@ -7,7 +7,7 @@ license.workspace = true
 description = "Discrete-event network simulator for darktree protocol testing"
 
 [dependencies]
-darktree = { path = "../darktree", features = ["std", "debug"] }
+darktree = { path = "../darktree", features = ["std", "debug", "test-support"] }
 hashbrown = { version = "0.15", features = ["default-hasher"] }
 embassy-sync = "0.6"
 

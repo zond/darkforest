@@ -1331,4 +1331,43 @@ where
         }
         self.recently_forwarded.insert(hash, now);
     }
+
+    // =========================================================================
+    // Test support methods
+    // =========================================================================
+    //
+    // These methods expose internal state for testing via the simulator.
+    // Only available when the `test-support` feature is enabled.
+
+    /// Access the location store for testing DHT operations.
+    #[cfg(feature = "test-support")]
+    pub fn test_location_store(&self) -> &LocationStore {
+        &self.location_store
+    }
+
+    /// Access pending lookups for testing DHT operations.
+    #[cfg(feature = "test-support")]
+    #[allow(private_interfaces)]
+    pub fn test_pending_lookups(&self) -> &PendingLookupMap {
+        &self.pending_lookups
+    }
+
+    /// Access the app incoming channel for testing data delivery.
+    #[cfg(feature = "test-support")]
+    pub fn test_app_incoming(&self) -> &AppInChannel {
+        &self.app_incoming
+    }
+
+    /// Access the location cache for testing DHT operations.
+    #[cfg(feature = "test-support")]
+    pub fn test_location_cache(&self) -> &LocationCache {
+        &self.location_cache
+    }
+
+    /// Access pending ACKs for testing reliability mechanisms.
+    #[cfg(feature = "test-support")]
+    #[allow(private_interfaces)]
+    pub fn test_pending_acks(&self) -> &PendingAckMap {
+        &self.pending_acks
+    }
 }
