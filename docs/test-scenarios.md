@@ -296,9 +296,10 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Setup:** Two nodes with same 4-byte child hash try to join same parent.
 - **Expect:** Parent accepts only one. Second is rejected.
 
-### 12.2 Maximum Children (12)
+### 12.2 Maximum Children (12) ✓
 - **Setup:** Parent has 12 children. 13th node tries to join.
 - **Expect:** 13th node rejected (implicit, via missing from children list).
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_maximum_children_enforced`
 
 ### 12.3 Keyspace Rebalance on Child Join ✓
 - **Setup:** P has children C1, C2. C3 joins.

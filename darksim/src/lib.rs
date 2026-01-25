@@ -2971,4 +2971,76 @@ mod tests {
             );
         }
     }
+
+    /// Scenario 12.2: Maximum Children (12)
+    ///
+    /// Per design doc, MAX_CHILDREN = 12 to guarantee worst-case Pulse fits in 252 bytes.
+    /// When a parent already has 12 children, a 13th node trying to join is rejected
+    /// (implicitly, by not appearing in the parent's children list).
+    #[test]
+    fn test_maximum_children_enforced() {
+        use crate::topology::Link;
+        use darktree::types::MAX_CHILDREN;
+
+        // Try one more than the limit to verify rejection
+        const NUM_ATTEMPTED_CHILDREN: usize = 13;
+
+        let mut sim = Simulator::new(42);
+
+        // Add parent first (will be oldest, likely to be root)
+        let parent = sim.add_node(100);
+        let parent_node_id = sim.node(&parent).unwrap().node_id();
+
+        // Add children (only MAX_CHILDREN should be accepted)
+        let mut children = Vec::new();
+        for i in 0..NUM_ATTEMPTED_CHILDREN {
+            let child = sim.add_node(101 + i as u64);
+            sim.topology_mut().add_link(parent, child, Link::new());
+            children.push(child);
+        }
+
+        // Run for 30 tau to allow all children time to attempt joining
+        // and receive parent's response (or lack thereof for rejected ones)
+        let tau = sim.node(&parent).unwrap().tau();
+        sim.run_for(tau * 30);
+
+        // Verify parent is root
+        assert!(
+            sim.node(&parent).unwrap().is_root(),
+            "Parent should be root"
+        );
+
+        // Count how many children actually have this specific parent
+        let mut accepted_count = 0;
+        let mut rejected_count = 0;
+
+        for child in &children {
+            let child_node = sim.node(child).unwrap();
+            // Check if this child has the correct parent (not just any parent)
+            if child_node.parent_id() == Some(parent_node_id) {
+                accepted_count += 1;
+            } else {
+                // Rejected child should still be root of its own single-node tree
+                assert!(
+                    child_node.is_root(),
+                    "Rejected child should be root of its own tree"
+                );
+                rejected_count += 1;
+            }
+        }
+
+        // Exactly MAX_CHILDREN should be accepted
+        assert_eq!(
+            accepted_count, MAX_CHILDREN,
+            "Parent should accept exactly {} children, but accepted {}",
+            MAX_CHILDREN, accepted_count
+        );
+
+        // Exactly one should be rejected (we tried MAX_CHILDREN + 1)
+        assert_eq!(
+            rejected_count, 1,
+            "Exactly one child should be rejected (tried {}, max is {})",
+            NUM_ATTEMPTED_CHILDREN, MAX_CHILDREN
+        );
+    }
 }
