@@ -2066,4 +2066,75 @@ mod tests {
         let ratio = lora_tau.as_millis() / udp_tau.as_millis();
         assert!(ratio >= 65 && ratio <= 70, "LoRa τ should be ~67x UDP τ");
     }
+
+    /// Scenario 10.1: Pubkey Cached on First Pulse
+    /// Setup: N receives pulse from unknown node P with has_pubkey=true.
+    /// Expect: N caches P's pubkey. Subsequent pulses verified.
+    ///
+    /// Tests that when a node receives a pulse containing a public key,
+    /// the pubkey is cached and used to verify future pulses.
+    #[test]
+    fn test_pubkey_cached_on_first_pulse() {
+        use crate::topology::Link;
+        use darktree::debug::DebugEvent;
+
+        // Create two connected nodes
+        let mut sim = Simulator::new(42);
+        let n = sim.add_node(1);
+        let p = sim.add_node(2);
+        sim.topology_mut().add_link(n, p, Link::default());
+
+        // Initially, N should not have P's pubkey cached
+        let n_has_p_pubkey = sim.node(&n).unwrap().inner().has_pubkey(&p);
+        assert!(!n_has_p_pubkey, "N should not initially have P's pubkey");
+
+        // Run simulation briefly to exchange pulses
+        // During this time, nodes will:
+        // 1. Send initial pulses (first pulses include pubkey)
+        // 2. Cache each other's pubkeys
+        sim.run_for(Duration::from_secs(2));
+
+        // After exchange, N should have P's pubkey cached
+        let n_has_p_pubkey = sim.node(&n).unwrap().inner().has_pubkey(&p);
+        assert!(n_has_p_pubkey, "N should have cached P's pubkey");
+
+        // And P should have N's pubkey cached
+        let p_has_n_pubkey = sim.node(&p).unwrap().inner().has_pubkey(&n);
+        assert!(p_has_n_pubkey, "P should have cached N's pubkey");
+
+        // Clear debug events
+        sim.node(&n).unwrap().take_debug_events();
+        sim.node(&p).unwrap().take_debug_events();
+
+        // Trigger P to send another pulse
+        let tau = sim.node(&p).unwrap().tau();
+        let future_time = sim.current_time() + tau * 3;
+        sim.node_mut(&p).unwrap().handle_timer(future_time);
+
+        // Capture P's pulse and deliver to N
+        let p_pulses = sim.node(&p).unwrap().take_outgoing();
+        assert!(!p_pulses.is_empty(), "P should have sent a pulse");
+        let pulse_data = p_pulses[0].clone();
+
+        // Deliver to N - should be verified using cached pubkey
+        sim.node_mut(&n)
+            .unwrap()
+            .handle_transport_rx(&pulse_data, None, future_time);
+
+        // Check N's events - should have PulseReceived, not SignatureVerifyFailed
+        let n_events = sim.node(&n).unwrap().take_debug_events();
+
+        let pulse_received = n_events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::PulseReceived { from, .. } if *from == p));
+        let sig_failed = n_events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::SignatureVerifyFailed { .. }));
+
+        assert!(
+            pulse_received,
+            "N should have received and verified P's pulse"
+        );
+        assert!(!sig_failed, "Signature verification should not have failed");
+    }
 }
