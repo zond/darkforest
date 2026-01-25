@@ -2137,4 +2137,138 @@ mod tests {
         );
         assert!(!sig_failed, "Signature verification should not have failed");
     }
+
+    /// Scenario 10.2: Need Pubkey Flag
+    /// Setup: N receives pulse from P without pubkey. N needs it.
+    /// Expect: N sets need_pubkey=true in next pulse. P includes pubkey.
+    ///
+    /// Tests the request-response mechanism for pubkey exchange where
+    /// a node explicitly requests a neighbor's pubkey via the need_pubkey flag.
+    #[test]
+    fn test_need_pubkey_flag() {
+        use darktree::wire::{Decode, Reader};
+
+        // Create two nodes without topology connection initially
+        // This ensures they don't automatically exchange pulses
+        let mut sim = Simulator::new(42);
+        let n = sim.add_node(1);
+        let p = sim.add_node(2);
+
+        // Get tau for timing
+        let tau = sim.node(&n).unwrap().tau();
+
+        // Initially neither should have the other's pubkey
+        assert!(
+            !sim.node(&n).unwrap().inner().has_pubkey(&p),
+            "N should not have P's pubkey initially"
+        );
+        assert!(
+            !sim.node(&p).unwrap().inner().has_pubkey(&n),
+            "P should not have N's pubkey initially"
+        );
+
+        // Nodes send initial pulses on creation, but they go nowhere (no topology)
+        // Drain any initial outgoing to clear state
+        sim.node(&n).unwrap().take_outgoing();
+        sim.node(&p).unwrap().take_outgoing();
+
+        // Advance time past the next scheduled pulse time to trigger P to send
+        let t1 = sim.current_time() + tau * 3;
+        sim.node_mut(&p).unwrap().handle_timer(t1);
+
+        // Capture P's pulse - it should NOT include pubkey (no one needs it yet)
+        let p_pulses = sim.node(&p).unwrap().take_outgoing();
+        assert!(!p_pulses.is_empty(), "P should have sent a pulse");
+        let p_pulse_data = p_pulses[0].clone();
+
+        // Decode and check P's pulse flags
+        let mut reader = Reader::new(&p_pulse_data[1..]); // Skip wire type byte
+        let p_pulse = darktree::types::Pulse::decode(&mut reader).expect("decode P's pulse");
+        assert!(
+            !p_pulse.has_pubkey(),
+            "P's first pulse should NOT include pubkey (no one needs it)"
+        );
+        assert!(
+            !p_pulse.need_pubkey(),
+            "P should not need any pubkeys initially"
+        );
+
+        // Deliver P's pulse to N
+        sim.node_mut(&n)
+            .unwrap()
+            .handle_transport_rx(&p_pulse_data, None, t1);
+
+        // N should now need P's pubkey (added to need_pubkey set internally)
+        // N should NOT have P's pubkey yet
+        assert!(
+            !sim.node(&n).unwrap().inner().has_pubkey(&p),
+            "N should still not have P's pubkey (wasn't in pulse)"
+        );
+
+        // Drain N's outgoing (it may have scheduled a proactive pulse)
+        sim.node(&n).unwrap().take_outgoing();
+
+        // Advance time past next pulse time to trigger N to send
+        let t2 = t1 + tau * 2;
+        sim.node_mut(&n).unwrap().handle_timer(t2);
+
+        // Capture N's pulse - it should have need_pubkey=true
+        let n_pulses = sim.node(&n).unwrap().take_outgoing();
+        assert!(!n_pulses.is_empty(), "N should have sent a pulse");
+        let n_pulse_data = n_pulses[0].clone();
+
+        // Decode and check N's pulse flags
+        let mut reader = Reader::new(&n_pulse_data[1..]);
+        let n_pulse = darktree::types::Pulse::decode(&mut reader).expect("decode N's pulse");
+        assert!(
+            n_pulse.need_pubkey(),
+            "N's pulse should have need_pubkey=true (requesting P's pubkey)"
+        );
+        // N should include its own pubkey since it needs pubkeys
+        assert!(
+            n_pulse.has_pubkey(),
+            "N should include its pubkey when requesting others"
+        );
+
+        // Deliver N's pulse to P
+        sim.node_mut(&p)
+            .unwrap()
+            .handle_transport_rx(&n_pulse_data, None, t2);
+
+        // P should now know N needs its pubkey (tracked in neighbors_need_pubkey)
+        // P should also have cached N's pubkey
+        assert!(
+            sim.node(&p).unwrap().inner().has_pubkey(&n),
+            "P should now have N's pubkey (N included it)"
+        );
+
+        // Drain P's outgoing and advance time to trigger new pulse
+        sim.node(&p).unwrap().take_outgoing();
+        let t3 = t2 + tau * 2;
+        sim.node_mut(&p).unwrap().handle_timer(t3);
+
+        // Capture P's response pulse - should now include pubkey
+        let p_pulses = sim.node(&p).unwrap().take_outgoing();
+        assert!(!p_pulses.is_empty(), "P should have sent a pulse");
+        let p_pulse_data = p_pulses[0].clone();
+
+        // Decode and check P's pulse flags
+        let mut reader = Reader::new(&p_pulse_data[1..]);
+        let p_pulse = darktree::types::Pulse::decode(&mut reader).expect("decode P's response");
+        assert!(
+            p_pulse.has_pubkey(),
+            "P's response pulse should include pubkey (N needs it)"
+        );
+
+        // Deliver P's response to N
+        sim.node_mut(&n)
+            .unwrap()
+            .handle_transport_rx(&p_pulse_data, None, t3);
+
+        // N should now have P's pubkey cached
+        assert!(
+            sim.node(&n).unwrap().inner().has_pubkey(&p),
+            "N should now have P's pubkey cached"
+        );
+    }
 }
