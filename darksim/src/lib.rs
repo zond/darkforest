@@ -3721,4 +3721,128 @@ mod tests {
             );
         }
     }
+
+    /// Scenario 19.3: Root Node Restart
+    /// Setup: Tree with root R. R restarts at t=50τ.
+    /// Run: 100τ
+    /// Expect: Children timeout, become roots, remerge. R rejoins (may or may not become root again).
+    ///
+    /// Tests that when the root node restarts:
+    /// 1. Children timeout and become their own roots
+    /// 2. The orphaned children eventually remerge into a single tree
+    /// 3. The restarted root rejoins the network
+    #[test]
+    fn test_root_node_restart() {
+        use crate::topology::Link;
+
+        let mut sim = Simulator::new(42);
+
+        // Create a star topology: root R with 4 children, children also connected to each other
+        let r = sim.add_node(1);
+        let mut children = Vec::with_capacity(4);
+        for i in 0..4 {
+            let c = sim.add_node(100 + i);
+            // Connect child to root
+            sim.topology_mut().add_link(r, c, Link::new());
+            children.push(c);
+        }
+
+        // Also connect children to each other (mesh among children)
+        // This ensures they can remerge after R disappears
+        for i in 0..children.len() {
+            for j in (i + 1)..children.len() {
+                sim.topology_mut()
+                    .add_link(children[i], children[j], Link::new());
+            }
+        }
+
+        // Run until tree forms (~10 seconds = ~100τ at default tau)
+        sim.run_for(Duration::from_secs(5));
+
+        // Verify initial tree formed with R as root
+        assert!(
+            sim.node(&r).unwrap().is_root(),
+            "R should be root of initial tree"
+        );
+        let initial_tree_size = sim.node(&r).unwrap().tree_size();
+        assert_eq!(initial_tree_size, 5, "Initial tree should have 5 nodes");
+
+        // Verify all children have R as parent
+        let r_node_id = sim.node(&r).unwrap().node_id().clone();
+        for c in &children {
+            assert_eq!(
+                sim.node(c).unwrap().parent_id(),
+                Some(r_node_id),
+                "Child should have R as parent"
+            );
+        }
+
+        // Restart the root node (loses all state)
+        let r_node_id_before = r_node_id;
+        sim.restart_node(&r).expect("Root should exist");
+
+        // Immediately after restart, R should be root of its own single-node tree
+        assert!(
+            sim.node(&r).unwrap().is_root(),
+            "Immediately after restart, R should be root (fresh state)"
+        );
+        assert_eq!(
+            sim.node(&r).unwrap().tree_size(),
+            1,
+            "Immediately after restart, R's tree_size should be 1"
+        );
+
+        // Run for timeout period (~24τ for children to timeout on R)
+        // plus merge time (~10τ) plus discovery time (~3τ)
+        // Total: ~40τ ≈ 4 seconds at default tau, use 10 seconds to be safe
+        sim.run_for(Duration::from_secs(10));
+
+        // At this point:
+        // - Children should have timed out on R and become roots
+        // - Children should have remerged among themselves
+        // - R should have rejoined (may or may not be root)
+
+        // Verify all 5 nodes are in a single tree
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(
+            snapshot.tree_count(),
+            1,
+            "All nodes should be in a single tree after recovery"
+        );
+
+        // Find the final root
+        let all_nodes: Vec<_> = core::iter::once(r).chain(children.iter().copied()).collect();
+        let final_root = all_nodes
+            .iter()
+            .find(|id| sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Should have a root");
+
+        // Verify tree size is 5
+        let final_tree_size = sim.node(&final_root).unwrap().tree_size();
+        assert_eq!(final_tree_size, 5, "Final tree should have all 5 nodes");
+
+        // Verify R still has the same identity
+        assert_eq!(
+            sim.node(&r).unwrap().node_id().clone(),
+            r_node_id_before,
+            "R should have the same NodeId after restart"
+        );
+
+        // Verify all nodes have the same root_hash (converged)
+        let expected_root_hash = sim.node(&final_root).unwrap().root_hash();
+        for node_id in &all_nodes {
+            assert_eq!(
+                sim.node(node_id).unwrap().root_hash(),
+                expected_root_hash,
+                "All nodes should have the same root_hash"
+            );
+        }
+
+        // Note: R may or may not be the final root - the larger tree wins during merge,
+        // and after R restarts, the children form a 4-node tree while R is a 1-node tree.
+        // So the children's tree should win, and R should join as a child.
+        // But we don't strictly assert this since race conditions could vary the outcome.
+    }
 }

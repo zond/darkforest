@@ -492,10 +492,11 @@ Verify protocol works correctly with constrained resources.
 - **Run:** 50τ
 - **Expect:** Entries lost. Publishers republish within 8 hours. Lookups may fail temporarily.
 
-### 19.3 Root Node Restart
+### 19.3 Root Node Restart ✓
 - **Setup:** Tree with root R. R restarts at t=50τ.
 - **Run:** 100τ
 - **Expect:** Children timeout, become roots, remerge. R rejoins (may or may not become root again).
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_root_node_restart`
 
 ---
 
