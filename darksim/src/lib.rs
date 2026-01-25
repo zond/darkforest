@@ -3391,4 +3391,99 @@ mod tests {
             "After distrust TTL expiry, N and X should have the same root_hash"
         );
     }
+
+    /// Scenario 18.2: Simultaneous Child Joins
+    ///
+    /// When multiple nodes try to join a nearly-full parent simultaneously,
+    /// the parent should accept up to MAX_CHILDREN and the rest should
+    /// either stay as roots or find different parents.
+    #[test]
+    fn test_simultaneous_child_joins() {
+        use crate::topology::Link;
+        use darktree::MAX_CHILDREN;
+
+        let mut sim = Simulator::new(42);
+
+        // Create parent P
+        let p = sim.add_node(1);
+
+        // Create 10 initial children that will join P
+        let mut initial_children = Vec::with_capacity(10);
+        for i in 0..10 {
+            let c = sim.add_node(100 + i);
+            sim.topology_mut().add_link(p, c, Link::new());
+            initial_children.push(c);
+        }
+
+        // Run until P has 10 children
+        let tau = sim.node(&p).unwrap().tau();
+        sim.run_for(tau * 15);
+
+        // Verify P has 10 children
+        let p_children_count = sim.node(&p).unwrap().children_count();
+        assert_eq!(
+            p_children_count, 10,
+            "P should have 10 children before new nodes join"
+        );
+
+        // Now add 5 new nodes that can all see P (and only P)
+        // These will try to join simultaneously
+        let mut new_nodes = Vec::with_capacity(5);
+        for i in 0..5 {
+            let n = sim.add_node(200 + i);
+            sim.topology_mut().add_link(p, n, Link::new());
+            new_nodes.push(n);
+        }
+
+        // Run for discovery + join time
+        sim.run_for(tau * 20);
+
+        // Check how many children P has now
+        let p_children_after = sim.node(&p).unwrap().children_count();
+
+        // P should have at most MAX_CHILDREN (12)
+        assert!(
+            p_children_after <= MAX_CHILDREN as usize,
+            "P should not exceed MAX_CHILDREN ({}), got {}",
+            MAX_CHILDREN,
+            p_children_after
+        );
+
+        // Count how many of the new nodes joined P (became children)
+        let mut new_joined_p = 0;
+        let mut new_stayed_root = 0;
+        let p_node_id = sim.node(&p).unwrap().node_id();
+
+        for &n in &new_nodes {
+            let node = sim.node(&n).unwrap();
+            if node.parent_id() == Some(p_node_id) {
+                new_joined_p += 1;
+            } else if node.is_root() {
+                new_stayed_root += 1;
+            }
+        }
+
+        // P had 10 children, so can accept at most 2 more
+        assert!(
+            new_joined_p <= 2,
+            "At most 2 new nodes should join P (had 10, max 12), got {}",
+            new_joined_p
+        );
+
+        // The rest should be roots (they can only see P, who is full)
+        assert_eq!(
+            new_joined_p + new_stayed_root,
+            5,
+            "All 5 new nodes should either join P or stay root"
+        );
+
+        // Verify no node has more than MAX_CHILDREN children
+        for &node_id in initial_children.iter().chain(new_nodes.iter()).chain(&[p]) {
+            let node = sim.node(&node_id).unwrap();
+            assert!(
+                node.children_count() <= MAX_CHILDREN as usize,
+                "No node should exceed MAX_CHILDREN"
+            );
+        }
+    }
 }

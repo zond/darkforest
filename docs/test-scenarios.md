@@ -267,13 +267,15 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 
 ## 10. Pubkey Exchange
 
-### 10.1 Pubkey Cached on First Pulse
+### 10.1 Pubkey Cached on First Pulse ✓
 - **Setup:** N receives pulse from unknown node P with has_pubkey=true.
 - **Expect:** N caches P's pubkey. Subsequent pulses verified.
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_pubkey_cached_on_first_pulse`
 
-### 10.2 Need Pubkey Flag
+### 10.2 Need Pubkey Flag ✓
 - **Setup:** N receives pulse from P without pubkey. N needs it.
 - **Expect:** N sets need_pubkey=true in next pulse. P includes pubkey.
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_need_pubkey_flag`
 
 ### 10.3 Signature Verification Failure
 - **Setup:** Attacker sends pulse with wrong signature.
@@ -464,10 +466,11 @@ Verify protocol works correctly with constrained resources.
 - **Run:** 50τ
 - **Expect:** Single tree with A's root. No oscillation or split-brain.
 
-### 18.2 Simultaneous Child Joins
+### 18.2 Simultaneous Child Joins ✓
 - **Setup:** Parent P with 10 children. 5 new nodes try to join P simultaneously.
 - **Run:** 20τ
 - **Expect:** P accepts up to MAX_CHILDREN (12). Others find different parents or stay root.
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_simultaneous_child_joins`
 
 ### 18.3 Parent Switch During Message Transit
 - **Setup:** Node N sending Routed. N's parent changes mid-flight.
