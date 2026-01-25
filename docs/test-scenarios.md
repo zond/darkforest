@@ -292,9 +292,10 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 
 ## 12. Edge Cases
 
-### 12.1 Child Hash Collision
+### 12.1 Child Hash Collision ✓
 - **Setup:** Two nodes with same 4-byte child hash try to join same parent.
 - **Expect:** Parent accepts only one. Second is rejected.
+- **Status:** Implemented in `darktree/src/tree.rs` - `test_child_hash_collision_rejected`
 
 ### 12.2 Maximum Children (12) ✓
 - **Setup:** Parent has 12 children. 13th node tries to join.
