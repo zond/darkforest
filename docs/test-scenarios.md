@@ -440,9 +440,10 @@ Verify protocol works correctly with constrained resources.
 - **Expect:** Rejected at decode or signature verification.
 - **Status:** Implemented in `test_invalid_signature_algorithm_rejected`
 
-### 17.6 Children Not Sorted
+### 17.6 Children Not Sorted ✓
 - **Setup:** Pulse with children in non-ascending hash order.
 - **Expect:** Rejected at decode (invalid children order).
+- **Status:** Implemented in `test_unsorted_children_rejected`
 
 ---
 

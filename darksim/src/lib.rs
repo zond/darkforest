@@ -2699,4 +2699,83 @@ mod tests {
             "MessageDecodeFailed event should be emitted for invalid signature algorithm"
         );
     }
+
+    /// Scenario 17.6: Pulse with unsorted children should be rejected.
+    #[test]
+    fn test_unsorted_children_rejected() {
+        use darktree::debug::DebugEvent;
+        use darktree::types::ALGORITHM_ED25519;
+        use darktree::wire::{Decode, DecodeError, Reader, Writer};
+
+        // Create a node to receive the malformed message
+        let mut sim = Simulator::new(42);
+        let n = sim.add_node(1);
+        let tau = sim.node(&n).unwrap().tau();
+        let now = sim.current_time() + tau * 3;
+
+        // Manually construct a pulse with unsorted children
+        // Children should be sorted by hash in ascending order (lexicographic big-endian).
+        // We'll put 0xBB before 0xAA which is wrong (0xAA < 0xBB).
+        let mut w = Writer::new();
+
+        // Wire type (Pulse = 0x01)
+        w.write_u8(0x01);
+
+        // node_id (16 bytes)
+        w.write_node_id(&[0x42u8; 16]);
+
+        // flags: has_parent=false, need_pubkey=false, has_pubkey=false, child_count=2
+        let flags = 2 << 3; // 2 children in bits 3-7
+        w.write_u8(flags);
+
+        // root_hash (4 bytes)
+        w.write_child_hash(&[0xAA; 4]);
+
+        // subtree_size, tree_size (varints)
+        w.write_varint(3); // subtree_size
+        w.write_varint(3); // tree_size
+
+        // keyspace_lo, keyspace_hi (u32 big-endian)
+        w.write_u32_be(0);
+        w.write_u32_be(u32::MAX);
+
+        // Children in WRONG order (0xBB > 0xAA, so should be AA first)
+        w.write_child_hash(&[0xBB; 4]); // First child hash (WRONG - should be after 0xAA)
+        w.write_varint(1); // subtree_size
+        w.write_child_hash(&[0xAA; 4]); // Second child hash
+        w.write_varint(1); // subtree_size
+
+        // Signature (1 + 64 bytes)
+        w.write_u8(ALGORITHM_ED25519);
+        w.write_bytes(&[0u8; 64]);
+
+        let malformed_pulse = w.finish();
+
+        // Verify the decode fails with InvalidValue
+        let mut reader = Reader::new(&malformed_pulse[1..]); // Skip wire_type byte
+        let result = darktree::types::Pulse::decode(&mut reader);
+
+        assert!(
+            matches!(result, Err(DecodeError::InvalidValue)),
+            "Decode should fail with InvalidValue for unsorted children, got {:?}",
+            result
+        );
+
+        // Also verify that delivering this malformed pulse to a node
+        // results in MessageDecodeFailed event
+        sim.node(&n).unwrap().take_debug_events(); // Clear events
+        sim.node_mut(&n)
+            .unwrap()
+            .handle_transport_rx(&malformed_pulse, None, now);
+
+        let events = sim.node(&n).unwrap().take_debug_events();
+        let decode_failed = events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::MessageDecodeFailed { .. }));
+
+        assert!(
+            decode_failed,
+            "MessageDecodeFailed event should be emitted for unsorted children"
+        );
+    }
 }
