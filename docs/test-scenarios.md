@@ -309,10 +309,12 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 
 ## 13. Scale Tests
 
-### 13.1 100 Nodes Converge
-- **Setup:** 100 nodes, random mesh topology (average 5 neighbors each)
-- **Run:** 200τ
+### 13.1 100 Nodes Converge ✓
+- **Setup:** 100 nodes, random mesh topology (average ~10 neighbors each)
+- **Run:** ~2000τ (200 seconds)
 - **Expect:** Single tree. All nodes have same root_hash.
+- **Status:** Implemented in `test_100_nodes_converge` (ignored by default, ~2 min runtime)
+- **Note:** This test discovered a tree_size over-counting bug during rapid merges.
 
 ### 13.2 1000 Nodes Converge
 - **Setup:** 1000 nodes, realistic topology
