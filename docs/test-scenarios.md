@@ -425,9 +425,10 @@ Verify protocol works correctly with constrained resources.
 - **Expect:** Rejected with decode error.
 - **Status:** Implemented in `test_non_canonical_varint_rejected`
 
-### 17.3 Truncated Message
+### 17.3 Truncated Message ✓
 - **Setup:** Valid message header but truncated before signature.
 - **Expect:** Rejected at decode. No partial processing.
+- **Status:** Implemented in `test_truncated_message_rejected`
 
 ### 17.4 Invalid Wire Type
 - **Setup:** Message with wire_type=0x99 (unknown).

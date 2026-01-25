@@ -2525,4 +2525,62 @@ mod tests {
             "MessageDecodeFailed event should be emitted for non-canonical varint"
         );
     }
+
+    /// Scenario 17.3: Truncated message should be rejected.
+    #[test]
+    fn test_truncated_message_rejected() {
+        use darktree::debug::DebugEvent;
+        use darktree::wire::{Decode, DecodeError, Reader};
+
+        // Create a node
+        let mut sim = Simulator::new(42);
+        let n = sim.add_node(1);
+
+        // Get tau and trigger a pulse
+        let tau = sim.node(&n).unwrap().tau();
+        let future_time = sim.current_time() + tau * 3;
+        sim.node_mut(&n).unwrap().handle_timer(future_time);
+
+        // Capture the valid pulse
+        let pulses = sim.node(&n).unwrap().take_outgoing();
+        assert!(!pulses.is_empty(), "Node should have sent a pulse");
+        let valid_pulse = &pulses[0];
+
+        // A valid pulse has a 65-byte signature at the end (1 byte algorithm + 64 bytes sig).
+        // Truncate before the signature to create an invalid message.
+        assert!(
+            valid_pulse.len() > 65,
+            "Pulse should be longer than just the signature"
+        );
+
+        // Truncate to remove the last 32 bytes of the signature
+        let truncated_pulse = &valid_pulse[..valid_pulse.len() - 32];
+
+        // Verify the decode fails with UnexpectedEof
+        let mut reader = Reader::new(&truncated_pulse[1..]); // Skip wire_type byte
+        let result = darktree::types::Pulse::decode(&mut reader);
+
+        assert!(
+            matches!(result, Err(DecodeError::UnexpectedEof)),
+            "Decode should fail with UnexpectedEof for truncated message, got {:?}",
+            result
+        );
+
+        // Also verify that delivering this truncated pulse to a node
+        // results in MessageDecodeFailed event
+        sim.node(&n).unwrap().take_debug_events(); // Clear events
+        sim.node_mut(&n)
+            .unwrap()
+            .handle_transport_rx(truncated_pulse, None, future_time);
+
+        let events = sim.node(&n).unwrap().take_debug_events();
+        let decode_failed = events
+            .iter()
+            .any(|e| matches!(e, DebugEvent::MessageDecodeFailed { .. }));
+
+        assert!(
+            decode_failed,
+            "MessageDecodeFailed event should be emitted for truncated message"
+        );
+    }
 }
