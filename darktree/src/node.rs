@@ -1065,7 +1065,7 @@ where
     }
 
     /// Check if node is in shopping phase (first boot or merge).
-    pub(crate) fn is_shopping(&self) -> bool {
+    pub fn is_shopping(&self) -> bool {
         self.shopping_deadline.is_some()
     }
 

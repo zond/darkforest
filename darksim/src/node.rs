@@ -285,6 +285,11 @@ impl SimNode {
         self.inner.is_root()
     }
 
+    /// Check if this node is in shopping phase (looking for parent).
+    pub fn is_shopping(&self) -> bool {
+        self.inner.is_shopping()
+    }
+
     /// Get the tree size.
     pub fn tree_size(&self) -> u32 {
         self.inner.tree_size()

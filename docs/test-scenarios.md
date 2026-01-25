@@ -95,9 +95,10 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Run:** 30τ
 - **Expect:** N joins larger tree, other tree eventually merges via N.
 
-### 3.5 No Merge During Discovery
-- **Setup:** N is in discovery phase. Receives pulse from larger tree.
-- **Expect:** N waits until discovery ends before merging.
+### 3.5 No Merge During Shopping ✓
+- **Setup:** N is in shopping phase. Receives pulse from larger tree.
+- **Expect:** N waits until shopping ends before merging.
+- **Status:** Implemented in `test_no_merge_during_shopping`
 
 ---
 

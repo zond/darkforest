@@ -1359,6 +1359,91 @@ mod tests {
         );
     }
 
+    /// Scenario 3.5: No Merge During Shopping
+    /// Setup: N is in shopping phase. Receives pulse from larger tree.
+    /// Expect: N waits until shopping ends before merging (doesn't interrupt shopping).
+    ///
+    /// This tests that the is_shopping() guard in consider_merge() works correctly.
+    /// When a node is already shopping for a parent, it shouldn't restart shopping
+    /// when it sees another dominating tree.
+    #[test]
+    fn test_no_merge_during_shopping() {
+        use crate::topology::Link;
+
+        let mut sim = Simulator::new(42);
+
+        // Create a separate tree B with 5 nodes first (will be larger)
+        let tree_b_root = sim.add_node(100);
+        for i in 1..5 {
+            let child = sim.add_node(100 + i);
+            sim.topology_mut()
+                .add_link(tree_b_root, child, Link::default());
+        }
+
+        // Run tree B to form (node A doesn't exist yet)
+        sim.run_for(Duration::from_secs(5));
+
+        // Verify tree B formed with 5 nodes
+        let tree_b_node = sim.node(&tree_b_root).unwrap();
+        assert_eq!(tree_b_node.tree_size(), 5, "Tree B should have 5 nodes");
+
+        // Now add node A - it will start in shopping phase
+        let node_a = sim.add_node(1);
+        sim.topology_mut()
+            .add_link(node_a, tree_b_root, Link::default());
+
+        // Run for just 1τ (0.1s) - node A should be in shopping phase
+        // but NOT yet have selected a parent
+        sim.run_for(Duration::from_millis(100));
+
+        // Node A should still be in shopping phase (shopping is 3τ = 0.3s)
+        let node_a_state = sim.node(&node_a).unwrap();
+        assert!(
+            node_a_state.is_shopping(),
+            "Node A should still be in shopping phase after 1τ"
+        );
+        assert!(
+            node_a_state.is_root(),
+            "Node A should still be root during shopping"
+        );
+
+        // Run for another 1τ - still shopping
+        sim.run_for(Duration::from_millis(100));
+        let node_a_state = sim.node(&node_a).unwrap();
+        assert!(
+            node_a_state.is_shopping(),
+            "Node A should still be in shopping phase after 2τ"
+        );
+
+        // Run for another 2τ to complete shopping (total 4τ = 0.4s > 3τ)
+        sim.run_for(Duration::from_millis(200));
+
+        // Now shopping should be done and node A should have joined tree B
+        let node_a_state = sim.node(&node_a).unwrap();
+        assert!(
+            !node_a_state.is_shopping(),
+            "Node A should no longer be in shopping phase"
+        );
+
+        // Give some time for parent acknowledgment
+        sim.run_for(Duration::from_secs(2));
+
+        // Node A should now be part of tree B
+        let node_a_state = sim.node(&node_a).unwrap();
+        assert!(
+            !node_a_state.is_root(),
+            "Node A should have joined tree B after shopping"
+        );
+
+        // Tree should now have 6 nodes
+        let tree_b_node = sim.node(&tree_b_root).unwrap();
+        assert_eq!(
+            tree_b_node.tree_size(),
+            6,
+            "Tree B should now have 6 nodes (original 5 + node A)"
+        );
+    }
+
     /// Scenario 13.1: 100 Nodes Converge
     /// Setup: 100 nodes added gradually, random mesh topology
     /// Run: Add 10 nodes at a time, run 5τ between batches
