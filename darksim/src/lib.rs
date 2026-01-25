@@ -3043,4 +3043,63 @@ mod tests {
             NUM_ATTEMPTED_CHILDREN, MAX_CHILDREN
         );
     }
+
+    /// Scenario 1.3: Discovery Skips Full Parents
+    ///
+    /// Per design doc, during parent selection, nodes filter out neighbors
+    /// with children_count >= MAX_CHILDREN. A new node N should not select
+    /// a full parent P, even if P is the only visible neighbor.
+    #[test]
+    fn test_discovery_skips_full_parents() {
+        use crate::topology::Link;
+        use darktree::types::MAX_CHILDREN;
+
+        let mut sim = Simulator::new(42);
+
+        // Create parent P with exactly MAX_CHILDREN children already
+        let parent = sim.add_node(100);
+        let parent_node_id = sim.node(&parent).unwrap().node_id();
+
+        // Create MAX_CHILDREN children for P
+        let mut existing_children = Vec::new();
+        for i in 0..MAX_CHILDREN {
+            let child = sim.add_node(101 + i as u64);
+            sim.topology_mut().add_link(parent, child, Link::new());
+            existing_children.push(child);
+        }
+
+        // Run until P has all children
+        let tau = sim.node(&parent).unwrap().tau();
+        sim.run_for(tau * 30);
+
+        // Verify P is root with MAX_CHILDREN children
+        assert!(sim.node(&parent).unwrap().is_root());
+        let children_with_parent: usize = existing_children
+            .iter()
+            .filter(|c| sim.node(c).unwrap().parent_id() == Some(parent_node_id))
+            .count();
+        assert_eq!(
+            children_with_parent, MAX_CHILDREN,
+            "P should have exactly {} children",
+            MAX_CHILDREN
+        );
+
+        // Now add a new node N that can only see P (P is full)
+        let new_node = sim.add_node(200);
+        sim.topology_mut().add_link(parent, new_node, Link::new());
+
+        // Run for 10 tau - N should discover P is full and NOT select it
+        sim.run_for(tau * 10);
+
+        // N should remain root of its own single-node tree
+        let n_node = sim.node(&new_node).unwrap();
+        assert!(
+            n_node.is_root(),
+            "N should remain root (not select full parent P)"
+        );
+        assert!(
+            n_node.parent_id().is_none(),
+            "N should have no parent (P is full)"
+        );
+    }
 }

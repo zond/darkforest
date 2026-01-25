@@ -18,10 +18,11 @@ Scenarios derived from the design doc. Each describes setup, actions, and expect
 - **Expect:** Node waits until 3τ before selecting parent (discovery phase)
 - **Status:** Implemented in `test_discovery_phase_timing`
 
-### 1.3 Discovery Skips Full Parents
+### 1.3 Discovery Skips Full Parents ✓
 - **Setup:** 3 nodes. P has MAX_CHILDREN (12) children already. N boots.
 - **Run:** 10τ
 - **Expect:** N does not select P as parent (P is full)
+- **Status:** Implemented in `darksim/src/lib.rs` - `test_discovery_skips_full_parents`
 
 ---
 
