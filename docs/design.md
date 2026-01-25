@@ -250,6 +250,7 @@ Pulse interval is approximately 3τ (based on 150-byte pulse, PULSE_BW_DIVISOR=5
 |----------|---------------|----------------|
 | Join (get keyspace range) | 6-9τ | 2-4τ |
 | Merge detection | 0-3τ | 1-2τ |
+| Merge shopping | 3τ | 3τ |
 | State propagation | 0-3τ | 1-2τ |
 | Pubkey exchange | 3-6τ | 2-4τ |
 
@@ -355,31 +356,43 @@ N state:
 
 N is root of its own single-node tree.
 
-### Joining an Existing Tree
+### Merge Shopping (Parent Selection)
 
-When node N boots, it has no parent and no children. It enters a **discovery phase** to find the best parent:
+Nodes always boot as root of a single-node tree (see Bootstrap). Parent selection happens through **merge shopping** — a unified mechanism used both at first boot and when merging into a dominating tree.
 
-**Discovery phase:**
-1. N sends its first Pulse (as root of single-node tree)
-2. N starts a discovery timer (3τ) to collect neighbor Pulses
-3. When timer fires, N evaluates all discovered neighbors
+**When merge shopping triggers:**
+1. **First boot** — Immediately after first Pulse, node starts merge shopping to find a parent
+2. **Dominating tree seen** — When a node sees a Pulse from a better tree (larger tree_size, or equal size with lower root_hash)
+
+**Merge shopping phase (3τ):**
+1. Node starts a merge timer (3τ) to collect neighbor Pulses
+2. When timer fires, node evaluates all candidates from the target tree
+3. If no valid candidates, stay as root and retry on next dominating Pulse
 
 **Candidate filtering:** A neighbor is skipped if:
 - It has `children.len() >= MAX_CHILDREN` (parent is full)
 - It is in the distrusted set
+- Its root_hash doesn't match the target tree (for merges)
 
 **Parent selection algorithm:**
-1. **Pick the best tree** — if multiple roots visible, choose largest tree_size (tie-break: lowest root_hash). This makes N a bridge that triggers tree merging.
-2. **Filter by signal strength** — if 3+ candidates and RSSI data available, remove bottom 50% by RSSI. This ensures reliable parent links. Skip this step for non-radio transports (e.g., UDP) or when fewer than 3 candidates.
+1. **Pick the best tree** — if multiple roots visible, choose largest tree_size (tie-break: lowest root_hash). This becomes the "target tree" for candidate filtering.
+2. **Filter by signal strength** — if 3+ candidates and RSSI data available, remove bottom 50% by RSSI. This is a soft defense for reliable links, not a security guarantee (RSSI can be manipulated). Skip this step for non-radio transports (e.g., UDP) or when fewer than 3 candidates.
 3. **Pick shallowest** — from remaining candidates, choose the one with largest keyspace range (tie-break: best RSSI, or arbitrary if no RSSI). This keeps trees wide and shallow.
 
-If no valid candidates remain after filtering, N stays root of its single-node tree and will join via normal merge when it hears a larger tree.
+If no valid candidates remain from the target tree, fall back to candidates from the next-best tree using the same algorithm. If still no valid candidates, the node stays root of its single-node tree (or subtree during merges).
 
-**After joining:** Once N has a parent, it only switches parent when:
-- **Merge** — N sees a better tree (larger tree_size, or equal size with lower root_hash)
-- **Parent timeout** — after 8 missed Pulses, N becomes root of its own subtree (see "Partition and Reconnection")
+**Mutual parent detection:** If a node claims a parent but sees that parent also claiming it as parent (via parent_hash), one of them is in an invalid state. The node from the dominated tree (smaller tree_size, or equal size with higher root_hash) should back off and retry merge shopping.
 
-There is no "parent shopping" after joining. This provides stability while still allowing trees to merge and recover from partitions.
+**Why 3τ?** This window allows time for:
+- Neighbors to respond to the node's Pulse
+- Multiple neighbors to send their periodic Pulses
+- The node to receive Pulses from neighbors at different distances
+
+**After joining:** Once a node has a parent, it only switches parent when:
+- **Merge** — node sees a better tree (triggers new merge shopping phase)
+- **Parent timeout** — after 8 missed Pulses, node becomes root of its own subtree (see "Partition and Reconnection")
+
+This unified mechanism ensures both new nodes and merging subtrees find optimal shallow positions. Without merge shopping, a node might join the first neighbor it sees even when a much shallower position is reachable.
 
 This prioritization naturally produces wide, shallow trees. Larger keyspace ranges indicate shallower positions in the tree.
 

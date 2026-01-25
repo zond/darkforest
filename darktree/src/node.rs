@@ -200,7 +200,7 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     next_publish: Option<Timestamp>,
     location_seq: u32,
     proactive_pulse_pending: Option<Timestamp>,
-    discovery_deadline: Option<Timestamp>,
+    shopping_deadline: Option<Timestamp>,
 
     // Metrics
     metrics: TransportMetrics,
@@ -318,7 +318,7 @@ where
             next_publish: None,
             location_seq: 0,
             proactive_pulse_pending: None,
-            discovery_deadline: None,
+            shopping_deadline: None,
 
             metrics: TransportMetrics::new(),
 
@@ -492,15 +492,10 @@ where
         // Send first pulse immediately
         self.send_pulse(now);
 
-        // Start discovery phase if orphan (no parent, no children)
-        // Discovery lasts 3τ to collect neighbor Pulses before selecting parent
+        // Start shopping phase if orphan (no parent, no children)
+        // Shopping lasts 3τ to collect neighbor Pulses before selecting parent
         if self.parent.is_none() && self.children.is_empty() {
-            let discovery_duration = self.tau() * 3;
-            let deadline = now + discovery_duration;
-            self.discovery_deadline = Some(deadline);
-
-            #[cfg(feature = "debug")]
-            self.emit_debug(crate::debug::DebugEvent::DiscoveryStarted { deadline });
+            self.start_shopping(now);
         }
     }
 
@@ -531,7 +526,7 @@ where
                 (None, None) => self.clock.now() + Duration::from_secs(60),
             };
             // Include discovery deadline in timer wake
-            if let Some(deadline) = self.discovery_deadline {
+            if let Some(deadline) = self.shopping_deadline {
                 timer_wake = timer_wake.min(deadline);
             }
 
@@ -670,12 +665,12 @@ where
     /// For simulation, call this directly instead of using `run()`.
     pub fn handle_timer(&mut self, now: Timestamp) {
         // Check if discovery phase is complete
-        if let Some(deadline) = self.discovery_deadline {
+        if let Some(deadline) = self.shopping_deadline {
             if now >= deadline {
-                self.discovery_deadline = None;
+                self.shopping_deadline = None;
 
                 #[cfg(feature = "debug")]
-                self.emit_debug(crate::debug::DebugEvent::DiscoveryEnded {
+                self.emit_debug(crate::debug::DebugEvent::ShoppingEnded {
                     neighbor_count: self.neighbor_times.len(),
                 });
 
@@ -1069,9 +1064,19 @@ where
         self.proactive_pulse_pending = time;
     }
 
-    /// Check if node is in discovery phase.
-    pub(crate) fn is_in_discovery(&self) -> bool {
-        self.discovery_deadline.is_some()
+    /// Check if node is in shopping phase (first boot or merge).
+    pub(crate) fn is_shopping(&self) -> bool {
+        self.shopping_deadline.is_some()
+    }
+
+    /// Start shopping phase for 3τ.
+    pub(crate) fn start_shopping(&mut self, now: Timestamp) {
+        let shopping_duration = self.tau() * 3;
+        let deadline = now + shopping_duration;
+        self.shopping_deadline = Some(deadline);
+
+        #[cfg(feature = "debug")]
+        self.emit_debug(crate::debug::DebugEvent::ShoppingStarted { deadline });
     }
 
     pub(crate) fn secret(&self) -> &SecretKey {

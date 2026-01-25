@@ -17,10 +17,10 @@ pub type DebugChannel = Channel<ChannelMutex, DebugEvent, DEBUG_QUEUE_SIZE>;
 /// Debug events emitted by the node for protocol tracing.
 #[derive(Debug, Clone)]
 pub enum DebugEvent {
-    /// Discovery phase started.
-    DiscoveryStarted { deadline: Timestamp },
-    /// Discovery phase ended, calling select_best_parent.
-    DiscoveryEnded { neighbor_count: usize },
+    /// Shopping phase started (first boot or merge).
+    ShoppingStarted { deadline: Timestamp },
+    /// Shopping phase ended, calling select_best_parent.
+    ShoppingEnded { neighbor_count: usize },
     /// select_best_parent found candidates.
     SelectBestParent {
         candidate_count: usize,

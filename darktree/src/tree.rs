@@ -236,9 +236,15 @@ where
         let my_hash = self.compute_node_hash(self.node_id());
         if pulse.parent_hash == Some(my_hash) {
             self.handle_child_pulse(&pulse, &sender_hash, now);
+        } else {
+            // If we had this node as a child but they now claim a different parent,
+            // remove them from our children list (they switched parents)
+            if self.children().contains_key(&pulse.node_id) {
+                self.remove_child(&pulse.node_id);
+            }
         }
         // Check for pending parent acknowledgment
-        else if let Some((pending, _)) = self.pending_parent() {
+        if let Some((pending, _)) = self.pending_parent() {
             if pulse.node_id == pending {
                 self.handle_pending_parent_pulse(&pulse, &sender_hash, now);
             }
@@ -374,9 +380,12 @@ where
 
     /// Handle a pulse from a node claiming us as parent.
     fn handle_child_pulse(&mut self, pulse: &Pulse, sender_hash: &ChildHash, now: Timestamp) {
-        // Check if we can accept this child
-        if self.children().len() >= MAX_CHILDREN {
-            // At capacity, silently reject
+        // Check if this is an existing child (update) vs new child (join)
+        let is_existing = self.children().contains_key(&pulse.node_id);
+
+        // Only check capacity for NEW children - existing children must be able to update
+        if !is_existing && self.children().len() >= MAX_CHILDREN {
+            // At capacity, silently reject new child
             return;
         }
 
@@ -400,8 +409,8 @@ where
             return;
         }
 
-        // Track if this is a new child
-        let is_new = !self.children().contains_key(&pulse.node_id);
+        // Track if this is a new child (computed earlier)
+        let is_new = !is_existing;
 
         #[cfg(feature = "debug")]
         if is_new {
@@ -492,30 +501,23 @@ where
     }
 
     /// Consider merging with another tree based on received pulse.
+    ///
+    /// When a dominating tree is detected, starts a shopping phase (3τ) to
+    /// collect candidates before selecting the best parent. This is the same
+    /// mechanism used at first boot, providing unified parent selection.
     fn consider_merge(&mut self, pulse: &Pulse, _sender_hash: &ChildHash, now: Timestamp) {
-        // Don't merge during discovery phase - wait for select_best_parent
-        if self.is_in_discovery() {
+        // Don't start merge if already shopping - wait for select_best_parent
+        if self.is_shopping() {
             #[cfg(feature = "debug")]
             self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
                 from: pulse.node_id,
                 dominated: false,
-                reason: "in_discovery",
+                reason: "shopping",
             });
             return;
         }
 
-        // Don't merge if this node is distrusted
-        if self.is_distrusted(&pulse.node_id, now) {
-            #[cfg(feature = "debug")]
-            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
-                from: pulse.node_id,
-                dominated: false,
-                reason: "distrusted",
-            });
-            return;
-        }
-
-        // Don't merge if we're already in a pending parent state
+        // Don't merge if already switching parents
         if self.pending_parent().is_some() {
             #[cfg(feature = "debug")]
             self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
@@ -526,7 +528,7 @@ where
             return;
         }
 
-        // Different root?
+        // Same tree? No merge needed.
         if pulse.root_hash == *self.root_hash() {
             #[cfg(feature = "debug")]
             self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
@@ -550,22 +552,11 @@ where
             return;
         }
 
-        // Check if pulse sender is a valid parent candidate
-        if pulse.child_count() as usize >= MAX_CHILDREN {
-            #[cfg(feature = "debug")]
-            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
-                from: pulse.node_id,
-                dominated: true,
-                reason: "parent_full",
-            });
-            return; // Parent is full
-        }
-
         #[cfg(feature = "debug")]
         self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
             from: pulse.node_id,
             dominated: true,
-            reason: "merging",
+            reason: "start_shopping",
         });
 
         // TREE INVERSION: Leave our current tree position
@@ -578,10 +569,11 @@ where
         // Rebalance keyspace after position change
         self.rebalance_keyspace(now);
 
-        // Start parent switch process
-        self.set_pending_parent(Some((pulse.node_id, 0)));
+        // Start shopping phase (3τ) to collect candidates from dominating tree
+        // When shopping ends, select_best_parent picks the shallowest position
+        self.start_shopping(now);
 
-        // Schedule proactive pulse to announce our intent to join
+        // Schedule proactive pulse to announce we're looking for a parent
         self.schedule_proactive_pulse(now);
     }
 
@@ -1189,11 +1181,27 @@ mod tests {
             },
         );
 
-        // Consider merge
+        // Consider merge - starts shopping phase
         node.consider_merge(&pulse, &other_hash, now);
 
-        // Should have pending_parent set to join larger tree
-        assert!(node.pending_parent().is_some());
+        // Should be in shopping phase, not immediately joined
+        assert!(node.is_shopping(), "Should start shopping phase");
+        assert!(
+            node.pending_parent().is_none(),
+            "Should not set pending_parent yet"
+        );
+
+        // After shopping ends (3τ), select_best_parent is called
+        let tau = node.tau();
+        let after_shopping = now + tau * 3 + Duration::from_millis(1);
+        node.handle_timer(after_shopping);
+
+        // Now should have pending_parent set to join larger tree
+        assert!(!node.is_shopping(), "Shopping should be done");
+        assert!(
+            node.pending_parent().is_some(),
+            "Should have pending_parent after shopping"
+        );
         let (pending_id, _) = node.pending_parent().unwrap();
         assert_eq!(pending_id, other_id);
     }
@@ -1243,15 +1251,24 @@ mod tests {
             },
         );
 
-        // Consider merge
+        // Consider merge - if dominated, starts shopping phase
         node.consider_merge(&pulse, &other_hash, now);
 
         // With equal tree sizes, smaller root_hash wins (acts as tiebreaker).
         // We join them if our hash is LARGER than theirs (they have better tiebreaker).
         if our_root > other_hash {
+            // Should be in shopping phase
+            assert!(node.is_shopping(), "Should start shopping when dominated");
+
+            // After shopping ends, should have pending_parent
+            let tau = node.tau();
+            let after_shopping = now + tau * 3 + Duration::from_millis(1);
+            node.handle_timer(after_shopping);
             assert!(node.pending_parent().is_some());
+        } else {
+            // Not dominated, should not be shopping
+            assert!(!node.is_shopping(), "Should not shop when not dominated");
         }
-        // (If our hash is smaller, we don't join them - we have the better tiebreaker)
     }
 
     #[test]
