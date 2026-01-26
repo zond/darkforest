@@ -276,7 +276,7 @@ fn generate_positions(count: usize, seed: u64) -> Vec<(f64, f64)> {
 ///
 /// Formula: r = sqrt(k / ((n-1) * pi)) where k ≈ 5 (target neighbors)
 /// Clamped to [0.15, 0.70] for reasonable connectivity.
-pub fn compute_adaptive_radius(num_nodes: usize) -> f64 {
+pub(crate) fn compute_adaptive_radius(num_nodes: usize) -> f64 {
     if num_nodes <= 1 {
         return 0.5;
     }
@@ -342,43 +342,32 @@ fn ensure_connectivity(topo: &mut Topology, nodes: &[NodeId], edges: &mut [(usiz
         true
     }
 
+    // Check if all nodes are in the same component
+    let is_fully_connected = |parent: &mut [usize], n: usize| -> bool {
+        let root0 = find(parent, 0);
+        (1..n).all(|k| find(parent, k) == root0)
+    };
+
     // First, process existing edges (already added to topology)
-    for &(i, j, dist) in edges.iter() {
+    for &(i, j, _) in edges.iter() {
         if topo.is_connected(nodes[i], nodes[j]) {
             union(&mut parent, &mut rank, i, j);
         }
-        // Early exit if already connected
-        let root0 = find(&mut parent, 0);
-        let mut all_connected = true;
-        for k in 1..nodes.len() {
-            if find(&mut parent, k) != root0 {
-                all_connected = false;
-                break;
-            }
-        }
-        if all_connected && dist > 0.0 {
-            // All nodes in same component, and we've processed some edges
-            return;
-        }
+    }
+
+    // Check if already connected after processing existing edges
+    if is_fully_connected(&mut parent, nodes.len()) {
+        return;
     }
 
     // Add MST edges to connect remaining components
     for &(i, j, _) in edges.iter() {
         if !topo.is_connected(nodes[i], nodes[j]) && union(&mut parent, &mut rank, i, j) {
             topo.add_link(nodes[i], nodes[j], Link::default());
-        }
 
-        // Check if fully connected
-        let root0 = find(&mut parent, 0);
-        let mut all_connected = true;
-        for k in 1..nodes.len() {
-            if find(&mut parent, k) != root0 {
-                all_connected = false;
-                break;
+            if is_fully_connected(&mut parent, nodes.len()) {
+                return;
             }
-        }
-        if all_connected {
-            return;
         }
     }
 }
@@ -389,6 +378,24 @@ mod tests {
 
     fn make_nodes(count: usize) -> Vec<NodeId> {
         (0..count).map(|i| [i as u8; 16]).collect()
+    }
+
+    /// Assert that all nodes in the topology are connected (reachable from node 0).
+    fn assert_topology_connected(topo: &Topology, nodes: &[NodeId], msg: &str) {
+        let mut visited = vec![false; nodes.len()];
+        let mut queue = vec![0usize];
+        visited[0] = true;
+
+        while let Some(current) = queue.pop() {
+            for (i, node) in nodes.iter().enumerate() {
+                if !visited[i] && topo.is_connected(nodes[current], *node) {
+                    visited[i] = true;
+                    queue.push(i);
+                }
+            }
+        }
+
+        assert!(visited.iter().all(|&v| v), "{}", msg);
     }
 
     #[test]
@@ -468,29 +475,10 @@ mod tests {
 
     #[test]
     fn test_random_geometric_connectivity() {
-        // Test that random_geometric always produces a connected graph
         let nodes = make_nodes(20);
         let topo = Topology::random_geometric(&nodes, 42, 0.3);
 
-        // Verify connectivity using BFS from node 0
-        let mut visited = vec![false; nodes.len()];
-        let mut queue = vec![0usize];
-        visited[0] = true;
-
-        while let Some(current) = queue.pop() {
-            for (i, node) in nodes.iter().enumerate() {
-                if !visited[i] && topo.is_connected(nodes[current], *node) {
-                    visited[i] = true;
-                    queue.push(i);
-                }
-            }
-        }
-
-        // All nodes should be reachable
-        assert!(
-            visited.iter().all(|&v| v),
-            "Random geometric graph should be connected"
-        );
+        assert_topology_connected(&topo, &nodes, "Random geometric graph should be connected");
     }
 
     #[test]
@@ -542,23 +530,10 @@ mod tests {
         let nodes = make_nodes(50);
         let topo = Topology::random_geometric_adaptive(&nodes, 42);
 
-        // Should be connected
-        let mut visited = vec![false; nodes.len()];
-        let mut queue = vec![0usize];
-        visited[0] = true;
-
-        while let Some(current) = queue.pop() {
-            for (i, node) in nodes.iter().enumerate() {
-                if !visited[i] && topo.is_connected(nodes[current], *node) {
-                    visited[i] = true;
-                    queue.push(i);
-                }
-            }
-        }
-
-        assert!(
-            visited.iter().all(|&v| v),
-            "Adaptive random geometric graph should be connected"
+        assert_topology_connected(
+            &topo,
+            &nodes,
+            "Adaptive random geometric graph should be connected",
         );
 
         // Count average neighbors
@@ -598,23 +573,10 @@ mod tests {
         let nodes = make_nodes(10);
         let topo = Topology::random_geometric(&nodes, 42, 0.01); // Very small radius
 
-        // Should still be connected (MST edges added)
-        let mut visited = vec![false; nodes.len()];
-        let mut queue = vec![0usize];
-        visited[0] = true;
-
-        while let Some(current) = queue.pop() {
-            for (i, node) in nodes.iter().enumerate() {
-                if !visited[i] && topo.is_connected(nodes[current], *node) {
-                    visited[i] = true;
-                    queue.push(i);
-                }
-            }
-        }
-
-        assert!(
-            visited.iter().all(|&v| v),
-            "Even with tiny radius, graph should be connected via MST"
+        assert_topology_connected(
+            &topo,
+            &nodes,
+            "Even with tiny radius, graph should be connected via MST",
         );
     }
 }
