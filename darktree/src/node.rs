@@ -10,11 +10,11 @@
 //!
 //! ```
 //! use darktree::{Node, DefaultConfig};
-//! use darktree::traits::test_impls::{MockTransport, MockCrypto, MockRandom, MockClock};
+//! use darktree::traits::test_impls::{MockTransport, mock_crypto, MockRandom, MockClock};
 //!
 //! let node = Node::<_, _, _, _, DefaultConfig>::new(
 //!     MockTransport::new(),
-//!     MockCrypto::new(),
+//!     mock_crypto(),
 //!     MockRandom::new(),
 //!     MockClock::new(),
 //! );
@@ -116,7 +116,11 @@ pub(crate) type NeighborTimingMap = HashMap<NodeId, NeighborTiming>;
 pub(crate) type PubkeyCache = HashMap<NodeId, (PublicKey, Timestamp)>;
 pub(crate) type NeedPubkeySet = BTreeSet<NodeId>;
 pub(crate) type NeighborsNeedPubkeySet = BTreeSet<NodeId>;
-pub(crate) type LocationStore = HashMap<NodeId, LocationEntry>;
+/// Location store: (node_id, replica_index) -> LocationEntry.
+/// Keyed by both node_id AND replica_index to allow storing multiple replicas
+/// for the same publisher when a node temporarily owns multiple replica addresses
+/// during tree formation.
+pub(crate) type LocationStore = HashMap<(NodeId, u8), LocationEntry>;
 /// Location cache: node_id -> (keyspace_addr, last_used).
 pub(crate) type LocationCache = HashMap<NodeId, (u32, Timestamp)>;
 pub(crate) type PendingLookupMap = HashMap<NodeId, PendingLookup>;
@@ -390,10 +394,17 @@ where
 
     /// Check if this node owns a keyspace location.
     ///
-    /// Uses half-open interval [keyspace_lo, keyspace_hi). The keyspace is
-    /// [0, u32::MAX), so u32::MAX is not a valid address.
+    /// A node only owns its own slice of keyspace, not the ranges delegated to children.
+    /// The node's own slice is 1/subtree_size of the total range, starting at keyspace_lo.
     pub fn owns_key(&self, key: u32) -> bool {
-        key >= self.keyspace_lo && key < self.keyspace_hi
+        debug_assert!(self.subtree_size > 0, "subtree_size must be at least 1");
+        let lo = self.keyspace_lo as u64;
+        let hi = self.keyspace_hi as u64;
+        let range = hi - lo;
+        let own_slice_size = range / (self.subtree_size as u64);
+        let own_hi = lo + own_slice_size;
+
+        (key as u64) >= lo && (key as u64) < own_hi
     }
 
     /// Get current tree size.
@@ -1203,8 +1214,9 @@ where
 
     /// Evict the oldest entry from a map based on a timestamp extraction function.
     /// Returns true if an entry was evicted.
-    fn evict_oldest_by<V, F>(map: &mut HashMap<NodeId, V>, get_timestamp: F) -> bool
+    fn evict_oldest_by<K, V, F>(map: &mut HashMap<K, V>, get_timestamp: F) -> bool
     where
+        K: Eq + core::hash::Hash + Copy,
         F: Fn(&V) -> Timestamp,
     {
         if let Some(oldest_key) = map
@@ -1233,13 +1245,19 @@ where
         self.pubkey_cache.insert(node_id, (pubkey, now));
     }
 
-    pub(crate) fn insert_location_store(&mut self, node_id: NodeId, entry: LocationEntry) {
+    pub(crate) fn insert_location_store(
+        &mut self,
+        node_id: NodeId,
+        replica_index: u8,
+        entry: LocationEntry,
+    ) {
+        let key = (node_id, replica_index);
         if self.location_store.len() >= Cfg::MAX_LOCATION_STORE
-            && !self.location_store.contains_key(&node_id)
+            && !self.location_store.contains_key(&key)
         {
-            Self::evict_oldest_by(&mut self.location_store, |e| e.received_at);
+            Self::evict_oldest_by(&mut self.location_store, |e: &LocationEntry| e.received_at);
         }
-        self.location_store.insert(node_id, entry);
+        self.location_store.insert(key, entry);
     }
 
     pub(crate) fn insert_location_cache(&mut self, node_id: NodeId, addr: u32, now: Timestamp) {
@@ -1382,5 +1400,11 @@ where
     #[allow(private_interfaces)]
     pub fn test_pending_acks(&self) -> &PendingAckMap {
         &self.pending_acks
+    }
+
+    /// Compute keyspace address for a node's replica (for testing).
+    #[cfg(feature = "test-support")]
+    pub fn test_replica_addr(&self, node_id: &NodeId, replica: u8) -> u32 {
+        self.replica_addr(node_id, replica)
     }
 }

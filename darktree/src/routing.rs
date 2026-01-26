@@ -481,18 +481,17 @@ where
         next_timeout
     }
 
-    /// Hash a node_id with replica index to get DHT key.
-    pub(crate) fn hash_to_key(&self, node_id: &NodeId, replica: u8) -> [u8; 32] {
+    /// Compute the keyspace address for a node's replica.
+    ///
+    /// Each node publishes its location to K_REPLICAS different addresses.
+    /// The address is computed by hashing (node_id || replica_index) and
+    /// taking the first 4 bytes as a u32.
+    pub(crate) fn replica_addr(&self, node_id: &NodeId, replica: u8) -> u32 {
         let mut data = [0u8; 17];
         data[..16].copy_from_slice(node_id);
         data[16] = replica;
-        self.crypto().hash(&data)
-    }
-
-    /// Convert a DHT key to a keyspace address.
-    pub(crate) fn addr_for_key(&self, key: [u8; 32]) -> u32 {
-        // Use first 4 bytes of hash as u32 keyspace address
-        u32::from_be_bytes([key[0], key[1], key[2], key[3]])
+        let hash = self.crypto().hash(&data);
+        u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]])
     }
 
     /// Process pending messages that were waiting for a pubkey.
@@ -520,7 +519,9 @@ mod tests {
 
     use super::*;
     use crate::config::{DefaultConfig, SmallConfig};
-    use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
+    use crate::traits::test_impls::{
+        mock_crypto, MockClock, MockCrypto, MockRandom, MockTransport,
+    };
 
     /// Type alias for test nodes using default config.
     type TestNode = Node<MockTransport, MockCrypto, MockRandom, MockClock, DefaultConfig>;
@@ -530,7 +531,7 @@ mod tests {
 
     fn make_node() -> TestNode {
         let transport = MockTransport::new();
-        let crypto = MockCrypto::new();
+        let crypto = mock_crypto();
         let random = MockRandom::new();
         let clock = MockClock::new();
         Node::new(transport, crypto, random, clock)
@@ -538,7 +539,7 @@ mod tests {
 
     fn make_small_node() -> SmallTestNode {
         let transport = MockTransport::new();
-        let crypto = MockCrypto::new();
+        let crypto = mock_crypto();
         let random = MockRandom::new();
         let clock = MockClock::new();
         Node::new(transport, crypto, random, clock)
@@ -565,28 +566,20 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_to_key() {
+    fn test_replica_addr() {
         let node = make_node();
 
         let node_id: NodeId = [1u8; 16];
-        let key0 = node.hash_to_key(&node_id, 0);
-        let key1 = node.hash_to_key(&node_id, 1);
+        let addr0 = node.replica_addr(&node_id, 0);
+        let addr0_again = node.replica_addr(&node_id, 0);
 
-        // Different replicas should produce different keys
-        assert_ne!(key0, key1);
-    }
+        // Same inputs produce same output (deterministic)
+        assert_eq!(addr0, addr0_again);
 
-    #[test]
-    fn test_addr_for_key() {
-        let node = make_node();
-
-        let key = [
-            0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0,
-        ];
-        let addr = node.addr_for_key(key);
-
-        assert_eq!(addr, 0x12345678);
+        // Different node_ids produce different addresses
+        let other_id: NodeId = [2u8; 16];
+        let other_addr = node.replica_addr(&other_id, 0);
+        assert_ne!(addr0, other_addr);
     }
 
     #[test]
@@ -818,11 +811,11 @@ mod tests {
 
     #[test]
     fn test_retry_backoff_bounds() {
-        use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
+        use crate::traits::test_impls::{mock_crypto, MockClock, MockRandom, MockTransport};
 
         // Create node with known tau (100ms default for MockTransport with no bw)
         let transport = MockTransport::new();
-        let crypto = MockCrypto::new();
+        let crypto = mock_crypto();
         let random = MockRandom::with_seed(42);
         let clock = MockClock::new();
         let mut node: TestNode = Node::new(transport, crypto, random, clock);

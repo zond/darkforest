@@ -28,8 +28,7 @@ where
     /// Check if we own any replica key for a node_id in our keyspace.
     fn owns_replica_key(&self, node_id: &NodeId) -> bool {
         (0..K_REPLICAS).any(|replica| {
-            let key = self.hash_to_key(node_id, replica as u8);
-            let dest_addr = self.addr_for_key(key);
+            let dest_addr = self.replica_addr(node_id, replica as u8);
             self.owns_key(dest_addr)
         })
     }
@@ -49,8 +48,7 @@ where
 
         // Publish to K_REPLICAS locations
         for replica in 0..K_REPLICAS {
-            let key = self.hash_to_key(&node_id, replica as u8);
-            let dest_addr = self.addr_for_key(key);
+            let dest_addr = self.replica_addr(&node_id, replica as u8);
 
             // Build payload: owner_node_id || pubkey || keyspace_addr || seq || replica_index || signature
             let mut payload = Writer::new();
@@ -105,8 +103,10 @@ where
             Err(_) => return,
         };
 
-        // SECURITY: Verify keyspace ownership to prevent DHT pollution attacks
-        if !self.owns_replica_key(&owner_node_id) {
+        // SECURITY: Verify keyspace ownership to prevent DHT pollution attacks.
+        // We must own the SPECIFIC replica key this PUBLISH is for, not just any replica.
+        let dest_addr = self.replica_addr(&owner_node_id, replica_index);
+        if !self.owns_key(dest_addr) {
             return;
         }
 
@@ -127,10 +127,11 @@ where
             return; // Invalid signature
         }
 
-        // Check if this is a newer entry
-        if let Some(existing) = self.location_store().get(&owner_node_id) {
-            if seq <= existing.seq {
-                return; // Replay or old entry
+        // Check if this is a newer entry for this specific replica
+        let store_key = (owner_node_id, replica_index);
+        if let Some(existing) = self.location_store().get(&store_key) {
+            if seq < existing.seq {
+                return; // Old entry
             }
         }
 
@@ -145,7 +146,7 @@ where
             received_at: now,
         };
 
-        self.insert_location_store(owner_node_id, entry);
+        self.insert_location_store(owner_node_id, replica_index, entry);
 
         // Update fraud detection counters (HyperLogLog cardinality estimation)
         let key = *self.hll_secret_key();
@@ -155,8 +156,7 @@ where
 
     /// Send a LOOKUP message.
     pub(crate) fn send_lookup(&mut self, target: NodeId, replica: usize, _now: Timestamp) {
-        let key = self.hash_to_key(&target, replica as u8);
-        let dest_addr = self.addr_for_key(key);
+        let dest_addr = self.replica_addr(&target, replica as u8);
 
         // dest_hash identifies the target (4-byte truncated hash of target node_id)
         let dest_hash = self.compute_node_hash(&target);
@@ -194,7 +194,7 @@ where
         let entry = match self
             .location_store()
             .iter()
-            .find(|(node_id, _)| self.compute_node_hash(node_id) == dest_hash)
+            .find(|((node_id, _replica), _)| self.compute_node_hash(node_id) == dest_hash)
         {
             Some((_, entry)) => entry.clone(),
             None => return, // No matching entry
@@ -255,6 +255,8 @@ where
             Ok(s) => s,
             Err(_) => return,
         };
+        // Read replica_index to advance past it (required for signature parsing).
+        // We don't use the value since we cache by node_id, not by replica.
         let _replica_index = match reader.read_u8() {
             Ok(r) => r,
             Err(_) => return,
@@ -313,13 +315,14 @@ where
         let to_republish: Vec<LocationEntry> = self
             .location_store()
             .iter()
-            .filter(|(node_id, _)| !self.owns_replica_key(node_id))
+            .filter(|((node_id, _replica), _)| !self.owns_replica_key(node_id))
             .map(|(_, entry)| entry.clone())
             .collect();
 
         // Remove entries we no longer own
         for entry in &to_republish {
-            self.location_store_mut().remove(&entry.node_id);
+            self.location_store_mut()
+                .remove(&(entry.node_id, entry.replica_index));
         }
 
         // Re-publish to new owners
@@ -336,8 +339,7 @@ where
 
             // Send to all replicas (they'll filter based on keyspace ownership)
             for replica in 0..K_REPLICAS {
-                let key = self.hash_to_key(&entry.node_id, replica as u8);
-                let dest_addr = self.addr_for_key(key);
+                let dest_addr = self.replica_addr(&entry.node_id, replica as u8);
 
                 let msg = self.build_routed_no_reply(dest_addr, MSG_PUBLISH, payload_bytes.clone());
                 let _ = self.send_routed(msg);
@@ -350,13 +352,15 @@ where
 mod tests {
     use super::*;
     use crate::time::{Duration, Timestamp};
-    use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
-    use crate::types::NodeId;
+    use crate::traits::test_impls::{
+        mock_crypto, MockClock, MockCrypto, MockRandom, MockTransport,
+    };
+    use crate::types::{NodeId, K_REPLICAS};
 
     fn make_node(
     ) -> Node<MockTransport, MockCrypto, MockRandom, MockClock, crate::config::DefaultConfig> {
         let transport = MockTransport::new();
-        let crypto = MockCrypto::new();
+        let crypto = mock_crypto();
         let random = MockRandom::new();
         let clock = MockClock::new();
         Node::new(transport, crypto, random, clock)
@@ -370,8 +374,10 @@ mod tests {
         // Node owns full keyspace, so publish should store locally
         node.publish_location(Timestamp::ZERO);
 
-        // Should have stored our own location entry
-        assert!(node.location_store().contains_key(&node_id));
+        // Should have stored our own location entry (at least one replica)
+        let has_entry = (0..K_REPLICAS as u8)
+            .any(|replica| node.location_store().contains_key(&(node_id, replica)));
+        assert!(has_entry);
     }
 
     #[test]
@@ -383,8 +389,10 @@ mod tests {
         node.publish_location(now);
         let node_id = *node.node_id();
 
-        // Verify entry exists
-        assert!(node.location_store().contains_key(&node_id));
+        // Verify at least one entry exists
+        let has_entry = (0..K_REPLICAS as u8)
+            .any(|replica| node.location_store().contains_key(&(node_id, replica)));
+        assert!(has_entry);
 
         // Shrink our keyspace to a small range that doesn't include the replica keys
         // This simulates joining a tree and receiving a smaller keyspace allocation
@@ -399,7 +407,9 @@ mod tests {
         // For most node_ids, they won't, so entry should be removed
         let still_owns = node.owns_replica_key(&node_id);
         if !still_owns {
-            assert!(!node.location_store().contains_key(&node_id));
+            let has_entry = (0..K_REPLICAS as u8)
+                .any(|replica| node.location_store().contains_key(&(node_id, replica)));
+            assert!(!has_entry);
         }
     }
 

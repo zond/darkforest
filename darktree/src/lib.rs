@@ -16,12 +16,12 @@
 //!
 //! ```
 //! use darktree::{Node, DefaultConfig};
-//! use darktree::traits::test_impls::{MockTransport, MockCrypto, MockRandom, MockClock};
+//! use darktree::traits::test_impls::{MockTransport, mock_crypto, MockRandom, MockClock};
 //!
 //! // Create a node with mock implementations
 //! let node = Node::<_, _, _, _, DefaultConfig>::new(
 //!     MockTransport::new(),
-//!     MockCrypto::new(),
+//!     mock_crypto(),
 //!     MockRandom::new(),
 //!     MockClock::new(),
 //! );
@@ -112,7 +112,9 @@ mod tests {
 
     use super::*;
     use crate::node::JoinContext;
-    use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
+    use crate::traits::test_impls::{
+        mock_crypto, MockClock, MockCrypto, MockRandom, MockTransport,
+    };
 
     /// Type alias for test nodes using default config.
     type TestNode = Node<MockTransport, MockCrypto, MockRandom, MockClock, DefaultConfig>;
@@ -120,7 +122,7 @@ mod tests {
     #[test]
     fn test_node_creation() {
         let transport = MockTransport::new();
-        let crypto = MockCrypto::new();
+        let crypto = mock_crypto();
         let random = MockRandom::new();
         let clock = MockClock::new();
 
@@ -137,7 +139,7 @@ mod tests {
     #[test]
     fn test_node_identity() {
         let transport = MockTransport::new();
-        let mut crypto = MockCrypto::new();
+        let mut crypto = mock_crypto();
         let random = MockRandom::new();
         let clock = MockClock::new();
 
@@ -183,7 +185,7 @@ mod tests {
         // LoRa: 38 bytes/sec, 255 byte MTU
         // tau = 255 / 38 * 1000 = 6710 ms
         let transport = MockTransport::with_mtu_and_bw(255, Some(38));
-        let crypto = MockCrypto::new();
+        let crypto = mock_crypto();
         let random = MockRandom::new();
         let clock = MockClock::new();
 
@@ -197,7 +199,7 @@ mod tests {
     fn test_tau_no_bandwidth() {
         // No bandwidth limit: should use MIN_TAU_MS (100ms)
         let transport = MockTransport::new(); // bw = None
-        let crypto = MockCrypto::new();
+        let crypto = mock_crypto();
         let random = MockRandom::new();
         let clock = MockClock::new();
 
@@ -212,7 +214,7 @@ mod tests {
         // High bandwidth (e.g., UDP): MTU / bw would be < MIN_TAU_MS
         // 512 byte MTU, 100000 bytes/sec -> 5.12ms, should floor to 100ms
         let transport = MockTransport::with_mtu_and_bw(512, Some(100_000));
-        let crypto = MockCrypto::new();
+        let crypto = mock_crypto();
         let random = MockRandom::new();
         let clock = MockClock::new();
 
@@ -226,7 +228,7 @@ mod tests {
     fn test_lookup_timeout() {
         // LoRa: tau = 6710ms, lookup_timeout = 32 * tau = 214720ms (~3.6 min)
         let transport = MockTransport::with_mtu_and_bw(255, Some(38));
-        let crypto = MockCrypto::new();
+        let crypto = mock_crypto();
         let random = MockRandom::new();
         let clock = MockClock::new();
 
@@ -240,7 +242,7 @@ mod tests {
     fn test_fraud_detection_triggers() {
         // Test that fraud detection fires when unique publisher count is too low
         let transport = MockTransport::new();
-        let crypto = MockCrypto::new();
+        let crypto = mock_crypto();
         let random = MockRandom::new();
         let clock = MockClock::new();
 
@@ -279,7 +281,7 @@ mod tests {
     #[test]
     fn test_keyspace_ownership() {
         let transport = MockTransport::new();
-        let crypto = MockCrypto::new();
+        let crypto = mock_crypto();
         let random = MockRandom::new();
         let clock = MockClock::new();
 
@@ -295,7 +297,7 @@ mod tests {
     #[test]
     fn test_my_address() {
         let transport = MockTransport::new();
-        let crypto = MockCrypto::new();
+        let crypto = mock_crypto();
         let random = MockRandom::new();
         let clock = MockClock::new();
 

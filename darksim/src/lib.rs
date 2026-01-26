@@ -3844,4 +3844,72 @@ mod tests {
         // So the children's tree should win, and R should join as a child.
         // But we don't strictly assert this since race conditions could vary the outcome.
     }
+
+    /// Test that DHT PUBLISH results in location entries being stored at replica nodes.
+    ///
+    /// This test verifies the bugfixes for:
+    /// - LocationStore keyed by (NodeId, replica_index) instead of just NodeId
+    /// - owns_key() checking own slice, not entire managed keyspace
+    /// - Last child range extending to parent_hi to avoid gaps
+    #[test]
+    fn test_publish_stores_location() {
+        use crate::topology::Link;
+        use darktree::K_REPLICAS;
+
+        // Create a 10-node fully connected mesh
+        let mut sim = Simulator::new(42);
+        let mut nodes = Vec::with_capacity(10);
+        for i in 0..10 {
+            nodes.push(sim.add_node(i as u64));
+        }
+
+        // Fully connect all nodes
+        for i in 0..nodes.len() {
+            for j in (i + 1)..nodes.len() {
+                sim.topology_mut()
+                    .add_link(nodes[i], nodes[j], Link::default());
+            }
+        }
+
+        // Run until tree converges
+        sim.run_for(Duration::from_secs(10));
+
+        // Verify single tree formed
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(snapshot.tree_count(), 1, "Should have single tree");
+        assert_eq!(snapshot.max_tree_size(), 10, "Tree should have 10 nodes");
+
+        // Run additional time for location publishing and propagation
+        // LOCATION_REFRESH is 1 hour, but initial publish happens shortly after joining
+        sim.run_for(Duration::from_secs(30));
+
+        // Pick a non-root node N
+        let n = nodes
+            .iter()
+            .find(|id| !sim.node(id).unwrap().is_root())
+            .copied()
+            .expect("Should have at least one non-root node");
+        let n_node_id = sim.node(&n).unwrap().node_id();
+
+        // Count total number of replica entries for N across all storage nodes.
+        // With the location_store keyed by (node_id, replica_index), we count
+        // how many (n_node_id, replica) entries exist in total.
+        let mut storage_count = 0;
+        for node_id in &nodes {
+            let store = sim.node(node_id).unwrap().inner().test_location_store();
+            for replica in 0..K_REPLICAS as u8 {
+                if store.contains_key(&(n_node_id, replica)) {
+                    storage_count += 1;
+                }
+            }
+        }
+
+        // K_REPLICAS = 3, so exactly 3 replica entries should exist across all nodes
+        assert_eq!(
+            storage_count, K_REPLICAS,
+            "Expected {} storage nodes to have N's location, found {}",
+            K_REPLICAS, storage_count
+        );
+    }
 }

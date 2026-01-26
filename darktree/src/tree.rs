@@ -362,11 +362,17 @@ where
         let parent_slice = fast_div.div(parent_range);
         let children_start = parent_lo + parent_slice;
 
-        // Each child gets a slice proportional to its subtree_size
+        // Each child gets a slice proportional to its subtree_size.
+        // IMPORTANT: Last child's range extends to parent_hi to avoid gaps from integer division.
+        let num_children = pulse.children.len();
         let mut current_lo = children_start;
         for (i, (_, subtree_size)) in pulse.children.iter().enumerate() {
             let child_range = fast_div.div(parent_range * (*subtree_size as u64));
-            let child_hi = current_lo + child_range;
+            let child_hi = if i == num_children - 1 {
+                parent_hi // Last child extends to parent_hi to avoid gaps
+            } else {
+                current_lo + child_range
+            };
 
             if i == child_idx {
                 return (current_lo as u32, child_hi as u32);
@@ -438,6 +444,9 @@ where
         // Recompute all child keyspace ranges
         self.recompute_child_ranges();
 
+        // Rebalance keyspace after subtree size changed (owned slice may have shrunk)
+        self.rebalance_keyspace(now);
+
         // If new child, schedule proactive pulse to acknowledge them
         if is_new {
             self.schedule_proactive_pulse(now);
@@ -476,6 +485,9 @@ where
                 new_root: pulse.root_hash,
                 new_size: pulse.tree_size,
             });
+
+            // Schedule location publish (with jitter) after joining tree
+            self.schedule_location_publish(now);
 
             // Rebalance keyspace after joining new tree
             self.rebalance_keyspace(now);
@@ -606,6 +618,8 @@ where
         if candidates.is_empty() {
             // No valid candidates - stay as root of single-node tree
             // Will join via normal merge when we hear a larger tree
+            // Schedule location publish so others can find us
+            self.schedule_location_publish(now);
             return;
         }
 
@@ -634,6 +648,8 @@ where
 
         if !dominated {
             // Best tree doesn't dominate us - stay as root
+            // Schedule location publish so others can find us
+            self.schedule_location_publish(now);
             return;
         }
 
@@ -683,6 +699,18 @@ where
         self.recompute_child_ranges();
     }
 
+    /// Schedule a location publish with jitter.
+    ///
+    /// Used when a node stays as root after shopping ends (either no candidates
+    /// or the node dominates all candidates). The root needs to publish its
+    /// location so other nodes can find it via DHT lookup.
+    fn schedule_location_publish(&mut self, now: Timestamp) {
+        // Jitter: 0-1τ to spread out PUBLISH messages
+        let tau_ms = self.tau().as_millis();
+        let jitter_ms = self.random_mut().gen_range(0, tau_ms);
+        self.set_next_publish(Some(now + Duration::from_millis(jitter_ms)));
+    }
+
     /// Recompute keyspace ranges for all children.
     fn recompute_child_ranges(&mut self) {
         // Build children list sorted by hash
@@ -724,10 +752,19 @@ where
         // Clear old ranges
         self.child_ranges_mut().clear();
 
-        // Assign ranges to children
-        for (child_id, subtree_size) in &sorted_children {
+        // Assign ranges to children.
+        // IMPORTANT: Last child's range extends to my_hi to avoid gaps from integer division.
+        // Without this fix, integer division precision loss creates unclaimed addresses at the
+        // end of the keyspace, causing DHT PUBLISH messages to those addresses to be dropped.
+        let num_children = sorted_children.len();
+        for (i, (child_id, subtree_size)) in sorted_children.iter().enumerate() {
             let child_range = fast_div.div(my_range * (*subtree_size as u64));
-            let child_hi = current_lo + child_range;
+            let child_hi = if i == num_children - 1 {
+                // Last child gets everything up to my_hi to avoid gaps
+                my_hi
+            } else {
+                current_lo + child_range
+            };
 
             self.child_ranges_mut()
                 .insert(*child_id, (current_lo as u32, child_hi as u32));
@@ -983,17 +1020,17 @@ where
         // Entries older than LOCATION_TTL are expired.
         let cutoff = now - LOCATION_TTL;
 
-        // Collect expired entries
-        let expired: Vec<[u8; 16]> = self
+        // Collect expired entries (key is (node_id, replica_index))
+        let expired: Vec<(NodeId, u8)> = self
             .location_store()
             .iter()
             .filter(|(_, entry)| entry.received_at < cutoff)
-            .map(|(id, _)| *id)
+            .map(|(key, _)| *key)
             .collect();
 
         // Remove expired
-        for id in expired {
-            self.location_store_mut().remove(&id);
+        for key in expired {
+            self.location_store_mut().remove(&key);
         }
     }
 
@@ -1012,14 +1049,16 @@ where
 mod tests {
     use super::*;
     use crate::node::NeighborTiming;
-    use crate::traits::test_impls::{MockClock, MockCrypto, MockRandom, MockTransport};
+    use crate::traits::test_impls::{
+        mock_crypto, MockClock, MockCrypto, MockRandom, MockTransport,
+    };
     use crate::types::{LocationEntry, NodeId, Signature, ALGORITHM_ED25519};
     use alloc::vec;
 
     fn make_node(
     ) -> Node<MockTransport, MockCrypto, MockRandom, MockClock, crate::config::DefaultConfig> {
         let transport = MockTransport::new();
-        let crypto = MockCrypto::new();
+        let crypto = mock_crypto();
         let random = MockRandom::new();
         let clock = MockClock::new();
         Node::new(transport, crypto, random, clock)
@@ -1130,20 +1169,20 @@ mod tests {
             received_at: recent_time, // Recent, should stay
         };
 
-        node.insert_location_store(node_id1, entry1);
-        node.insert_location_store(node_id2, entry2);
+        node.insert_location_store(node_id1, 0, entry1);
+        node.insert_location_store(node_id2, 0, entry2);
 
         // Verify both exist
-        assert!(node.location_store().contains_key(&node_id1));
-        assert!(node.location_store().contains_key(&node_id2));
+        assert!(node.location_store().contains_key(&(node_id1, 0)));
+        assert!(node.location_store().contains_key(&(node_id2, 0)));
 
         // Run expiry at time = 13 hours (LOCATION_TTL = 12 hours)
         let now = Timestamp::ZERO + Duration::from_hours(13);
         node.handle_location_expiry(now);
 
         // Old entry should be gone, recent should remain
-        assert!(!node.location_store().contains_key(&node_id1));
-        assert!(node.location_store().contains_key(&node_id2));
+        assert!(!node.location_store().contains_key(&(node_id1, 0)));
+        assert!(node.location_store().contains_key(&(node_id2, 0)));
     }
 
     #[test]
@@ -1400,9 +1439,41 @@ mod tests {
 
     #[test]
     fn test_child_hash_collision_rejected() {
-        // MockCrypto's hash: first 4 bytes of hash depend only on first 4 bytes of input.
-        // Two NodeIds with same first 4 bytes will have the same 4-byte child hash.
-        let mut node = make_node();
+        use crate::traits::Crypto;
+
+        // A minimal crypto that produces hash collisions: hash output = first 4 bytes repeated.
+        // This lets us test collision rejection without needing real SHA-256 collisions.
+        struct CollisionCrypto;
+        impl Crypto for CollisionCrypto {
+            fn algorithm(&self) -> u8 {
+                1
+            }
+            fn sign(&self, _: &crate::types::SecretKey, _: &[u8]) -> Signature {
+                Signature::default()
+            }
+            fn verify(&self, _: &crate::types::PublicKey, _: &[u8], _: &Signature) -> bool {
+                true // Accept all signatures for this test
+            }
+            fn generate_keypair(&mut self) -> (crate::types::PublicKey, crate::types::SecretKey) {
+                // Return a fixed keypair - actual values don't matter for this test
+                ([0xAA; 32], [0xBB; 32])
+            }
+            fn hash(&self, data: &[u8]) -> [u8; 32] {
+                // Hash = first 4 bytes repeated, so same prefix = same hash
+                let mut h = [0u8; 32];
+                for i in 0..32 {
+                    h[i] = data.get(i % 4).copied().unwrap_or(0);
+                }
+                h
+            }
+        }
+
+        let transport = MockTransport::new();
+        let crypto = CollisionCrypto;
+        let random = MockRandom::new();
+        let clock = MockClock::new();
+        let mut node: Node<_, _, _, _, crate::config::DefaultConfig> =
+            Node::new(transport, crypto, random, clock);
         let now = Timestamp::from_secs(1000);
 
         // Create two NodeIds with same first 4 bytes (will have same child hash)

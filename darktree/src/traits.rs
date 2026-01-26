@@ -300,6 +300,87 @@ pub trait Random {
     }
 }
 
+// ============================================================================
+// Default crypto implementation using SHA-256 and Ed25519
+// ============================================================================
+
+/// Default cryptographic implementation using SHA-256 and Ed25519.
+///
+/// Uses real cryptographic primitives from `sha2` and `ed25519-dalek` crates.
+/// Keypair generation is deterministic from a seed for reproducible tests.
+#[cfg(any(test, feature = "default-crypto"))]
+pub struct DefaultCrypto {
+    next_seed: u64,
+}
+
+#[cfg(any(test, feature = "default-crypto"))]
+impl DefaultCrypto {
+    /// Create a new DefaultCrypto instance.
+    ///
+    /// The seed is used for deterministic keypair generation. For production use,
+    /// provide a seed from a secure random source. For tests, use a fixed seed
+    /// for reproducibility.
+    pub fn new(seed: u64) -> Self {
+        Self { next_seed: seed }
+    }
+}
+
+#[cfg(any(test, feature = "default-crypto"))]
+impl Crypto for DefaultCrypto {
+    fn algorithm(&self) -> u8 {
+        crate::types::ALGORITHM_ED25519
+    }
+
+    fn sign(&self, secret: &SecretKey, message: &[u8]) -> Signature {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let signing_key = SigningKey::from_bytes(secret);
+        let sig = signing_key.sign(message);
+
+        Signature {
+            algorithm: self.algorithm(),
+            sig: sig.to_bytes(),
+        }
+    }
+
+    fn verify(&self, pubkey: &PublicKey, message: &[u8], sig: &Signature) -> bool {
+        use ed25519_dalek::{Verifier, VerifyingKey};
+
+        if sig.algorithm != self.algorithm() {
+            return false;
+        }
+
+        let Ok(verifying_key) = VerifyingKey::from_bytes(pubkey) else {
+            return false;
+        };
+
+        // from_bytes takes &[u8; 64] and is infallible in ed25519-dalek 2.x
+        let signature = ed25519_dalek::Signature::from_bytes(&sig.sig);
+
+        verifying_key.verify(message, &signature).is_ok()
+    }
+
+    fn generate_keypair(&mut self) -> (PublicKey, SecretKey) {
+        use ed25519_dalek::SigningKey;
+        use sha2::{Digest, Sha256};
+
+        // Derive deterministic 32-byte seed from counter
+        let seed_bytes: [u8; 32] = Sha256::digest(self.next_seed.to_le_bytes()).into();
+        self.next_seed = self.next_seed.wrapping_add(1);
+
+        // Create ed25519 keypair from seed
+        let signing_key = SigningKey::from_bytes(&seed_bytes);
+        let verifying_key = signing_key.verifying_key();
+
+        (verifying_key.to_bytes(), seed_bytes)
+    }
+
+    fn hash(&self, data: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(data).into()
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_impls {
     //! Mock implementations of traits for unit testing and doc tests.
@@ -310,7 +391,6 @@ pub mod test_impls {
     use core::future::{ready, Ready};
 
     use super::*;
-    use crate::types::ALGORITHM_ED25519;
 
     /// Mock transport for testing using embassy-sync channels.
     pub struct MockTransport {
@@ -465,69 +545,15 @@ pub mod test_impls {
         }
     }
 
-    /// Mock crypto for testing (deterministic, NOT cryptographically secure).
-    #[derive(Default)]
-    pub struct MockCrypto {
-        pub next_keypair_seed: u8,
-    }
+    /// Crypto implementation for testing using real SHA-256 and Ed25519.
+    ///
+    /// This is a re-export of [`DefaultCrypto`](super::DefaultCrypto) for use in tests.
+    /// Keypair generation is deterministic from a seed for reproducible tests.
+    pub type MockCrypto = super::DefaultCrypto;
 
-    impl MockCrypto {
-        pub fn new() -> Self {
-            Self::default()
-        }
-    }
-
-    impl Crypto for MockCrypto {
-        fn algorithm(&self) -> u8 {
-            ALGORITHM_ED25519
-        }
-
-        fn sign(&self, secret: &SecretKey, message: &[u8]) -> Signature {
-            // Deterministic "signature" for testing: hash(secret || message)
-            let mut sig = [0u8; 64];
-            let hash = self.hash(&[secret.as_slice(), message].concat());
-            sig[..32].copy_from_slice(&hash);
-            sig[32..].copy_from_slice(&hash);
-            Signature {
-                algorithm: self.algorithm(),
-                sig,
-            }
-        }
-
-        fn verify(&self, pubkey: &PublicKey, message: &[u8], sig: &Signature) -> bool {
-            if sig.algorithm != self.algorithm() {
-                return false;
-            }
-            // For testing, we can't verify without the secret key,
-            // so we just check the format is valid (non-zero signature)
-            // Real impl would verify cryptographically
-            let _ = (pubkey, message); // Acknowledge inputs are intentionally unused
-            sig.sig[..32] != [0u8; 32]
-        }
-
-        fn generate_keypair(&mut self) -> (PublicKey, SecretKey) {
-            let seed = self.next_keypair_seed;
-            self.next_keypair_seed = self.next_keypair_seed.wrapping_add(1);
-
-            let mut secret = [seed; 32];
-            secret[0] = seed;
-            secret[1] = seed.wrapping_add(1);
-
-            // "Public key" = hash of secret (deterministic)
-            let pubkey = self.hash(&secret);
-
-            (pubkey, secret)
-        }
-
-        fn hash(&self, data: &[u8]) -> [u8; 32] {
-            // Simple non-cryptographic hash for testing
-            let mut hash = [0u8; 32];
-            for (i, &byte) in data.iter().enumerate() {
-                hash[i % 32] ^= byte;
-                hash[(i + 1) % 32] = hash[(i + 1) % 32].wrapping_add(byte);
-            }
-            hash
-        }
+    /// Helper to create a MockCrypto with default seed (0) for reproducible tests.
+    pub fn mock_crypto() -> MockCrypto {
+        MockCrypto::new(0)
     }
 
     /// Mock random for testing (deterministic).

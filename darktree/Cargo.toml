@@ -13,7 +13,8 @@ default-crypto = ["dep:ed25519-dalek", "dep:sha2"]
 # Enable debug events for protocol tracing (use in tests/simulations)
 debug = []
 # Expose internal state for testing via darksim. DO NOT enable in production builds.
-test-support = []
+# Enables default-crypto since tests need a crypto implementation.
+test-support = ["default-crypto"]
 
 [dependencies]
 ed25519-dalek = { version = "2", features = ["rand_core"], optional = true }
