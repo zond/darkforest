@@ -3912,4 +3912,102 @@ mod tests {
             K_REPLICAS, storage_count
         );
     }
+
+    /// Test complete DHT PUBLISH-LOOKUP-FOUND flow.
+    ///
+    /// Verifies that when node A sends data to node B:
+    /// 1. A lookup is triggered (B's location not in cache)
+    /// 2. LOOKUP message reaches a storage node
+    /// 3. FOUND response is received by A
+    /// 4. B's location is cached on A
+    /// 5. Data is delivered to B
+    #[test]
+    fn test_lookup_finds_published_location() {
+        use crate::event::Event;
+        use crate::topology::Link;
+
+        // Create a 10-node fully connected mesh
+        let mut sim = Simulator::new(123);
+        let mut nodes = Vec::with_capacity(10);
+        for i in 0..10 {
+            nodes.push(sim.add_node(i as u64));
+        }
+
+        // Fully connect all nodes
+        for i in 0..nodes.len() {
+            for j in (i + 1)..nodes.len() {
+                sim.topology_mut()
+                    .add_link(nodes[i], nodes[j], Link::default());
+            }
+        }
+
+        // Run until tree converges and locations are published
+        sim.run_for(Duration::from_secs(30));
+
+        // Verify single tree formed
+        sim.take_snapshot();
+        let snapshot = sim.metrics().latest_snapshot().unwrap();
+        assert_eq!(snapshot.tree_count(), 1, "Should have single tree");
+
+        // Pick sender A and receiver B (different nodes)
+        let sender = nodes[5];
+        let receiver = nodes[7];
+        let receiver_node_id = sim.node(&receiver).unwrap().node_id();
+
+        // Verify sender doesn't have receiver's location cached yet
+        {
+            let sender_node = sim.node(&sender).unwrap();
+            assert!(
+                !sender_node
+                    .inner()
+                    .test_location_cache()
+                    .contains_key(&receiver_node_id),
+                "Sender should NOT have receiver's location cached initially"
+            );
+        }
+
+        // Schedule app send from sender to receiver
+        let payload = b"Hello from LOOKUP test!".to_vec();
+        sim.schedule(
+            sim.current_time() + Duration::from_millis(100),
+            Event::AppSend {
+                from: sender,
+                to: receiver,
+                payload: payload.clone(),
+            },
+        );
+
+        // Run simulation to allow lookup and data delivery
+        sim.run_for(Duration::from_secs(30));
+
+        // Verify sender now has receiver's location cached
+        {
+            let sender_node = sim.node(&sender).unwrap();
+            assert!(
+                sender_node
+                    .inner()
+                    .test_location_cache()
+                    .contains_key(&receiver_node_id),
+                "Sender should have receiver's location cached after lookup"
+            );
+        }
+
+        // Verify data was delivered to receiver
+        {
+            let receiver_node = sim.node(&receiver).unwrap();
+            let incoming = receiver_node.inner().test_app_incoming();
+
+            // Try to receive the message
+            let received = incoming.try_receive();
+            assert!(
+                received.is_ok(),
+                "Receiver should have received data from sender"
+            );
+            let data = received.unwrap();
+            assert_eq!(
+                data.payload, payload,
+                "Received payload should match sent payload"
+            );
+        }
+    }
 }
