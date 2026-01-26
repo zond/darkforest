@@ -1637,24 +1637,29 @@ Without acknowledgment, A doesn't know if B received the message. For multi-hop 
 
 Since all transmissions are broadcasts, A can overhear when B forwards A's message. This serves as an implicit acknowledgment.
 
-**For Routed messages:**
+**Hash function:** A single `ack_hash(msg)` is used for both ACK matching and duplicate detection. It is computed **excluding TTL and next_hop**. This hash identifies the "logical message" regardless of which hop it's on or which path it takes.
+
+**Why exclude TTL:** The same message at hop 1 (TTL=50) and hop 2 (TTL=49) is the same logical message. By excluding TTL, A can recognize B's forward even though TTL was decremented.
+
+**Why exclude next_hop:** A cannot predict which neighbor B will choose as the next hop (B might use a shortcut A doesn't know about). By excluding next_hop, A can recognize B's forward regardless of B's routing decision.
+
+**Sender (A) behavior:**
 1. A sends `Routed` with TTL=X, next_hop=hash(B) to B
-2. A computes expected forwarded hash (with TTL=X-1 and next_hop updated to B's next hop)
+2. A stores `(ack_hash(msg), TTL=X)` in pending_acks
 3. A starts exponential backoff timer
-4. If A hears B's forwarded message (matching hash): implicit ACK, done
+4. If A hears a message where `ack_hash` matches AND `overheard_TTL == X-1`: this is B's forward. Implicit ACK, done.
 5. If timeout without ACK: A resends original (TTL=X), up to 8 retries
 
-**Hash comparison:**
-The ACK hash is computed over all message fields **including** `ttl` and `next_hop`. This means A must predict what B's forwarded message will look like: TTL decremented, and next_hop set to B's chosen next hop. In practice, A knows the route (same routing algorithm), so A can compute B's next_hop. When overhearing any broadcast, nodes compare hashes against their pending set to detect if it's a forwarded version of a pending message.
+**Why check TTL on overhear:** If A only checked the hash, a message from further down the chain (e.g., TTL=45) that loops back could be mistaken for B's forward. By verifying `overheard_TTL == sent_TTL - 1`, A confirms this is the immediate next hop's forward.
 
 ### Explicit ACK Messages
 
-When B receives a duplicate (same message, same TTL), B knows A didn't hear B's original forward. Instead of re-forwarding (which would create duplicates), B sends an explicit ACK:
+When B receives a duplicate retransmission (same `ack_hash` AND same TTL), B knows A didn't hear B's original forward. Instead of re-forwarding (which would create duplicates), B sends an explicit ACK:
 
 ```rust
 // Top-level message type: wire_type = 0x03
 struct Ack {
-    hash: [u8; 8],  // truncated hash of the message being ACKed
+    hash: [u8; 8],  // ack_hash that sender is waiting for
 }
 ```
 
@@ -1663,13 +1668,43 @@ struct Ack {
 **Forwarder (B) behavior:**
 1. B receives `Routed` with TTL=X, next_hop=hash(B) from A
 2. B verifies next_hop matches hash(B.node_id) — if not, ignore (not the intended forwarder)
-3. B decrements TTL to X-1, sets next_hop to hash(C) where C is B's next hop, and forwards
-4. B stores `hash(original Routed with TTL=X, next_hop=hash(B))` in recently_forwarded set
-5. If B receives same message again (same hash):
-   - Send `ACK(hash(forwarded Routed with TTL=X-1, next_hop=hash(C)))` back
-   - Do NOT re-forward (duplicate suppression)
+3. B computes `ack_hash(msg)` and checks recently_forwarded set:
+   - If hash NOT in set → new message: store (hash, TTL), forward with TTL-1
+   - If hash in set AND TTL matches stored TTL → retransmission: send ACK(ack_hash)
+   - If hash in set AND TTL differs → same message via different path: ignore silently
 
-The ACK contains the hash A is waiting for (the forwarded version with TTL-1 and updated next_hop).
+**Why store TTL alongside hash:** The hash identifies the "logical message" (excludes TTL). But we need the TTL to distinguish:
+- **Same TTL**: Direct retransmission from the immediate sender who didn't hear our forward → send ACK
+- **Different TTL**: Same message arrived via a different path (loop or alternate route) → ignore silently (don't forward again, don't send ACK to the wrong node)
+
+**Example flow (success):**
+```
+A sends:     TTL=50, next_hop=hash(B), payload=P
+A stores:    (ack_hash, TTL=50) in pending_acks
+
+B receives:  TTL=50, next_hop=hash(B)
+B stores:    (ack_hash, TTL=50) in recently_forwarded
+B forwards:  TTL=49, next_hop=hash(C)
+
+A hears:     TTL=49, ack_hash matches, 49 == 50-1 → implicit ACK, done!
+```
+
+**Example flow (loss + explicit ACK):**
+```
+A sends:     TTL=50, next_hop=hash(B), payload=P
+A stores:    (ack_hash, TTL=50) in pending_acks
+
+B receives:  TTL=50, next_hop=hash(B)
+B stores:    (ack_hash, TTL=50) in recently_forwarded
+B forwards:  TTL=49, next_hop=hash(C)
+
+A misses B's forward, retransmits: TTL=50, next_hop=hash(B)
+
+B receives:  ack_hash matches, TTL=50 matches stored → retransmission
+B sends:     ACK(ack_hash)
+
+A receives:  ACK hash matches pending_acks → done!
+```
 
 ### Timing Considerations
 
@@ -1700,7 +1735,8 @@ const MAX_RETRIES: u8 = 8;
 // For UDP (τ=0.1s): ~28 seconds
 
 struct PendingAck {
-    expected_hash: [u8; 8],  // hash of forwarded message (TTL-1, next_hop updated)
+    expected_hash: [u8; 8],  // ack_hash (excludes TTL and next_hop)
+    sent_ttl: u8,            // TTL we sent, expect to hear TTL-1
     original_msg: Vec<u8>,   // for retransmission
     retries: u8,
     next_retry: Instant,
