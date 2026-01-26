@@ -352,15 +352,14 @@ where
 mod tests {
     use super::*;
     use crate::time::{Duration, Timestamp};
-    use crate::traits::test_impls::{
-        mock_crypto, MockClock, MockCrypto, MockRandom, MockTransport,
-    };
+    use crate::traits::test_impls::{FastTestCrypto, MockClock, MockRandom, MockTransport};
     use crate::types::{NodeId, K_REPLICAS};
 
     fn make_node(
-    ) -> Node<MockTransport, MockCrypto, MockRandom, MockClock, crate::config::DefaultConfig> {
+    ) -> Node<MockTransport, FastTestCrypto, MockRandom, MockClock, crate::config::DefaultConfig>
+    {
         let transport = MockTransport::new();
-        let crypto = mock_crypto();
+        let crypto = FastTestCrypto::new(0);
         let random = MockRandom::new();
         let clock = MockClock::new();
         Node::new(transport, crypto, random, clock)

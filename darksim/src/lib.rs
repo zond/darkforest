@@ -308,6 +308,77 @@ mod tests {
         );
     }
 
+    /// Scenario 2.6: Random Geometric Topology
+    /// Setup: 20 nodes with random geometric connectivity (adaptive radius)
+    /// Run: 60 seconds (longer due to multi-hop discovery)
+    /// Expect: Single tree formed despite sparse, multi-hop connectivity.
+    #[test]
+    fn test_random_geometric_topology_forms_tree() {
+        let (mut sim, nodes) = ScenarioBuilder::new(20)
+            .with_seed(42)
+            .random_geometric_adaptive()
+            .build();
+
+        // Verify sparse connectivity (not fully connected)
+        let total_possible_edges = nodes.len() * (nodes.len() - 1) / 2;
+        let actual_edges: usize = nodes
+            .iter()
+            .map(|n| sim.topology().neighbors(*n).len())
+            .sum::<usize>()
+            / 2; // Each edge counted twice
+        let density = actual_edges as f64 / total_possible_edges as f64;
+        println!(
+            "Random geometric: {} edges / {} possible = {:.1}% density",
+            actual_edges,
+            total_possible_edges,
+            density * 100.0
+        );
+        assert!(
+            density < 0.5,
+            "Random geometric should be sparse, got {:.1}% density",
+            density * 100.0
+        );
+
+        // With sparse multi-hop topology, convergence takes longer
+        // Each hop adds latency to tree discovery and merging
+        let result = sim.run_for(Duration::from_secs(60));
+
+        // Debug output
+        println!("Tree count: {}", result.final_tree_count());
+        println!("Max tree size: {}", result.final_max_tree_size());
+        for node_id in &nodes {
+            let node = sim.node(node_id).unwrap();
+            println!(
+                "  Node {:?}: is_root={}, tree_size={}, neighbors={}",
+                &node_id[0..4],
+                node.is_root(),
+                node.tree_size(),
+                sim.topology().neighbors(*node_id).len()
+            );
+        }
+
+        // Verify single tree formed
+        assert!(
+            result.converged(),
+            "Random geometric network should converge to single tree"
+        );
+        assert_eq!(result.final_tree_count(), 1);
+        assert_eq!(
+            result.final_max_tree_size(),
+            20,
+            "Tree should have exactly 20 nodes"
+        );
+
+        // Random geometric may have deeper trees due to sparse connectivity
+        // With ~5 neighbors per node on average, depth could be higher than fully connected
+        let depth = max_tree_depth(&sim, &nodes);
+        assert!(
+            depth <= 10,
+            "Random geometric tree depth should be reasonable, got {}",
+            depth
+        );
+    }
+
     /// Scenario 5.1: Parent Timeout (8 Pulses)
     /// Setup: Tree with parent P and child C. Stop P's pulses at t=10τ.
     /// Run: 40τ

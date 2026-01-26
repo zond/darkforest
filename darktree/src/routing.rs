@@ -519,19 +519,17 @@ mod tests {
 
     use super::*;
     use crate::config::{DefaultConfig, SmallConfig};
-    use crate::traits::test_impls::{
-        mock_crypto, MockClock, MockCrypto, MockRandom, MockTransport,
-    };
+    use crate::traits::test_impls::{FastTestCrypto, MockClock, MockRandom, MockTransport};
 
     /// Type alias for test nodes using default config.
-    type TestNode = Node<MockTransport, MockCrypto, MockRandom, MockClock, DefaultConfig>;
+    type TestNode = Node<MockTransport, FastTestCrypto, MockRandom, MockClock, DefaultConfig>;
 
     /// Type alias for test nodes using small config (64KB RAM).
-    type SmallTestNode = Node<MockTransport, MockCrypto, MockRandom, MockClock, SmallConfig>;
+    type SmallTestNode = Node<MockTransport, FastTestCrypto, MockRandom, MockClock, SmallConfig>;
 
     fn make_node() -> TestNode {
         let transport = MockTransport::new();
-        let crypto = mock_crypto();
+        let crypto = FastTestCrypto::new(0);
         let random = MockRandom::new();
         let clock = MockClock::new();
         Node::new(transport, crypto, random, clock)
@@ -539,7 +537,7 @@ mod tests {
 
     fn make_small_node() -> SmallTestNode {
         let transport = MockTransport::new();
-        let crypto = mock_crypto();
+        let crypto = FastTestCrypto::new(0);
         let random = MockRandom::new();
         let clock = MockClock::new();
         Node::new(transport, crypto, random, clock)
@@ -811,11 +809,9 @@ mod tests {
 
     #[test]
     fn test_retry_backoff_bounds() {
-        use crate::traits::test_impls::{mock_crypto, MockClock, MockRandom, MockTransport};
-
         // Create node with known tau (100ms default for MockTransport with no bw)
         let transport = MockTransport::new();
-        let crypto = mock_crypto();
+        let crypto = FastTestCrypto::new(0);
         let random = MockRandom::with_seed(42);
         let clock = MockClock::new();
         let mut node: TestNode = Node::new(transport, crypto, random, clock);

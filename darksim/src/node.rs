@@ -5,9 +5,10 @@ use std::future::{ready, Ready};
 
 use darktree::config::DefaultConfig;
 use darktree::traits::{
-    Clock, Crypto, Random, Received, Transport, TransportInChannel, TransportOutChannel,
+    test_impls::FastTestCrypto, Clock, Random, Received, Transport, TransportInChannel,
+    TransportOutChannel,
 };
-use darktree::{Duration, Node, NodeId, OutgoingData, PublicKey, SecretKey, Signature, Timestamp};
+use darktree::{Duration, Node, NodeId, OutgoingData, PublicKey, Timestamp};
 use embassy_sync::channel::Channel;
 
 /// Mock transport for simulation.
@@ -130,73 +131,6 @@ impl Clock for SimClock {
     }
 }
 
-/// Mock crypto for simulation (deterministic, NOT cryptographically secure).
-pub struct SimCrypto {
-    next_keypair_seed: u8,
-}
-
-impl SimCrypto {
-    pub fn new() -> Self {
-        Self {
-            next_keypair_seed: 0,
-        }
-    }
-
-    pub fn with_seed(seed: u8) -> Self {
-        Self {
-            next_keypair_seed: seed,
-        }
-    }
-}
-
-impl Default for SimCrypto {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Crypto for SimCrypto {
-    fn algorithm(&self) -> u8 {
-        0x01 // Ed25519
-    }
-
-    fn sign(&self, secret: &SecretKey, message: &[u8]) -> Signature {
-        let mut sig = [0u8; 64];
-        let hash = self.hash(&[secret.as_slice(), message].concat());
-        sig[..32].copy_from_slice(&hash);
-        sig[32..].copy_from_slice(&hash);
-        Signature {
-            algorithm: self.algorithm(),
-            sig,
-        }
-    }
-
-    fn verify(&self, _pubkey: &PublicKey, _message: &[u8], sig: &Signature) -> bool {
-        sig.algorithm == self.algorithm() && sig.sig[..32] != [0u8; 32]
-    }
-
-    fn generate_keypair(&mut self) -> (PublicKey, SecretKey) {
-        let seed = self.next_keypair_seed;
-        self.next_keypair_seed = self.next_keypair_seed.wrapping_add(1);
-
-        let mut secret = [seed; 32];
-        secret[0] = seed;
-        secret[1] = seed.wrapping_add(1);
-
-        let pubkey = self.hash(&secret);
-        (pubkey, secret)
-    }
-
-    fn hash(&self, data: &[u8]) -> [u8; 32] {
-        let mut hash = [0u8; 32];
-        for (i, &byte) in data.iter().enumerate() {
-            hash[i % 32] ^= byte;
-            hash[(i + 1) % 32] = hash[(i + 1) % 32].wrapping_add(byte);
-        }
-        hash
-    }
-}
-
 /// Mock random for simulation (deterministic LCG).
 pub struct SimRandom {
     state: u64,
@@ -230,7 +164,7 @@ impl Random for SimRandom {
 }
 
 /// Type alias for simulated nodes.
-pub type SimNodeInner = Node<SimTransport, SimCrypto, SimRandom, SimClock, DefaultConfig>;
+pub type SimNodeInner = Node<SimTransport, FastTestCrypto, SimRandom, SimClock, DefaultConfig>;
 
 /// Wrapper around a darktree Node for simulation.
 pub struct SimNode {
@@ -244,7 +178,7 @@ impl SimNode {
     /// Create a new SimNode with given seed for deterministic identity.
     pub fn new(seed: u64, created_at: Timestamp) -> Self {
         let transport = SimTransport::new();
-        let crypto = SimCrypto::with_seed((seed & 0xFF) as u8);
+        let crypto = FastTestCrypto::new(seed);
         let random = SimRandom::with_seed(seed);
         let clock = SimClock::at(created_at);
 
@@ -256,7 +190,7 @@ impl SimNode {
     /// Create a SimNode with bandwidth-limited transport (for LoRa simulation).
     pub fn with_bandwidth(seed: u64, created_at: Timestamp, bw: u32) -> Self {
         let transport = SimTransport::new().with_bandwidth(bw);
-        let crypto = SimCrypto::with_seed((seed & 0xFF) as u8);
+        let crypto = FastTestCrypto::new(seed);
         let random = SimRandom::with_seed(seed);
         let clock = SimClock::at(created_at);
 

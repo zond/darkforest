@@ -23,17 +23,17 @@
 //!
 //! ```
 //! use darktree::{Node, DefaultConfig, SmallConfig, NodeConfig};
-//! use darktree::traits::test_impls::{MockTransport, mock_crypto, MockRandom, MockClock};
+//! use darktree::traits::test_impls::{MockTransport, FastTestCrypto, MockRandom, MockClock};
 //!
 //! // For 256KB+ RAM devices (default)
 //! let node = Node::<_, _, _, _, DefaultConfig>::new(
-//!     MockTransport::new(), mock_crypto(), MockRandom::new(), MockClock::new()
+//!     MockTransport::new(), FastTestCrypto::new(0), MockRandom::new(), MockClock::new()
 //! );
 //! assert_eq!(node.tree_size(), 1);
 //!
 //! // For 64KB RAM devices
 //! let node = Node::<_, _, _, _, SmallConfig>::new(
-//!     MockTransport::new(), mock_crypto(), MockRandom::new(), MockClock::new()
+//!     MockTransport::new(), FastTestCrypto::new(0), MockRandom::new(), MockClock::new()
 //! );
 //! assert!(node.is_root());
 //!
@@ -54,7 +54,7 @@
 //!     const MAX_RECENTLY_FORWARDED: usize = 32;
 //! }
 //! let node = Node::<_, _, _, _, MyConfig>::new(
-//!     MockTransport::new(), mock_crypto(), MockRandom::new(), MockClock::new()
+//!     MockTransport::new(), FastTestCrypto::new(0), MockRandom::new(), MockClock::new()
 //! );
 //! ```
 

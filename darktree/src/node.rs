@@ -10,11 +10,11 @@
 //!
 //! ```
 //! use darktree::{Node, DefaultConfig};
-//! use darktree::traits::test_impls::{MockTransport, mock_crypto, MockRandom, MockClock};
+//! use darktree::traits::test_impls::{MockTransport, FastTestCrypto, MockRandom, MockClock};
 //!
 //! let node = Node::<_, _, _, _, DefaultConfig>::new(
 //!     MockTransport::new(),
-//!     mock_crypto(),
+//!     FastTestCrypto::new(0),
 //!     MockRandom::new(),
 //!     MockClock::new(),
 //! );

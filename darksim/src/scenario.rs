@@ -290,31 +290,13 @@ pub fn lora_scenario(num_nodes: usize) -> ScenarioBuilder {
         .with_bandwidth(38)
 }
 
-/// Predict a node's ID from its seed (matches SimCrypto deterministic keypair generation).
+/// Predict a node's ID from its seed (matches FastTestCrypto deterministic keypair generation).
 fn predict_node_id(node_seed: u64) -> NodeId {
-    let seed_byte = (node_seed & 0xFF) as u8;
+    use darktree::traits::{test_impls::FastTestCrypto, Crypto};
 
-    // SimCrypto generates: secret -> pubkey = hash(secret) -> node_id = hash(pubkey)[..16]
-    let mut secret = [seed_byte; 32];
-    secret[0] = seed_byte;
-    secret[1] = seed_byte.wrapping_add(1);
-
-    let pubkey = sim_hash(&secret);
-    let pubkey_hash = sim_hash(&pubkey);
-
-    let mut node_id = [0u8; 16];
-    node_id.copy_from_slice(&pubkey_hash[..16]);
-    node_id
-}
-
-/// Hash function matching SimCrypto.hash for deterministic ID prediction.
-fn sim_hash(data: &[u8]) -> [u8; 32] {
-    let mut hash = [0u8; 32];
-    for (i, &byte) in data.iter().enumerate() {
-        hash[i % 32] ^= byte;
-        hash[(i + 1) % 32] = hash[(i + 1) % 32].wrapping_add(byte);
-    }
-    hash
+    let mut crypto = FastTestCrypto::new(node_seed);
+    let (pubkey, _secret) = crypto.generate_keypair();
+    crypto.node_id_from_pubkey(&pubkey)
 }
 
 #[cfg(test)]

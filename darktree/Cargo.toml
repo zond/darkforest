@@ -9,16 +9,12 @@ description = "Tree-based DHT protocol for LoRa mesh networks"
 [features]
 default = []
 std = ["critical-section/std", "hashbrown/default"]
-default-crypto = ["dep:ed25519-dalek", "dep:sha2"]
 # Enable debug events for protocol tracing (use in tests/simulations)
 debug = []
 # Expose internal state for testing via darksim. DO NOT enable in production builds.
-# Enables default-crypto since tests need a crypto implementation.
-test-support = ["default-crypto"]
+test-support = []
 
 [dependencies]
-ed25519-dalek = { version = "2", features = ["rand_core"], optional = true }
-sha2 = { version = "0.10", optional = true }
 embassy-sync = "0.6"
 embassy-futures = "0.1"
 critical-section = "1.1"
@@ -27,8 +23,6 @@ libm = "0.2"
 siphasher = { version = "1", default-features = false }
 
 [dev-dependencies]
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-sha2 = "0.10"
 rand = "0.8"
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 critical-section = { version = "1.1", features = ["std"] }

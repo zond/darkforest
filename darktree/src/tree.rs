@@ -1049,16 +1049,15 @@ where
 mod tests {
     use super::*;
     use crate::node::NeighborTiming;
-    use crate::traits::test_impls::{
-        mock_crypto, MockClock, MockCrypto, MockRandom, MockTransport,
-    };
+    use crate::traits::test_impls::{FastTestCrypto, MockClock, MockRandom, MockTransport};
     use crate::types::{LocationEntry, NodeId, Signature, ALGORITHM_ED25519};
     use alloc::vec;
 
     fn make_node(
-    ) -> Node<MockTransport, MockCrypto, MockRandom, MockClock, crate::config::DefaultConfig> {
+    ) -> Node<MockTransport, FastTestCrypto, MockRandom, MockClock, crate::config::DefaultConfig>
+    {
         let transport = MockTransport::new();
-        let crypto = mock_crypto();
+        let crypto = FastTestCrypto::new(0);
         let random = MockRandom::new();
         let clock = MockClock::new();
         Node::new(transport, crypto, random, clock)
