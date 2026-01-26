@@ -1489,7 +1489,198 @@ replica_1_key = hash(node_id || 0x01)
 replica_2_key = hash(node_id || 0x02)
 ```
 
-Replicas are distributed across different parts of the tree.
+Replicas are distributed across different parts of the tree, increasing the chance that at least one replica survives link failures or subtree partitions.
+
+### Sibling Backup
+
+While replication spreads entries across the tree, node churn can still cause data loss: when a storage node dies, its entries are lost even though a sibling will inherit its keyspace. **Sibling backup** exploits radio overhearing to maintain redundant copies within each family (parent + children group).
+
+#### The Family Circle
+
+Nodes in a family are ordered by keyspace into a circular list:
+
+```
+[parent, child_0, child_1, ..., child_n] → wraps back to parent
+```
+
+Where:
+- Parent owns `[family_lo, first_child_lo)` (the portion before its first child, as with any node that has children)
+- Children are ordered by their `keyspace_lo` values
+- Each node's **successor** is the next node in this circular order
+
+Example with keyspace [0x0000, 0x4000):
+```
+parent:  owns [0x0000, 0x1000)  → successor: child_0
+child_0: owns [0x1000, 0x2000)  → successor: child_1
+child_1: owns [0x2000, 0x3000)  → successor: child_2
+child_2: owns [0x3000, 0x4000)  → successor: parent (circular)
+```
+
+#### Backup Scope
+
+Each node backs up location entries for its **successor** and **successor's successor**:
+
+```rust
+fn backup_scope(&self) -> Vec<(u32, u32)> {
+    let succ = self.successor();
+    let succ_succ = succ.successor();
+    vec![succ.keyspace_range(), succ_succ.keyspace_range()]
+}
+```
+
+This provides two levels of redundancy: if one node dies, both its predecessor and predecessor's predecessor have backup copies.
+
+#### Backup via Overhearing
+
+Family members are typically in radio range (children joined because they heard the parent's pulse). When a `Routed(PUBLISH)` is transmitted, nearby nodes overhear it:
+
+```rust
+fn on_routed_publish_received(&mut self, msg: &Routed, entry: &LocationEntry) {
+    // IMPORTANT: Verify signature before ANY storage (primary or backup)
+    // This prevents attackers from polluting backup stores with invalid entries
+    if !self.verify_location_signature(entry) {
+        return;
+    }
+
+    let target_addr = msg.dest_addr;
+
+    if self.owns_keyspace(target_addr) {
+        // Primary storage (existing behavior)
+        self.location_store.insert(entry);
+    } else if self.in_backup_scope(target_addr) {
+        // Backup storage (new behavior)
+        self.backup_store.insert(entry);
+    }
+}
+```
+
+No extra messages are needed—backups form naturally from overhearing.
+
+**Security note:** Backup storage MUST verify `LOC:` signatures identically to primary storage. Skipping verification would allow attackers to fill backup stores with garbage, causing memory exhaustion and re-publish amplification when siblings "disappear."
+
+#### Recovery on Family Change
+
+When a sibling disappears from the parent's Pulse, we can trust this immediately—the parent has already waited ~24τ (8 missed Pulses) before removing the child. No additional absence tracking is needed.
+
+To avoid **message amplification** (multiple nodes re-publishing the same entry), only the **immediate predecessor** of the departed sibling re-publishes. Jitter spreads re-publishes over time, allowing overhear-based deduplication.
+
+```rust
+const REPUBLISH_JITTER_TAU: u64 = 2;  // Max jitter for re-publish (in tau units)
+
+fn on_parent_pulse(&mut self, pulse: &Pulse) {
+    let old_siblings = self.current_siblings.clone();
+    let new_siblings = self.compute_siblings(pulse);
+
+    // Find siblings that disappeared
+    let departed: Vec<_> = old_siblings.iter()
+        .filter(|s| !new_siblings.contains(s))
+        .collect();
+
+    for sibling in &departed {
+        // Only immediate predecessor handles re-publishing
+        if !self.was_immediate_predecessor_of(sibling) {
+            continue;
+        }
+
+        for entry in self.backup_store.drain_range(sibling.keyspace_range()) {
+            if self.owns_keyspace(entry.keyspace_addr) {
+                // We inherited this keyspace - promote to primary
+                self.location_store.insert(entry.clone());
+            }
+            // Re-publish in all cases so new owner AND new backups get it
+            let jitter = self.random.gen_range(0, REPUBLISH_JITTER_TAU * self.tau());
+            self.schedule_republish(entry, jitter);
+        }
+    }
+
+    // Update backup scope and prune entries no longer covered
+    self.current_siblings = new_siblings;
+    let new_scope = self.compute_backup_scope();
+    self.backup_store.retain(|e| new_scope.contains(e.keyspace_addr));
+}
+```
+
+**Why trust the parent immediately:** The parent already waited ~24τ (8 missed Pulses) before removing the child from its Pulse. Adding our own delay would be redundant.
+
+**Why only immediate predecessor re-publishes:** With two-level backup (successor + successor's successor), two nodes have backups for any sibling. Only the immediate predecessor acts; the other simply prunes its now-out-of-scope entries.
+
+**Why promoted entries also re-publish:** Even when we promote a backup to primary (because we inherited that keyspace), we must re-publish. Our new successors need backup copies, and they only get them by overhearing the re-publish.
+
+**Why jitter:** Spreading re-publishes over 0–2τ (~13s for LoRa) allows natural deduplication. If node A re-publishes first, node B may overhear and skip its queued re-publish.
+
+#### Complete Rebalance Process
+
+When a parent Pulse arrives, process both primary and backup storage:
+
+```
+1. DETECT CHANGES
+   - Compare old vs new sibling list → identify departed siblings
+   - Compare old vs new keyspace range → detect own range changes
+   - Recompute family circle ordering and backup scope
+   - Initialize empty republish_set for coalescing
+
+2. HANDLE DEPARTED SIBLINGS (backup recovery)
+   For each sibling that disappeared from parent's child list:
+   - Skip if we were NOT that sibling's immediate predecessor
+   - For each backup entry in that sibling's old keyspace range:
+     - If entry is now in OUR keyspace → add to primary storage
+     - Add entry to republish_set
+     - Remove from backup storage
+
+3. REBALANCE PRIMARY STORAGE (range shift)
+   For each primary entry no longer in our keyspace range:
+   - Add entry to republish_set
+   - Remove from primary storage
+
+4. PRUNE BACKUP STORAGE
+   Remove entries no longer in our new backup scope
+   (backup scope = successor's range ∪ successor's successor's range)
+
+5. SEND COALESCED RE-PUBLISHES
+   For each unique entry in republish_set:
+   - Schedule Routed(PUBLISH) with jitter (0–2τ)
+```
+
+**Why coalesce:** The same entry might appear in both step 2 (backup recovery) and step 3 (range shift). Coalescing ensures each entry is re-published at most once per rebalance.
+
+**Why step 3 must re-publish:** When our range shrinks, entries may move to a distant part of the tree where no family has backups. We cannot rely on the 8-hour refresh—re-publishing is required for availability.
+
+**Bandwidth during instability:** If the tree is rapidly converging (keyspace shifting frequently), entries may be re-published multiple times. This is acceptable—availability is more important than bandwidth efficiency during transient periods. Once the tree stabilizes, re-publishing stops.
+
+#### Edge Cases
+
+**Simultaneous departure of consecutive siblings:** If child_1 and child_2 both depart in the same Pulse, child_0 becomes the immediate predecessor of the combined departed range. The algorithm checks predecessor status against the *new* family ordering, so child_0 will correctly re-publish entries for both departed siblings' keyspace ranges.
+
+**Single-child family:** With only parent + one child, each is the other's successor. When the child departs, the parent is its own successor and predecessor. The parent should re-publish the child's backup entries and then becomes a leaf node with no backup responsibilities.
+
+**Parent departure:** When the parent dies (detected via parent timeout, not sibling Pulse observation), children become orphans and enter shopping phase. Their backup stores persist until they join a new family, at which point the normal rebalance process handles any scope changes.
+
+#### Memory Budget
+
+Backup storage roughly triples location storage per node:
+
+| Storage Type | Entries | Rationale |
+|-------------|---------|-----------|
+| Primary | MAX_LOCATION_STORE | Fair share of network entries |
+| Backup | 2 × MAX_LOCATION_STORE | Successor + successor's successor |
+| **Total** | 3 × MAX_LOCATION_STORE | Primary + two backup ranges |
+
+Each `LocationEntry` is ~140 bytes (16 node_id + 32 pubkey + 4 addr + 4 seq + 1 replica + 65 signature + 8 timestamp + padding).
+
+| Config | Primary | Backup | Total Entries | Memory |
+|--------|---------|--------|---------------|--------|
+| DefaultConfig | 256 | 512 | 768 | ~105 KB |
+| SmallConfig | 32 | 64 | 96 | ~13 KB |
+
+**Network-wide redundancy:** Combined with K=3 replicas, each node's location is stored in 3 × 3 = 9 places across the network (3 replica addresses, each with primary + 2 backup copies). This provides strong resilience against both geographic failures (replicas spread across tree) and local churn (sibling backups within families).
+
+#### Why This Works
+
+1. **Zero message overhead for backup**: Siblings overhear PUBLISH naturally
+2. **Graceful failover**: Predecessor has backup before sibling dies
+3. **Self-healing chain**: Re-publish propagates backups to new neighbors
+4. **Local decision-making**: Each node acts on its own Pulse observations
+5. **Bounded storage**: Fixed capacity limits, pruned on scope change
 
 ### TTL and Expiration
 
@@ -1509,22 +1700,6 @@ fn cleanup_expired(&mut self) {
 ```
 
 Dead nodes stop refreshing → entries expire → no stale data.
-
-### Rebalancing
-
-When subtree sizes change, keyspace ranges shift. Storage nodes push entries to new owners:
-
-```rust
-fn on_range_change(&mut self, old_range: (u32, u32), new_range: (u32, u32)) {
-    for entry in self.location_store.values() {
-        let key = hash_to_u32(&[&entry.node_id[..], &[entry.replica_index]].concat());
-        if key < new_range.0 || key >= new_range.1 {
-            // Entry's key is no longer in our range - forward it
-            self.forward_entry_to_new_owner(entry);
-        }
-    }
-}
-```
 
 ---
 
