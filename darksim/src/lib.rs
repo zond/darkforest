@@ -17,9 +17,10 @@
 //! ```
 //! use darksim::{ScenarioBuilder, Duration};
 //!
-//! // Create a 5-node network and run for 10 seconds
+//! // Create a 5-node fully connected network and run for 10 seconds
 //! let result = ScenarioBuilder::new(5)
 //!     .with_seed(42)
+//!     .fully_connected()
 //!     .run_for(Duration::from_secs(10));
 //!
 //! // Check if network converged to single tree
@@ -118,6 +119,7 @@ mod tests {
     fn test_single_node_becomes_root() {
         let result = ScenarioBuilder::new(1)
             .with_seed(42)
+            .fully_connected()
             .run_for(Duration::from_secs(5));
 
         // Single node should be root of tree_size=1
@@ -133,6 +135,7 @@ mod tests {
         // With default tau=100ms, 10 seconds should be plenty
         let (mut sim, nodes) = ScenarioBuilder::new(2)
             .with_seed(42)
+            .fully_connected()
             .with_snapshot_interval(Duration::from_millis(500))
             .build();
 

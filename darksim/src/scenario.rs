@@ -8,15 +8,18 @@ use crate::sim::Simulator;
 use crate::topology::Topology;
 
 /// Type of topology to generate.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 enum TopologyType {
-    /// Fully connected (default).
-    #[default]
+    /// Fully connected topology.
     FullyConnected,
     /// Chain topology (each node connected only to neighbors).
     Chain,
     /// Star topology (first node is hub).
     Star,
+    /// Random geometric topology with specified radius.
+    RandomGeometric { radius: f64 },
+    /// Random geometric topology with adaptive radius.
+    RandomGeometricAdaptive,
     /// Custom topology provided by user.
     Custom(Topology),
 }
@@ -27,8 +30,8 @@ pub struct ScenarioBuilder {
     num_nodes: usize,
     /// RNG seed for determinism.
     seed: u64,
-    /// Topology type to generate.
-    topology_type: TopologyType,
+    /// Topology type to generate (must be explicitly specified).
+    topology_type: Option<TopologyType>,
     /// Global packet loss rate.
     loss_rate: f64,
     /// Link delay.
@@ -49,11 +52,15 @@ impl Default for ScenarioBuilder {
 
 impl ScenarioBuilder {
     /// Create a new scenario with the specified number of nodes.
+    ///
+    /// Note: You MUST specify a topology before calling build().
+    /// Use `.fully_connected()`, `.chain_topology()`, `.star_topology()`,
+    /// or `.topology(custom_topology)`.
     pub fn new(num_nodes: usize) -> Self {
         Self {
             num_nodes,
             seed: 42,
-            topology_type: TopologyType::FullyConnected,
+            topology_type: None, // Must be explicitly specified
             loss_rate: 0.0,
             delay: Duration::from_millis(1),
             bandwidth: None,
@@ -70,25 +77,44 @@ impl ScenarioBuilder {
 
     /// Set a custom network topology.
     pub fn topology(mut self, topo: Topology) -> Self {
-        self.topology_type = TopologyType::Custom(topo);
+        self.topology_type = Some(TopologyType::Custom(topo));
         self
     }
 
-    /// Use fully connected topology (default).
+    /// Use fully connected topology.
     pub fn fully_connected(mut self) -> Self {
-        self.topology_type = TopologyType::FullyConnected;
+        self.topology_type = Some(TopologyType::FullyConnected);
         self
     }
 
     /// Use chain topology (each node connected only to neighbors).
     pub fn chain_topology(mut self) -> Self {
-        self.topology_type = TopologyType::Chain;
+        self.topology_type = Some(TopologyType::Chain);
         self
     }
 
     /// Use star topology (first node is hub).
     pub fn star_topology(mut self) -> Self {
-        self.topology_type = TopologyType::Star;
+        self.topology_type = Some(TopologyType::Star);
+        self
+    }
+
+    /// Use random geometric topology with specified radius.
+    ///
+    /// Nodes are placed at deterministic positions in a unit square.
+    /// Two nodes are connected if their distance is <= radius.
+    /// Connectivity is guaranteed by adding minimal MST edges if needed.
+    pub fn random_geometric(mut self, radius: f64) -> Self {
+        self.topology_type = Some(TopologyType::RandomGeometric { radius });
+        self
+    }
+
+    /// Use random geometric topology with adaptive radius.
+    ///
+    /// The radius is computed to give approximately 5 neighbors per node,
+    /// clamped to [0.15, 0.70]. Connectivity is guaranteed.
+    pub fn random_geometric_adaptive(mut self) -> Self {
+        self.topology_type = Some(TopologyType::RandomGeometricAdaptive);
         self
     }
 
@@ -159,10 +185,21 @@ impl ScenarioBuilder {
 
         // Build topology with predicted node IDs
         let mut topo = match self.topology_type {
-            TopologyType::FullyConnected => Topology::fully_connected(&predicted_node_ids),
-            TopologyType::Chain => Topology::chain(&predicted_node_ids),
-            TopologyType::Star => Topology::star(&predicted_node_ids),
-            TopologyType::Custom(t) => t,
+            Some(TopologyType::FullyConnected) => Topology::fully_connected(&predicted_node_ids),
+            Some(TopologyType::Chain) => Topology::chain(&predicted_node_ids),
+            Some(TopologyType::Star) => Topology::star(&predicted_node_ids),
+            Some(TopologyType::RandomGeometric { radius }) => {
+                Topology::random_geometric(&predicted_node_ids, self.seed, radius)
+            }
+            Some(TopologyType::RandomGeometricAdaptive) => {
+                Topology::random_geometric_adaptive(&predicted_node_ids, self.seed)
+            }
+            Some(TopologyType::Custom(t)) => t,
+            None => panic!(
+                "Topology must be explicitly specified. \
+                Use .fully_connected(), .chain_topology(), .star_topology(), \
+                .random_geometric(), .random_geometric_adaptive(), or .topology()"
+            ),
         };
 
         // Apply global settings
@@ -243,12 +280,14 @@ impl ScenarioBuilder {
 
 /// Convenience function to create a simple N-node fully connected scenario.
 pub fn simple_scenario(num_nodes: usize) -> ScenarioBuilder {
-    ScenarioBuilder::new(num_nodes)
+    ScenarioBuilder::new(num_nodes).fully_connected()
 }
 
 /// Convenience function for LoRa-like simulation (38 bytes/sec bandwidth).
 pub fn lora_scenario(num_nodes: usize) -> ScenarioBuilder {
-    ScenarioBuilder::new(num_nodes).with_bandwidth(38)
+    ScenarioBuilder::new(num_nodes)
+        .fully_connected()
+        .with_bandwidth(38)
 }
 
 /// Predict a node's ID from its seed (matches SimCrypto deterministic keypair generation).
@@ -284,7 +323,10 @@ mod tests {
 
     #[test]
     fn test_scenario_builder_basic() {
-        let (sim, nodes) = ScenarioBuilder::new(3).with_seed(123).build();
+        let (sim, nodes) = ScenarioBuilder::new(3)
+            .with_seed(123)
+            .fully_connected()
+            .build();
 
         assert_eq!(nodes.len(), 3);
         assert_eq!(sim.node_ids().len(), 3);
@@ -300,7 +342,10 @@ mod tests {
 
     #[test]
     fn test_scenario_with_loss() {
-        let (sim, nodes) = ScenarioBuilder::new(2).with_loss_rate(0.5).build();
+        let (sim, nodes) = ScenarioBuilder::new(2)
+            .fully_connected()
+            .with_loss_rate(0.5)
+            .build();
 
         // With 50% loss, topology should still be connected but lossy
         let link = sim.topology().get_link(nodes[0], nodes[1]).unwrap();
@@ -310,6 +355,7 @@ mod tests {
     #[test]
     fn test_scenario_partition() {
         let (mut sim, nodes) = ScenarioBuilder::new(4)
+            .fully_connected()
             .partition_at(Timestamp::from_millis(500), vec![vec![0, 1], vec![2, 3]])
             .build();
 
