@@ -139,13 +139,16 @@ pub(crate) struct PendingAck {
     pub retries: u8,
     /// Timestamp when next retry should occur.
     pub next_retry_at: Timestamp,
+    /// TTL value when message was sent (for implicit ACK verification).
+    pub sent_ttl: u8,
 }
 
 /// Map of pending ACKs keyed by message hash.
 pub(crate) type PendingAckMap = HashMap<AckHash, PendingAck>;
 
 /// Map of recently forwarded message hashes for duplicate detection.
-pub(crate) type RecentlyForwardedMap = HashMap<AckHash, Timestamp>;
+/// Stores (timestamp, ttl) to distinguish retransmissions from alternate paths.
+pub(crate) type RecentlyForwardedMap = HashMap<AckHash, (Timestamp, u8)>;
 
 /// The main protocol node.
 ///
@@ -668,9 +671,16 @@ where
                 }
 
                 // Implicit ACK: overhearing a Routed message clears pending ACK
-                // This is cheap (just a hash lookup) so we do it BEFORE signature verification.
+                // Only clear if TTL matches what we expect (sent_ttl - 1).
+                // This prevents false positives from messages arriving via alternate paths.
                 let received_hash = self.compute_ack_hash(&routed);
-                self.pending_acks.remove(&received_hash);
+                let received_ttl = routed.ttl;
+                if let Some(pending) = self.pending_acks.get(&received_hash) {
+                    if received_ttl == pending.sent_ttl.saturating_sub(1) {
+                        // TTL matches: this is the message we sent, forwarded by next hop
+                        self.pending_acks.remove(&received_hash);
+                    }
+                }
 
                 self.handle_routed(routed, now);
             }
@@ -819,9 +829,9 @@ where
 
     /// Clean up old entries from recently_forwarded.
     pub(crate) fn cleanup_recently_forwarded(&mut self, now: Timestamp) {
-        let ttl = self.tau() * RECENTLY_FORWARDED_TTL_MULTIPLIER;
+        let expiry = self.tau() * RECENTLY_FORWARDED_TTL_MULTIPLIER;
         self.recently_forwarded
-            .retain(|_, &mut timestamp| now.saturating_sub(timestamp) < ttl);
+            .retain(|_, &mut (timestamp, _)| now.saturating_sub(timestamp) < expiry);
     }
 
     /// Calculate retry backoff duration with exponential growth and jitter.
@@ -1304,6 +1314,7 @@ where
         &mut self,
         hash: AckHash,
         original_bytes: Vec<u8>,
+        sent_ttl: u8,
         now: Timestamp,
     ) {
         if self.pending_acks.len() >= Cfg::MAX_PENDING_ACKS
@@ -1316,6 +1327,7 @@ where
             original_bytes,
             retries: 0,
             next_retry_at: now + self.tau(),
+            sent_ttl,
         };
         self.pending_acks.insert(hash, pending);
     }
@@ -1323,13 +1335,14 @@ where
     /// Insert a recently forwarded entry with bounded eviction.
     ///
     /// Evicts the oldest entry by timestamp when at capacity.
-    pub(crate) fn insert_recently_forwarded(&mut self, hash: AckHash, now: Timestamp) {
+    /// Stores both timestamp and TTL to distinguish retransmissions from alternate paths.
+    pub(crate) fn insert_recently_forwarded(&mut self, hash: AckHash, ttl: u8, now: Timestamp) {
         if self.recently_forwarded.len() >= Cfg::MAX_RECENTLY_FORWARDED
             && !self.recently_forwarded.contains_key(&hash)
         {
-            Self::evict_oldest_ack_by(&mut self.recently_forwarded, |&ts| ts);
+            Self::evict_oldest_ack_by(&mut self.recently_forwarded, |&(ts, _)| ts);
         }
-        self.recently_forwarded.insert(hash, now);
+        self.recently_forwarded.insert(hash, (now, ttl));
     }
 
     // =========================================================================

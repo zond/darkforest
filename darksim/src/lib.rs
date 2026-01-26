@@ -1663,13 +1663,9 @@ mod tests {
     /// This is a scale test that verifies the protocol converges correctly
     /// with a larger network and incremental node joins (more realistic).
     ///
-    /// IGNORED by default because it takes a while to run.
-    /// Run explicitly with: cargo test -p darksim test_100_nodes -- --ignored --nocapture
-    ///
     /// NOTE: This test discovered a tree_size over-counting bug during rapid merges.
     /// See TODO in test body.
     #[test]
-    #[ignore]
     fn test_100_nodes_converge() {
         use crate::topology::Link;
 

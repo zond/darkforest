@@ -23,7 +23,7 @@
 //! ## Routed Wire Format
 //!
 //! ```text
-//! flags_and_type (1) || dest_addr (4) || [dest_hash (4)] || [src_addr (4)]
+//! flags_and_type (1) || next_hop (4) || dest_addr (4) || [dest_hash (4)] || [src_addr (4)]
 //! || src_node_id (16) || [src_pubkey (32)] || ttl (1)
 //! || payload_len (varint) || payload || signature (65)
 //!
@@ -33,6 +33,8 @@
 //! - bit 5: has_src_addr
 //! - bit 6: has_src_pubkey
 //! - bit 7: reserved
+//!
+//! next_hop: 4-byte truncated hash of intended forwarder (prevents amplification)
 //! ```
 
 use alloc::vec::Vec;
@@ -542,6 +544,7 @@ impl Decode for Pulse {
 impl Encode for Routed {
     fn encode(&self, w: &mut Writer) {
         w.write_u8(self.flags_and_type);
+        w.write_child_hash(&self.next_hop);
         w.write_u32_be(self.dest_addr);
 
         // dest_hash (conditional on flag)
@@ -595,6 +598,7 @@ impl Decode for Routed {
             return Err(DecodeError::InvalidMessageType);
         }
 
+        let next_hop = r.read_child_hash()?;
         let dest_addr = r.read_u32_be()?;
 
         // dest_hash (conditional on flag)
@@ -626,6 +630,7 @@ impl Decode for Routed {
 
         Ok(Routed {
             flags_and_type,
+            next_hop,
             dest_addr,
             dest_hash,
             src_addr,
@@ -755,7 +760,10 @@ pub(crate) fn pulse_sign_data(pulse: &Pulse) -> Writer {
     w
 }
 
-/// Build the data to be signed for a Routed message (excludes ttl).
+/// Build the data to be signed for a Routed message (excludes ttl and next_hop).
+///
+/// next_hop is excluded because it changes at each hop as forwarders set it.
+/// ttl is excluded because it decrements at each hop.
 pub(crate) fn routed_sign_data(routed: &Routed) -> Writer {
     let mut w = Writer::new();
     w.write_bytes(crate::types::DOMAIN_ROUTE);
@@ -885,6 +893,7 @@ mod tests {
     fn test_routed_roundtrip() {
         let routed = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, true, true, false),
+            next_hop: [0x11, 0x22, 0x33, 0x44],
             dest_addr: 0x1234_5678,
             dest_hash: Some([0xAB, 0xCD, 0xEF, 0x01]),
             src_addr: Some(0x8765_4321),
@@ -902,6 +911,7 @@ mod tests {
         let decoded = Routed::decode_from_slice(&encoded).unwrap();
 
         assert_eq!(routed.flags_and_type, decoded.flags_and_type);
+        assert_eq!(routed.next_hop, decoded.next_hop);
         assert_eq!(routed.dest_addr, decoded.dest_addr);
         assert_eq!(routed.dest_hash, decoded.dest_hash);
         assert_eq!(routed.src_addr, decoded.src_addr);
@@ -916,6 +926,7 @@ mod tests {
     fn test_routed_minimal() {
         let routed = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_PUBLISH, false, false, false),
+            next_hop: [0u8; 4],
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: None,
@@ -940,6 +951,7 @@ mod tests {
     fn test_routed_with_src_pubkey() {
         let routed = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, true),
+            next_hop: [0u8; 4],
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
@@ -1240,6 +1252,7 @@ mod tests {
             let has_src_addr: bool = u.arbitrary()?;
             let has_src_pubkey: bool = u.arbitrary()?;
 
+            let next_hop: [u8; 4] = u.arbitrary()?;
             let dest_addr: u32 = u.arbitrary()?;
             let dest_hash: Option<[u8; 4]> = if has_dest_hash {
                 Some(u.arbitrary()?)
@@ -1273,6 +1286,7 @@ mod tests {
                     has_src_addr,
                     has_src_pubkey,
                 ),
+                next_hop,
                 dest_addr,
                 dest_hash,
                 src_addr,
@@ -1288,6 +1302,7 @@ mod tests {
 
             let encoded = routed.encode_to_vec();
             let decoded = Routed::decode_from_slice(&encoded).expect("valid routed should decode");
+            assert_eq!(routed.next_hop, decoded.next_hop);
             assert_eq!(routed.dest_addr, decoded.dest_addr);
             assert_eq!(routed.src_node_id, decoded.src_node_id);
             assert_eq!(routed.ttl, decoded.ttl);

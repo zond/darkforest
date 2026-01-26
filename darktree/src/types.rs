@@ -10,9 +10,9 @@ use crate::time::{Duration, Timestamp};
 pub(crate) const MAX_TREE_DEPTH: usize = 127; // TTL 255 / 2 for round-trip
 pub const MAX_CHILDREN: usize = 12; // Guarantees worst-case Pulse fits in 252 bytes
 pub const MAX_PACKET_SIZE: usize = 255;
-/// Recently forwarded entries expire after 300τ to allow for slow multi-hop ACKs.
-/// On LoRa (τ=6.7s) this is ~33 minutes; on UDP (τ=100ms) this is 30 seconds.
-pub(crate) const RECENTLY_FORWARDED_TTL_MULTIPLIER: u64 = 300;
+/// Recently forwarded entries expire after 320τ to allow for slow multi-hop ACKs.
+/// On LoRa (τ=6.7s) this is ~35 minutes; on UDP (τ=100ms) this is 32 seconds.
+pub(crate) const RECENTLY_FORWARDED_TTL_MULTIPLIER: u64 = 320;
 
 // Protocol constants
 pub const K_REPLICAS: usize = 3;
@@ -213,6 +213,8 @@ pub(crate) const ROUTED_FLAG_HAS_SRC_PUBKEY: u8 = 0x40;
 pub struct Routed {
     /// Combined flags and message type byte.
     pub flags_and_type: u8,
+    /// Truncated hash of intended next-hop forwarder (prevents amplification attacks).
+    pub next_hop: ChildHash,
     /// Destination keyspace address (u32).
     pub dest_addr: u32,
     /// Optional 4-byte hash of recipient for verification.
@@ -277,6 +279,7 @@ impl Default for Routed {
     fn default() -> Self {
         Self {
             flags_and_type: 0,
+            next_hop: [0u8; 4],
             dest_addr: 0,
             dest_hash: None,
             src_addr: None,

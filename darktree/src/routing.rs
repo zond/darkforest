@@ -31,6 +31,9 @@ where
             return;
         }
 
+        // Store original TTL before decrementing (for duplicate detection)
+        let original_ttl = msg.ttl;
+
         // Decrement TTL for forwarding
         msg.ttl = msg.ttl.saturating_sub(1);
 
@@ -50,6 +53,13 @@ where
             return;
         }
 
+        // Am I the intended forwarder? If not, ignore silently.
+        // This prevents amplification attacks where multiple nodes forward the same message.
+        let my_hash = self.compute_node_hash(self.node_id());
+        if msg.next_hop != my_hash {
+            return;
+        }
+
         // Not for us - verify signature before forwarding to prevent bandwidth waste
         if self.verify_routed_signature(&msg, now).is_none() {
             // Can't verify signature (no pubkey or invalid) - drop
@@ -60,14 +70,18 @@ where
         // Note: hash excludes TTL so it's the same at any hop
         let msg_hash = self.compute_ack_hash(&msg);
 
-        if self.recently_forwarded().contains_key(&msg_hash) {
-            // Duplicate - sender is waiting, send explicit ACK instead of re-forwarding
-            self.send_explicit_ack(msg_hash);
+        if let Some(&(_, stored_ttl)) = self.recently_forwarded().get(&msg_hash) {
+            if stored_ttl == original_ttl {
+                // Same TTL = retransmission from sender who didn't hear our forward
+                // Send explicit ACK to confirm we received and forwarded it
+                self.send_explicit_ack(msg_hash);
+            }
+            // Different TTL = same message via alternate path, ignore silently
             return;
         }
 
-        // Not a duplicate - forward and track
-        self.insert_recently_forwarded(msg_hash, now);
+        // Not a duplicate - forward and track with TTL
+        self.insert_recently_forwarded(msg_hash, original_ttl, now);
         self.forward_routed(msg, now);
     }
 
@@ -156,15 +170,18 @@ where
     }
 
     /// Forward a routed message toward its destination.
-    fn forward_routed(&mut self, msg: Routed, now: Timestamp) {
+    fn forward_routed(&mut self, mut msg: Routed, now: Timestamp) {
         let dest = msg.dest_addr;
 
         // Try to find best next hop
-        if let Some(next_hop) = self.best_next_hop(dest) {
-            self.send_to_neighbor(next_hop, msg, now);
-        } else if let Some(parent) = self.parent() {
+        if let Some(next_hop_id) = self.best_next_hop(dest) {
+            // Set next_hop to the intended forwarder's hash
+            msg.next_hop = self.compute_node_hash(&next_hop_id);
+            self.send_to_neighbor(next_hop_id, msg, now);
+        } else if let Some(parent_id) = self.parent() {
             // Forward upward to parent as fallback
-            self.send_to_neighbor(parent, msg, now);
+            msg.next_hop = self.compute_node_hash(&parent_id);
+            self.send_to_neighbor(parent_id, msg, now);
         }
         // If no route, drop the message
     }
@@ -208,6 +225,7 @@ where
     ///
     /// Inserts the message hash into pending_acks for retransmission if no ACK is received.
     fn send_to_neighbor(&mut self, _neighbor: NodeId, msg: Routed, now: Timestamp) {
+        let sent_ttl = msg.ttl;
         let encoded = crate::wire::Message::Routed(msg.clone()).encode_to_vec();
 
         if encoded.len() > self.transport().mtu() {
@@ -218,8 +236,8 @@ where
         // Compute ACK hash for tracking (uses routed_sign_data which excludes TTL)
         let ack_hash = self.compute_ack_hash(&msg);
 
-        // Track pending ACK before sending
-        self.insert_pending_ack(ack_hash, encoded.clone(), now);
+        // Track pending ACK before sending (with TTL for implicit ACK verification)
+        self.insert_pending_ack(ack_hash, encoded.clone(), sent_ttl, now);
 
         // Broadcast on protocol channel (neighbors will hear it)
         let result = self.transport().protocol_outgoing().try_send(encoded);
@@ -311,8 +329,19 @@ where
             include_pubkey,
         );
 
+        // Compute initial next_hop based on routing decision
+        let next_hop = if let Some(next_hop_id) = self.best_next_hop(dest_addr) {
+            self.compute_node_hash(&next_hop_id)
+        } else if let Some(parent_id) = self.parent() {
+            self.compute_node_hash(&parent_id)
+        } else {
+            // No route - use zeros (message may be handled locally or dropped)
+            [0u8; 4]
+        };
+
         let mut msg = Routed {
             flags_and_type,
+            next_hop,
             dest_addr,
             dest_hash,
             src_addr: Some(self.my_address()),
@@ -655,6 +684,7 @@ mod tests {
 
         let msg1 = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            next_hop: [0u8; 4],
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
@@ -684,6 +714,7 @@ mod tests {
 
         let msg1 = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            next_hop: [0u8; 4],
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
@@ -718,6 +749,7 @@ mod tests {
         // Create a message and compute its hash
         let msg = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            next_hop: [0u8; 4],
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
@@ -730,8 +762,8 @@ mod tests {
 
         let hash = node.compute_ack_hash(&msg);
 
-        // Manually insert a pending ACK
-        node.insert_pending_ack(hash, vec![1, 2, 3], now);
+        // Manually insert a pending ACK (sent_ttl = 255)
+        node.insert_pending_ack(hash, vec![1, 2, 3], 255, now);
         assert!(node.pending_acks().contains_key(&hash));
 
         // Simulate receiving the message (which should clear pending ACK via implicit ACK)
@@ -761,6 +793,7 @@ mod tests {
 
         let msg = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            next_hop: [0u8; 4],
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
@@ -776,8 +809,8 @@ mod tests {
         // Initially not tracked
         assert!(!node.recently_forwarded().contains_key(&hash));
 
-        // Insert into recently_forwarded
-        node.insert_recently_forwarded(hash, now);
+        // Insert into recently_forwarded (with TTL)
+        node.insert_recently_forwarded(hash, 255, now);
 
         // Should now be tracked
         assert!(node.recently_forwarded().contains_key(&hash));
@@ -859,9 +892,9 @@ mod tests {
         let hash1: [u8; 8] = [1; 8];
         let hash2: [u8; 8] = [2; 8];
 
-        // Insert two entries at different times
-        node.insert_recently_forwarded(hash1, now);
-        node.insert_recently_forwarded(hash2, now + Duration::from_secs(10));
+        // Insert two entries at different times (with dummy TTL values)
+        node.insert_recently_forwarded(hash1, 255, now);
+        node.insert_recently_forwarded(hash2, 255, now + Duration::from_secs(10));
 
         // Both should exist
         assert!(node.recently_forwarded().contains_key(&hash1));
@@ -892,14 +925,14 @@ mod tests {
         // Fill pending_acks to capacity (using DefaultConfig)
         for i in 0..DefaultConfig::MAX_PENDING_ACKS {
             let hash: [u8; 8] = [i as u8; 8];
-            node.insert_pending_ack(hash, vec![i as u8], now);
+            node.insert_pending_ack(hash, vec![i as u8], 255, now);
         }
 
         assert_eq!(node.pending_acks().len(), DefaultConfig::MAX_PENDING_ACKS);
 
         // Insert one more - should evict oldest
         let new_hash: [u8; 8] = [0xFF; 8];
-        node.insert_pending_ack(new_hash, vec![0xFF], now);
+        node.insert_pending_ack(new_hash, vec![0xFF], 255, now);
 
         // Should still be at capacity (not exceed)
         assert_eq!(
@@ -925,7 +958,7 @@ mod tests {
             let mut hash: [u8; 8] = [0; 8];
             hash[0] = (i >> 8) as u8;
             hash[1] = (i & 0xFF) as u8;
-            node.insert_recently_forwarded(hash, now);
+            node.insert_recently_forwarded(hash, 255, now);
         }
 
         assert_eq!(
@@ -935,7 +968,7 @@ mod tests {
 
         // Insert one more - should evict oldest
         let new_hash: [u8; 8] = [0xFF; 8];
-        node.insert_recently_forwarded(new_hash, now);
+        node.insert_recently_forwarded(new_hash, 255, now);
 
         // Should still be at capacity (not exceed)
         assert_eq!(
@@ -958,6 +991,7 @@ mod tests {
 
         let msg = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            next_hop: [0u8; 4],
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
@@ -971,7 +1005,7 @@ mod tests {
         let hash = node.compute_ack_hash(&msg);
 
         // Mark as recently forwarded (simulating first forward)
-        node.insert_recently_forwarded(hash, now);
+        node.insert_recently_forwarded(hash, 255, now);
 
         // Clear any messages in transport
         node.transport().take_sent();
@@ -997,7 +1031,7 @@ mod tests {
         // Fill to capacity
         for i in 0..SmallConfig::MAX_PENDING_ACKS {
             let hash: [u8; 8] = [i as u8; 8];
-            node.insert_pending_ack(hash, vec![i as u8], now);
+            node.insert_pending_ack(hash, vec![i as u8], 255, now);
         }
 
         assert_eq!(
@@ -1008,7 +1042,7 @@ mod tests {
 
         // Insert one more - should evict oldest
         let new_hash: [u8; 8] = [0xFF; 8];
-        node.insert_pending_ack(new_hash, vec![0xFF], now);
+        node.insert_pending_ack(new_hash, vec![0xFF], 255, now);
 
         // Should still be at SmallConfig capacity
         assert_eq!(

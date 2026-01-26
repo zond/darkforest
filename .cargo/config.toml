@@ -1,5 +1,0 @@
-[alias]
-# Run all tests including doc tests (doc tests need test-support feature)
-test-all = "test --all --features test-support"
-# Run slow/ignored tests
-test-slow = "test --all --features test-support -- --ignored"
