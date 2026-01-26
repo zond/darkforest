@@ -1677,6 +1677,8 @@ struct Ack {
 - **Same TTL**: Direct retransmission from the immediate sender who didn't hear our forward → send ACK
 - **Different TTL**: Same message arrived via a different path (loop or alternate route) → ignore silently (don't forward again, don't send ACK to the wrong node)
 
+**TTL=1 behavior:** When a message arrives with TTL=1, the forwarder cannot continue routing (TTL=0 means expired). If `dest_addr` is within the forwarder's keyspace, the message is delivered locally. Otherwise, the message expires silently — the sender will retry and eventually give up. Senders should use sufficient TTL for the expected hop count (DEFAULT_TTL=255 provides ample headroom).
+
 **Example flow (success):**
 ```
 A sends:     TTL=50, next_hop=hash(B), payload=P
@@ -1757,11 +1759,11 @@ const MAX_PENDING_ACKS: usize = 32;          // messages awaiting ACK
 const MAX_RECENTLY_FORWARDED: usize = 256;   // for duplicate detection
 const ACK_HASH_SIZE: usize = 8;              // truncated hash bytes
 
-// RECENTLY_FORWARDED_TTL = 300τ (must exceed worst-case retry sequence of ~280τ with jitter)
-// For LoRa (τ=6.7s): ~33 minutes
-// For UDP (τ=0.1s): ~30 seconds
+// RECENTLY_FORWARDED_TTL = 320τ (must exceed worst-case retry sequence of ~280τ with jitter)
+// For LoRa (τ=6.7s): ~36 minutes
+// For UDP (τ=0.1s): ~32 seconds
 fn recently_forwarded_ttl(&self) -> Duration {
-    self.tau() * 300
+    self.tau() * 320
 }
 ```
 
@@ -1772,13 +1774,27 @@ fn recently_forwarded_ttl(&self) -> Duration {
 - Total: ~4.5KB metadata + up to 8KB message storage
 
 **Why these values:**
-- `RECENTLY_FORWARDED_TTL = 300τ`: Must exceed worst-case retry sequence (~280τ with jitter). Provides ~7% margin.
+- `RECENTLY_FORWARDED_TTL = 320τ`: Must exceed worst-case retry sequence (~280τ with jitter). Provides ~14% margin.
 - `MAX_RECENTLY_FORWARDED = 256`: Forwarding rate scales inversely with τ (slow links forward slowly), so the product (TTL × rate) stays roughly constant. For LoRa at 33 min TTL but ~0.05 msg/s: ~99 entries needed. For UDP at 30s TTL but ~0.5 msg/s: ~15 entries needed. 256 provides headroom for both.
 - `MAX_PENDING_ACKS = 32`: Limits concurrent outbound messages awaiting ACK. With worst-case ~280τ per message, throughput floor is ~32/280τ messages per τ under heavy loss.
 
 When collections are full, oldest entries are evicted (LRU). This may cause:
 - Evicted pending_ack: give up on that message (application can retry)
 - Evicted recently_forwarded: may forward a duplicate (harmless, just wasteful)
+
+### Hash Collision Tolerance
+
+The 8-byte (64-bit) `ack_hash` provides acceptable collision resistance for the expected message rates:
+
+- **Birthday bound:** Collisions become likely after ~2^32 (~4 billion) messages.
+- **Per-entry collision probability:** With 256 `recently_forwarded` entries, probability of a collision with any existing entry is ~256/2^64 ≈ 1 in 10^16.
+- **Practical impact:** For LoRa networks with ~0.05 msg/s throughput, reaching 2^32 messages would take ~2700 years.
+
+If a collision does occur:
+- A message might be incorrectly identified as a duplicate and not forwarded.
+- Or an ACK might satisfy the wrong pending message.
+
+Both cases result in a single message loss, which is acceptable given the design's explicit non-goal of exactly-once delivery.
 
 ### Why This Works
 
