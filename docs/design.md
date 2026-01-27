@@ -79,6 +79,7 @@ These constants define protocol limits and memory bounds. Implementations MUST r
 | MAX_BACKUPS_PER_NEIGHBOR | 64 | 16 | Per-neighbor backup limit |
 | MAX_PENDING_ACKS | 32 | 16 | Messages awaiting ACK |
 | MAX_RECENTLY_FORWARDED | 256 | 64 | Duplicate detection |
+| MAX_DELAYED_FORWARDS | 32 | 16 | Bounce-back dampening queue |
 | MAX_PENDING_LOOKUPS | 16 | 8 | Concurrent DHT lookups |
 | MAX_DISTRUSTED | 64 | 16 | Fraud detection blacklist |
 | HLL_REGISTERS | 256 | 64 | HyperLogLog registers |
@@ -1494,13 +1495,13 @@ When B receives a duplicate retransmission (same `ack_hash` AND same TTL), B kno
 1. B receives `Routed` with TTL=X, next_hop=hash(B) from A
 2. B verifies next_hop matches hash(B.node_id) — if not, ignore (not the intended forwarder)
 3. B computes `ack_hash(msg)` and checks recently_forwarded set:
-   - If hash NOT in set → new message: store (hash, TTL), forward with TTL-1
+   - If hash NOT in set → new message: store (hash, TTL, seen_count=1), forward with TTL-1
    - If hash in set AND TTL matches stored TTL → retransmission: send ACK(ack_hash)
-   - If hash in set AND TTL differs → same message via different path: ignore silently
+   - If hash in set AND TTL differs → bounce-back: apply dampening (see "Bounce-Back Dampening")
 
 **Why store TTL alongside hash:** The hash identifies the "logical message" (excludes TTL). But we need the TTL to distinguish:
 - **Same TTL**: Direct retransmission from the immediate sender who didn't hear our forward → send ACK
-- **Different TTL**: Same message arrived via a different path (loop or alternate route) → ignore silently (don't forward again, don't send ACK to the wrong node)
+- **Different TTL**: Message bounced back through tree during restructuring → apply bounce-back dampening
 
 **TTL=1 behavior:** When a message arrives with TTL=1, the forwarder cannot continue routing (TTL=0 means expired). If `dest_addr` is within the forwarder's keyspace, the message is delivered locally. Otherwise, the message expires silently — the sender will retry and eventually give up. Senders should use sufficient TTL for the expected hop count (DEFAULT_TTL=255 provides ample headroom).
 
@@ -1579,17 +1580,21 @@ fn recently_forwarded_ttl(&self) -> Duration {
 **Memory usage:**
 - `pending_acks`: 32 entries × ~16 bytes (hash + metadata) = ~512 bytes
   - Plus original messages for retransmission (bounded by MTU × 32 ≈ 8KB worst case)
-- `recently_forwarded`: 256 entries × ~16 bytes (hash + timestamp) = ~4KB
-- Total: ~4.5KB metadata + up to 8KB message storage
+- `recently_forwarded`: 256 entries × ~17 bytes (hash + timestamp + seen_count) = ~4.3KB
+- `delayed_forwards`: 32 entries × ~13 bytes (hash + seen_count + timestamp) = ~416 bytes
+  - Plus messages awaiting forward (bounded by MTU × 32 ≈ 8KB worst case)
+- Total: ~5.2KB metadata + up to 16KB message storage
 
 **Why these values:**
 - `RECENTLY_FORWARDED_TTL = 320τ`: Must exceed worst-case retry sequence (~280τ with jitter). Provides ~14% margin.
 - `MAX_RECENTLY_FORWARDED = 256`: Forwarding rate scales inversely with τ (slow links forward slowly), so the product (TTL × rate) stays roughly constant. For LoRa at 33 min TTL but ~0.05 msg/s: ~99 entries needed. For UDP at 30s TTL but ~0.5 msg/s: ~15 entries needed. 256 provides headroom for both.
 - `MAX_PENDING_ACKS = 32`: Limits concurrent outbound messages awaiting ACK. With worst-case ~280τ per message, throughput floor is ~32/280τ messages per τ under heavy loss.
+- `MAX_DELAYED_FORWARDS = 32`: Limits queued bounce-back messages during tree churn. Matches pending_acks since both hold messages awaiting transmission.
 
-When collections are full, oldest entries are evicted (LRU). This may cause:
-- Evicted pending_ack: give up on that message (application can retry)
-- Evicted recently_forwarded: may forward a duplicate (harmless, just wasteful)
+When collections are full, entries are evicted:
+- Evicted pending_ack (LRU): give up on that message (application can retry)
+- Evicted recently_forwarded (LRU): may forward a duplicate (harmless, just wasteful)
+- Evicted delayed_forward (longest delay): drop message most likely to exceed TTL anyway
 
 ### Hash Collision Tolerance
 
@@ -1629,6 +1634,67 @@ When retransmissions fail repeatedly (e.g., MAX_RETRIES reached), the sender sho
 2. **Parent used:** This indicates potential partition. The node should start monitoring parent liveness more aggressively.
 
 After invalidation, the next send attempt will recompute the route using remaining valid neighbors.
+
+### Bounce-Back Dampening
+
+During tree restructuring (nodes joining, leaving, or rebalancing keyspace), messages may bounce between nodes. For example: A forwards to B, but B's keyspace changed, so B routes back up, and the message eventually returns to A. Without intervention, the message bounces until TTL expires, wasting bandwidth.
+
+**Detection:** When a node receives a message with `next_hop` matching itself and `ack_hash` already in `recently_forwarded` but with a **different TTL**, the message has bounced back through the tree.
+
+**TTL=1 special case:** If the bounced message has TTL=1, drop it immediately after sending ACK. Forwarding would produce TTL=0 (expired), so there's no point scheduling a delayed forward.
+
+**Response:** When bounce-back is detected (and TTL > 1):
+
+1. **ACK upstream:** Send explicit ACK so they don't waste retries while we delay
+2. **Clear own pending_ack:** If we have a pending_ack entry for this hash, remove it (the bounce proves downstream heard us)
+3. **Increment seen_count and refresh entry:** Update the recently_forwarded entry and reset its expiration
+4. **Schedule delayed forward:** Queue the message with exponential backoff
+
+```rust
+fn handle_bounce_back(&mut self, msg: Routed, ack_hash: [u8; 4]) {
+    // Always ACK upstream so they don't retry while we delay (or drop)
+    self.send_ack(ack_hash);
+
+    // TTL=1 would become TTL=0 (expired) on forward - just drop it
+    if msg.ttl <= 1 {
+        return;
+    }
+
+    // Clear our own pending_ack if present (bounce proves downstream heard us)
+    self.pending_acks.remove(&ack_hash);
+
+    // Update recently_forwarded entry
+    let entry = self.recently_forwarded.get_mut(&ack_hash).unwrap();
+    entry.seen_count += 1;
+    entry.expires_at = now() + self.recently_forwarded_ttl();  // Refresh expiration
+
+    // Schedule delayed forward with exponential backoff
+    // Backoff: 1τ, 2τ, 4τ, 8τ, ..., capped at 128τ
+    let delay = self.tau() * (1 << min(entry.seen_count - 1, 7));
+    self.schedule_delayed_forward(msg, ack_hash, entry.seen_count, delay);
+}
+```
+
+**Why this helps:**
+- ACK prevents upstream retry storms during long delays
+- Gives the tree time to stabilize during churn
+- Prevents bandwidth waste from rapid bouncing
+- Message eventually delivers once tree settles
+- Graceful degradation: worst case is 128τ delay per bounce, not message loss
+
+**TTL handling:** The delayed forward uses `msg.ttl - 1`, same as any forward. TTL decrement provides natural termination — a message can only bounce as many times as it has TTL remaining.
+
+**Entry refresh:** The `recently_forwarded` entry's expiration is reset to `now() + 320τ` on each bounce. This ensures the entry (and its `seen_count`) survives until the delayed forward fires, even for long delays like 128τ.
+
+**Delayed forward queue:**
+- Bounded by `MAX_DELAYED_FORWARDS` (32 entries)
+- Each entry stores: message, ack_hash, seen_count, scheduled time
+- **seen_count storage:** The entry stores its own `seen_count` so backoff state survives even if the `recently_forwarded` entry is evicted under LRU pressure
+- **Deduplication:** At most one delayed forward per `ack_hash`. If a new bounce arrives for a hash already in the queue, double the remaining delay (exponential backoff continues — the first delay wasn't enough)
+- **Eviction:** When full, drop the entry with the longest remaining delay (most likely to exceed TTL anyway)
+- When the delay fires, forward with `msg.ttl - 1` and recompute `next_hop` based on current routing table
+
+**Interaction with duplicate detection:** Duplicate detection (same hash AND same TTL) triggers an explicit ACK without forwarding. Bounce-back (same hash, different TTL) triggers delayed forwarding. The TTL comparison distinguishes these cases.
 
 ### What This Doesn't Provide
 
