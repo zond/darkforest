@@ -52,6 +52,7 @@
 //!     const MAX_PENDING_PUBKEY_NODES: usize = 4;
 //!     const MAX_PENDING_ACKS: usize = 8;
 //!     const MAX_RECENTLY_FORWARDED: usize = 32;
+//!     const MAX_BACKUP_STORE: usize = 64;
 //! }
 //! let node = Node::<_, _, _, _, MyConfig>::new(
 //!     MockTransport::new(), FastTestCrypto::new(0), MockRandom::new(), MockClock::new()
@@ -98,6 +99,10 @@ pub trait NodeConfig {
 
     /// Maximum recently forwarded hashes for duplicate detection.
     const MAX_RECENTLY_FORWARDED: usize;
+
+    /// Maximum DHT backup entries stored for broadcast backup recovery.
+    /// Typically 2× MAX_LOCATION_STORE (backup entries from ~2 neighbors on average).
+    const MAX_BACKUP_STORE: usize;
 }
 
 /// Default configuration for 256KB+ RAM devices.
@@ -119,6 +124,7 @@ impl NodeConfig for DefaultConfig {
     const MAX_PENDING_PUBKEY_NODES: usize = 16;
     const MAX_PENDING_ACKS: usize = 32;
     const MAX_RECENTLY_FORWARDED: usize = 256;
+    const MAX_BACKUP_STORE: usize = 512;
 }
 
 /// Small configuration for 64KB RAM devices.
@@ -141,6 +147,7 @@ impl NodeConfig for SmallConfig {
     const MAX_PENDING_PUBKEY_NODES: usize = 4;
     const MAX_PENDING_ACKS: usize = 8;
     const MAX_RECENTLY_FORWARDED: usize = 32;
+    const MAX_BACKUP_STORE: usize = 64;
 }
 
 #[cfg(test)]
@@ -161,6 +168,7 @@ mod tests {
         assert_eq!(DefaultConfig::MAX_PENDING_PUBKEY_NODES, 16);
         assert_eq!(DefaultConfig::MAX_PENDING_ACKS, 32);
         assert_eq!(DefaultConfig::MAX_RECENTLY_FORWARDED, 256);
+        assert_eq!(DefaultConfig::MAX_BACKUP_STORE, 512);
     }
 
     #[test]
@@ -177,6 +185,7 @@ mod tests {
         assert_eq!(SmallConfig::MAX_PENDING_PUBKEY_NODES, 4);
         assert_eq!(SmallConfig::MAX_PENDING_ACKS, 8);
         assert_eq!(SmallConfig::MAX_RECENTLY_FORWARDED, 32);
+        assert_eq!(SmallConfig::MAX_BACKUP_STORE, 64);
     }
 
     #[test]
@@ -196,6 +205,7 @@ mod tests {
         assert!(SmallConfig::MAX_PENDING_PUBKEY_NODES < DefaultConfig::MAX_PENDING_PUBKEY_NODES);
         assert!(SmallConfig::MAX_PENDING_ACKS < DefaultConfig::MAX_PENDING_ACKS);
         assert!(SmallConfig::MAX_RECENTLY_FORWARDED < DefaultConfig::MAX_RECENTLY_FORWARDED);
+        assert!(SmallConfig::MAX_BACKUP_STORE < DefaultConfig::MAX_BACKUP_STORE);
     }
 
     #[test]
@@ -214,6 +224,7 @@ mod tests {
         assert!(DefaultConfig::MAX_PENDING_PUBKEY_NODES > 0);
         assert!(DefaultConfig::MAX_PENDING_ACKS > 0);
         assert!(DefaultConfig::MAX_RECENTLY_FORWARDED > 0);
+        assert!(DefaultConfig::MAX_BACKUP_STORE > 0);
 
         // SmallConfig
         assert!(SmallConfig::MAX_NEIGHBORS > 0);
@@ -228,5 +239,6 @@ mod tests {
         assert!(SmallConfig::MAX_PENDING_PUBKEY_NODES > 0);
         assert!(SmallConfig::MAX_PENDING_ACKS > 0);
         assert!(SmallConfig::MAX_RECENTLY_FORWARDED > 0);
+        assert!(SmallConfig::MAX_BACKUP_STORE > 0);
     }
 }
