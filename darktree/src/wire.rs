@@ -24,8 +24,7 @@
 //!
 //! ```text
 //! flags_and_type (1) || next_hop (4) || dest_addr (4) || [dest_hash (4)] || [src_addr (4)]
-//! || src_node_id (16) || [src_pubkey (32)] || ttl (1)
-//! || payload_len (varint) || payload || signature (65)
+//! || src_node_id (16) || [src_pubkey (32)] || ttl (1) || payload || signature (65)
 //!
 //! flags_and_type byte:
 //! - bits 0-3: msg_type
@@ -35,6 +34,7 @@
 //! - bit 7: reserved
 //!
 //! next_hop: 4-byte truncated hash of intended forwarder (prevents amplification)
+//! payload_length: implicit (message_length - fixed_fields - optional_fields - 65)
 //! ```
 
 use alloc::vec::Vec;
@@ -405,6 +405,9 @@ const WIRE_VERSION: u8 = 0;
 const WIRE_VERSION_SHIFT: u8 = 3;
 const WIRE_TYPE_MASK: u8 = 0x07;
 
+/// Signature size: 1 byte algorithm + 64 bytes Ed25519 signature
+const SIGNATURE_SIZE: usize = 65;
+
 // Message type discriminators for the wire format
 #[allow(dead_code)] // Documenting the wire format; type 0 is reserved
 const WIRE_TYPE_RESERVED: u8 = 0x00;
@@ -593,7 +596,8 @@ impl Encode for Routed {
         }
 
         w.write_u8(self.ttl);
-        w.write_len_prefixed(&self.payload);
+        // Payload length is implicit (remaining bytes before signature)
+        w.write_bytes(&self.payload);
         w.write_signature(&self.signature);
     }
 }
@@ -641,7 +645,14 @@ impl Decode for Routed {
         };
 
         let ttl = r.read_u8()?;
-        let payload = r.read_len_prefixed()?.to_vec();
+
+        // Payload length is implicit: remaining bytes minus signature (65 bytes)
+        let payload_len = r
+            .remaining()
+            .checked_sub(SIGNATURE_SIZE)
+            .ok_or(DecodeError::UnexpectedEof)?;
+        let payload = r.read_bytes(payload_len)?.to_vec();
+
         let signature = r.read_signature()?;
 
         Ok(Routed {
@@ -687,7 +698,8 @@ impl Encode for Broadcast {
         for dest in &self.destinations {
             w.write_child_hash(dest);
         }
-        w.write_len_prefixed(&self.payload);
+        // Payload length is implicit (remaining bytes before signature)
+        w.write_bytes(&self.payload);
         w.write_signature(&self.signature);
     }
 }
@@ -707,7 +719,13 @@ impl Decode for Broadcast {
             destinations.push(r.read_child_hash()?);
         }
 
-        let payload = r.read_len_prefixed()?.to_vec();
+        // Payload length is implicit: remaining bytes minus signature (65 bytes)
+        let payload_len = r
+            .remaining()
+            .checked_sub(SIGNATURE_SIZE)
+            .ok_or(DecodeError::UnexpectedEof)?;
+        let payload = r.read_bytes(payload_len)?.to_vec();
+
         let signature = r.read_signature()?;
 
         Ok(Broadcast {
