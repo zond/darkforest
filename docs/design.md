@@ -2264,27 +2264,30 @@ The first byte of every message encodes both version and type:
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+
-| Type  |  Ver  |
+|  Version  |Typ|
 +-+-+-+-+-+-+-+-+
 
-Byte 0: [type:4][version:4]
-- Upper nibble (bits 7-4): Message type (0-15)
-- Lower nibble (bits 3-0): Protocol version (0-15)
+Byte 0: [version:5][type:3]
+- Upper 5 bits (bits 7-3): Protocol version (0-31)
+- Lower 3 bits (bits 2-0): Message type (0-7)
 
-Current version: 0x00 (version 0)
+Current version: 0 (version 0)
 Message types:
-  0x10 = Pulse
-  0x20 = Routed
-  0x30 = ACK
-  0x40 = Broadcast
+  0 = reserved
+  1 = Pulse     (0x01)
+  2 = Routed    (0x02)
+  3 = ACK       (0x03)
+  4 = Broadcast (0x04)
+  5-7 = reserved
 
-Example: Pulse message = 0x10 (type 1, version 0)
-Future version 1 Pulse = 0x11 (type 1, version 1)
+Example: Pulse message = 0x01 (version 0, type 1)
+Future version 1 Pulse = 0x09 (version 1, type 1) — (1 << 3) | 1
 ```
 
 - Nodes SHOULD ignore messages with unknown versions
 - Version 0 is the initial protocol version
-- 4 bits allows versions 0-15 (ample room for evolution)
+- 5 bits allows versions 0-31 (ample room for evolution)
+- 3 bits allows 8 message types (4 defined, 4 reserved)
 
 ### Pulse Layout
 
@@ -2292,7 +2295,7 @@ Future version 1 Pulse = 0x11 (type 1, version 1)
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| Type=1| Ver=0 |                                               |
+| Ver=0 |Typ=1|                                                 |
 +-+-+-+-+-+-+-+-+                                               +
 |                          node_id (16 bytes)                   |
 +                                               +-+-+-+-+-+-+-+-+
@@ -2330,7 +2333,7 @@ Future version 1 Pulse = 0x11 (type 1, version 1)
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| Type=2| Ver=0 | flags_and_type|                               |
+| Ver=0 |Typ=2| flags_and_type|                                 |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
 |                        next_hop (4 bytes)                     |
 +               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -2364,7 +2367,7 @@ Future version 1 Pulse = 0x11 (type 1, version 1)
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| Type=3| Ver=0 |                  hash (4 bytes)               |
+| Ver=0 |Typ=3|                    hash (4 bytes)               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |   (continued) |             sender_hash (4 bytes)             |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -2380,7 +2383,7 @@ Total: 9 bytes
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| Type=4| Ver=0 |                                               |
+| Ver=0 |Typ=4|                                                 |
 +-+-+-+-+-+-+-+-+                                               +
 |                       src_node_id (16 bytes)                  |
 +                               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -2558,7 +2561,7 @@ The wire format parser rejects messages with any unexpected values, providing ea
 
 | Check | Location | Invalid values rejected |
 |-------|----------|------------------------|
-| Wire type | First byte upper nibble | Type nibble not in {1=Pulse, 2=Routed, 3=ACK, 4=Broadcast} |
+| Wire type | First byte lower 3 bits | Type not in {1=Pulse, 2=Routed, 3=ACK, 4=Broadcast} |
 | Varint canonical | All varints | Non-minimal encodings (e.g., 0x80 0x00 for 0) |
 | Child count | Pulse flags | Values > MAX_CHILDREN (12) |
 | Reserved bit 7 | Routed flags | Must be 0 |
