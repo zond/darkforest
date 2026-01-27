@@ -2,7 +2,17 @@
 //!
 //! A protocol for building mesh networks over LoRa radios with O(log N) routing.
 //!
-//! This crate is `no_std` by default. Enable the `std` feature for std environments.
+//! This crate is `no_std` but **requires the `alloc` crate**. It uses heap-allocated
+//! collections (`Vec`, `HashMap`, `BTreeMap`) with runtime-enforced capacity limits.
+//! See [`PriorityQueue`](traits::PriorityQueue) documentation for rationale.
+//!
+//! # Platform Requirements
+//!
+//! - **RAM**: 256KB minimum, 512KB recommended (ESP32-class devices)
+//! - **Allocator**: Use a real-time allocator like `embedded-alloc` with TLSF, or
+//!   your platform's allocator (e.g., `esp-alloc`). Avoid `linked_list_allocator`
+//!   or `wee_alloc` which handle fragmentation poorly.
+//! - **Embassy**: Compatible with embassy async runtime
 //!
 //! # Key Properties
 //!
@@ -89,6 +99,7 @@ compile_error!(
 
 extern crate alloc;
 
+pub mod children;
 pub mod config;
 #[cfg(feature = "debug")]
 pub mod debug;
@@ -106,10 +117,10 @@ pub mod wire;
 pub use config::{DefaultConfig, NodeConfig, SmallConfig};
 pub use node::Node;
 pub use time::{Duration, Timestamp};
-pub use traits::{Clock, Crypto, IncomingData, OutgoingData, Random, Received, Transport};
+pub use traits::{Ackable, Clock, Crypto, IncomingData, Outgoing, OutgoingData, Random, Transport};
 pub use types::{
-    ChildHash, Error, Event, LocationEntry, NodeId, Payload, PublicKey, Pulse, Routed, SecretKey,
-    Signature,
+    ChildHash, Error, Event, Incoming, LocationEntry, NodeId, Payload, PreEncoded, Priority,
+    PublicKey, Pulse, Routed, SecretKey, Signature,
 };
 pub use wire::{Decode, DecodeError, Encode, Message};
 

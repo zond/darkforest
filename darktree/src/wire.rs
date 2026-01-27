@@ -39,8 +39,10 @@
 
 use alloc::vec::Vec;
 
+use crate::traits::Outgoing;
 use crate::types::{
-    ChildHash, ChildrenList, LocationEntry, Pulse, Routed, Signature, PULSE_CHILD_COUNT_SHIFT,
+    Broadcast, ChildHash, ChildrenList, LocationEntry, Priority, Pulse, Routed, Signature,
+    BCAST_PAYLOAD_BACKUP, MAX_BROADCAST_DESTINATIONS, MSG_DATA, PULSE_CHILD_COUNT_SHIFT,
     PULSE_FLAG_HAS_PARENT, PULSE_FLAG_HAS_PUBKEY, ROUTED_FLAG_HAS_DEST_HASH,
     ROUTED_FLAG_HAS_SRC_ADDR, ROUTED_FLAG_HAS_SRC_PUBKEY,
 };
@@ -58,7 +60,7 @@ pub enum DecodeError {
     InvalidLength,
     /// Invalid signature format.
     InvalidSignature,
-    /// Invalid message type.
+    /// Invalid message type (includes unsupported versions and reserved types).
     InvalidMessageType,
     /// Collection capacity exceeded.
     CapacityExceeded,
@@ -395,13 +397,24 @@ pub trait Decode: Sized {
     }
 }
 
+// Wire format version and type encoding
+// First byte: [version:5][type:3]
+// - Upper 5 bits (bits 7-3): Protocol version (0-31)
+// - Lower 3 bits (bits 2-0): Message type (0-7)
+const WIRE_VERSION: u8 = 0;
+const WIRE_VERSION_SHIFT: u8 = 3;
+const WIRE_TYPE_MASK: u8 = 0x07;
+
 // Message type discriminators for the wire format
+#[allow(dead_code)] // Documenting the wire format; type 0 is reserved
+const WIRE_TYPE_RESERVED: u8 = 0x00;
 const WIRE_TYPE_PULSE: u8 = 0x01;
 const WIRE_TYPE_ROUTED: u8 = 0x02;
 const WIRE_TYPE_ACK: u8 = 0x03;
+pub(crate) const WIRE_TYPE_BROADCAST: u8 = 0x04;
 
 /// Size of ACK hash in bytes.
-pub(crate) const ACK_HASH_SIZE: usize = 8;
+pub(crate) const ACK_HASH_SIZE: usize = 4;
 
 /// Explicit ACK message for link-layer reliability.
 ///
@@ -413,6 +426,8 @@ pub(crate) const ACK_HASH_SIZE: usize = 8;
 pub struct Ack {
     /// Truncated hash of the message being acknowledged (the forwarded version with TTL-1).
     pub hash: [u8; ACK_HASH_SIZE],
+    /// Truncated hash of the sender's node_id (identifies which neighbor sent the ACK).
+    pub sender_hash: [u8; ACK_HASH_SIZE],
 }
 
 /// Wrapper enum for encoding/decoding top-level messages.
@@ -421,6 +436,7 @@ pub enum Message {
     Pulse(Pulse),
     Routed(Routed),
     Ack(Ack),
+    Broadcast(Broadcast),
 }
 
 impl Encode for Pulse {
@@ -646,6 +662,7 @@ impl Decode for Routed {
 impl Encode for Ack {
     fn encode(&self, w: &mut Writer) {
         w.write_bytes(&self.hash);
+        w.write_bytes(&self.sender_hash);
     }
 }
 
@@ -654,24 +671,78 @@ impl Decode for Ack {
         let hash_bytes = r.read_bytes(ACK_HASH_SIZE)?;
         let mut hash = [0u8; ACK_HASH_SIZE];
         hash.copy_from_slice(hash_bytes);
-        Ok(Ack { hash })
+
+        let sender_hash_bytes = r.read_bytes(ACK_HASH_SIZE)?;
+        let mut sender_hash = [0u8; ACK_HASH_SIZE];
+        sender_hash.copy_from_slice(sender_hash_bytes);
+
+        Ok(Ack { hash, sender_hash })
     }
+}
+
+impl Encode for Broadcast {
+    fn encode(&self, w: &mut Writer) {
+        w.write_node_id(&self.src_node_id);
+        w.write_u8(self.destinations.len() as u8);
+        for dest in &self.destinations {
+            w.write_child_hash(dest);
+        }
+        w.write_len_prefixed(&self.payload);
+        w.write_signature(&self.signature);
+    }
+}
+
+impl Decode for Broadcast {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let src_node_id = r.read_node_id()?;
+        let dest_count = r.read_u8()? as usize;
+
+        // Validate destination count
+        if dest_count > MAX_BROADCAST_DESTINATIONS {
+            return Err(DecodeError::CapacityExceeded);
+        }
+
+        let mut destinations = Vec::with_capacity(dest_count);
+        for _ in 0..dest_count {
+            destinations.push(r.read_child_hash()?);
+        }
+
+        let payload = r.read_len_prefixed()?.to_vec();
+        let signature = r.read_signature()?;
+
+        Ok(Broadcast {
+            src_node_id,
+            destinations,
+            payload,
+            signature,
+        })
+    }
+}
+
+/// Encode the version/type byte: (version << 3) | type
+#[inline]
+fn encode_version_type(version: u8, msg_type: u8) -> u8 {
+    (version << WIRE_VERSION_SHIFT) | (msg_type & WIRE_TYPE_MASK)
 }
 
 impl Encode for Message {
     fn encode(&self, w: &mut Writer) {
         match self {
             Message::Pulse(p) => {
-                w.write_u8(WIRE_TYPE_PULSE);
+                w.write_u8(encode_version_type(WIRE_VERSION, WIRE_TYPE_PULSE));
                 p.encode(w);
             }
             Message::Routed(r) => {
-                w.write_u8(WIRE_TYPE_ROUTED);
+                w.write_u8(encode_version_type(WIRE_VERSION, WIRE_TYPE_ROUTED));
                 r.encode(w);
             }
             Message::Ack(a) => {
-                w.write_u8(WIRE_TYPE_ACK);
+                w.write_u8(encode_version_type(WIRE_VERSION, WIRE_TYPE_ACK));
                 a.encode(w);
+            }
+            Message::Broadcast(b) => {
+                w.write_u8(encode_version_type(WIRE_VERSION, WIRE_TYPE_BROADCAST));
+                b.encode(w);
             }
         }
     }
@@ -679,13 +750,70 @@ impl Encode for Message {
 
 impl Decode for Message {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        let msg_type = r.read_u8()?;
+        let version_type = r.read_u8()?;
+        let version = version_type >> WIRE_VERSION_SHIFT;
+        let msg_type = version_type & WIRE_TYPE_MASK;
+
+        // Only version 0 is supported
+        if version != WIRE_VERSION {
+            return Err(DecodeError::InvalidMessageType);
+        }
+
         match msg_type {
             WIRE_TYPE_PULSE => Ok(Message::Pulse(Pulse::decode(r)?)),
             WIRE_TYPE_ROUTED => Ok(Message::Routed(Routed::decode(r)?)),
             WIRE_TYPE_ACK => Ok(Message::Ack(Ack::decode(r)?)),
+            WIRE_TYPE_BROADCAST => Ok(Message::Broadcast(Broadcast::decode(r)?)),
             _ => Err(DecodeError::InvalidMessageType),
         }
+    }
+}
+
+impl Outgoing for Message {
+    fn priority(&self) -> Priority {
+        match self {
+            Message::Ack(_) => Priority::Ack,
+            Message::Pulse(_) => Priority::BroadcastProtocol,
+            Message::Broadcast(b) => {
+                // Check first byte of payload for backup vs data
+                if b.payload.first().copied() == Some(BCAST_PAYLOAD_BACKUP) {
+                    Priority::BroadcastProtocol
+                } else {
+                    Priority::BroadcastData
+                }
+            }
+            Message::Routed(r) => {
+                if r.msg_type() == MSG_DATA {
+                    Priority::RoutedData
+                } else {
+                    Priority::RoutedProtocol
+                }
+            }
+        }
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        self.encode_to_vec()
+    }
+}
+
+impl crate::traits::Ackable for Routed {
+    fn ack_hash<C: crate::traits::Crypto>(&self, crypto: &C) -> [u8; 4] {
+        let sign_data = routed_sign_data(self);
+        let full_hash = crypto.hash(sign_data.as_slice());
+        let mut hash = [0u8; 4];
+        hash.copy_from_slice(&full_hash[..4]);
+        hash
+    }
+}
+
+impl crate::traits::Ackable for Broadcast {
+    fn ack_hash<C: crate::traits::Crypto>(&self, crypto: &C) -> [u8; 4] {
+        let sign_data = broadcast_sign_data(self);
+        let full_hash = crypto.hash(sign_data.as_slice());
+        let mut hash = [0u8; 4];
+        hash.copy_from_slice(&full_hash[..4]);
+        hash
     }
 }
 
@@ -801,6 +929,19 @@ pub(crate) fn location_sign_data(node_id: &[u8; 16], keyspace_addr: u32, seq: u3
     w.write_node_id(node_id);
     w.write_u32_be(keyspace_addr);
     w.write_varint(seq);
+    w
+}
+
+/// Build the data to be signed for a Broadcast message.
+pub(crate) fn broadcast_sign_data(broadcast: &Broadcast) -> Writer {
+    let mut w = Writer::new();
+    w.write_bytes(crate::types::DOMAIN_BCAST);
+    w.write_node_id(&broadcast.src_node_id);
+    w.write_u8(broadcast.destinations.len() as u8);
+    for dest in &broadcast.destinations {
+        w.write_child_hash(dest);
+    }
+    w.write_len_prefixed(&broadcast.payload);
     w
 }
 
@@ -997,18 +1138,44 @@ mod tests {
 
         // Test Ack roundtrip
         let ack = Ack {
-            hash: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            hash: [0x01, 0x02, 0x03, 0x04],
+            sender_hash: [0x05, 0x06, 0x07, 0x08],
         };
         let msg = Message::Ack(ack.clone());
         let encoded = msg.encode_to_vec();
-        assert_eq!(encoded.len(), 9); // 1 byte type + 8 bytes hash
+        assert_eq!(encoded.len(), 9); // 1 byte type + 4 bytes hash + 4 bytes sender_hash
         let decoded = Message::decode_from_slice(&encoded).unwrap();
 
         match decoded {
             Message::Ack(a) => {
                 assert_eq!(ack.hash, a.hash);
+                assert_eq!(ack.sender_hash, a.sender_hash);
             }
             _ => panic!("expected Ack"),
+        }
+
+        // Test Broadcast roundtrip
+        let broadcast = Broadcast {
+            src_node_id: [0x10; 16],
+            destinations: vec![[0xAA; 4], [0xBB; 4], [0xCC; 4]],
+            payload: b"broadcast payload".to_vec(),
+            signature: Signature {
+                algorithm: ALGORITHM_ED25519,
+                sig: [0x12; 64],
+            },
+        };
+        let msg = Message::Broadcast(broadcast.clone());
+        let encoded = msg.encode_to_vec();
+        let decoded = Message::decode_from_slice(&encoded).unwrap();
+
+        match decoded {
+            Message::Broadcast(b) => {
+                assert_eq!(broadcast.src_node_id, b.src_node_id);
+                assert_eq!(broadcast.destinations, b.destinations);
+                assert_eq!(broadcast.payload, b.payload);
+                assert_eq!(broadcast.signature, b.signature);
+            }
+            _ => panic!("expected Broadcast"),
         }
     }
 
@@ -1311,13 +1478,27 @@ mod tests {
         });
     }
 
-    /// Invalid wire types are rejected.
+    /// Invalid wire version/type combinations are rejected.
+    /// Wire format: [version:5][type:3]
+    /// - Version 0, types 1-4 are valid (Pulse, Routed, Ack, Broadcast)
+    /// - Version 0, types 0, 5-7 are invalid (reserved)
+    /// - Versions 1-31 are invalid (unsupported)
     #[test]
     fn fuzz_invalid_wire_type_rejected() {
         arbtest::arbtest(|u| {
-            let wire_type: u8 = u.int_in_range(0x04..=0xFF)?;
+            // Generate invalid version/type combinations:
+            // Either non-zero version, or version 0 with invalid type
+            let version: u8 = u.int_in_range(0..=31)?;
+            let msg_type: u8 = u.int_in_range(0..=7)?;
+
+            // Skip valid combinations: version 0, types 1-4
+            if version == 0 && (1..=4).contains(&msg_type) {
+                return Ok(());
+            }
+
+            let version_type = (version << 3) | msg_type;
             let extra_len: usize = u.int_in_range(0..=50)?;
-            let mut data = vec![wire_type];
+            let mut data = vec![version_type];
             for _ in 0..extra_len {
                 data.push(u.arbitrary()?);
             }
@@ -1331,7 +1512,8 @@ mod tests {
     fn test_trailing_bytes_rejected() {
         // Valid Ack + trailing byte
         let ack = Ack {
-            hash: [1, 2, 3, 4, 5, 6, 7, 8],
+            hash: [1, 2, 3, 4],
+            sender_hash: [5, 6, 7, 8],
         };
         let mut encoded = Message::Ack(ack).encode_to_vec();
         encoded.push(0xFF); // Add trailing byte

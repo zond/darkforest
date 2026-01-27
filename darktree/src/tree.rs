@@ -45,7 +45,7 @@ const _: () = assert!(
 /// This uses precomputed reciprocal for ~100-150 cycles per division (6-8× faster).
 ///
 /// Based on Barrett reduction with correction for exact results.
-struct FastDivisor {
+pub(crate) struct FastDivisor {
     divisor: u64,
     reciprocal: u64,
     shift: u32,
@@ -53,9 +53,12 @@ struct FastDivisor {
 
 impl FastDivisor {
     /// Create a fast divisor for the given value.
-    /// Panics in debug mode if divisor is 0.
-    fn new(divisor: u64) -> Self {
-        debug_assert!(divisor > 0, "divisor must be non-zero");
+    ///
+    /// # Panics
+    ///
+    /// Panics if divisor is 0.
+    pub(crate) fn new(divisor: u64) -> Self {
+        assert!(divisor > 0, "divisor must be non-zero");
 
         // Powers of 2 are handled specially: 2^(64+shift)/divisor = 2^64 which
         // overflows u64. We mark these with reciprocal=0 and use bit shift in div().
@@ -88,7 +91,7 @@ impl FastDivisor {
 
     /// Divide n by the precomputed divisor.
     #[inline]
-    fn div(&self, n: u64) -> u64 {
+    pub(crate) fn div(&self, n: u64) -> u64 {
         // Fast path for powers of 2: just shift
         if self.reciprocal == 0 {
             return n >> self.shift;
@@ -397,12 +400,11 @@ where
         // Check for hash collision with existing children.
         // Two different NodeIds could have the same 4-byte hash, which would
         // cause keyspace allocation conflicts. Reject if collision detected.
-        for existing_id in self.children().keys() {
-            if *existing_id != pulse.node_id {
-                let existing_hash = self.compute_node_hash(existing_id);
-                if existing_hash == *sender_hash {
-                    return;
-                }
+        // (Note: ChildrenStore.contains_hash() provides O(1) collision check)
+        if self.children().contains_hash(sender_hash) {
+            // Hash exists - check if it's the same node (update) or different (collision)
+            if !self.children().contains_key(&pulse.node_id) {
+                return; // Collision with different node, reject
             }
         }
 
@@ -422,13 +424,13 @@ where
             });
         }
 
-        // Accept the child
+        // Accept the child (hash already computed as sender_hash)
         self.children_mut()
-            .insert(pulse.node_id, pulse.subtree_size);
+            .insert(*sender_hash, pulse.node_id, pulse.subtree_size);
 
         // Store child's keyspace range
-        self.child_ranges_mut()
-            .insert(pulse.node_id, (pulse.keyspace_lo, pulse.keyspace_hi));
+        self.children_mut()
+            .set_range(&pulse.node_id, pulse.keyspace_lo, pulse.keyspace_hi);
 
         // Remove from shortcuts if present
         self.shortcuts_mut().remove(&pulse.node_id);
@@ -713,34 +715,25 @@ where
 
     /// Recompute keyspace ranges for all children.
     fn recompute_child_ranges(&mut self) {
-        // Build children list sorted by hash
-        let mut sorted_children: Vec<([u8; 16], u32)> = self
+        // ChildrenStore.iter_by_hash() returns entries already sorted by hash,
+        // so no explicit sorting needed! This gives O(n) instead of O(n log n).
+
+        // First pass: compute total subtree size
+        let total: u64 = self
             .children()
-            .iter()
-            .map(|(&id, &size)| (id, size))
-            .collect();
-
-        // Sort by hash
-        sorted_children.sort_by(|(a, _), (b, _)| {
-            let a_hash = self.compute_node_hash(a);
-            let b_hash = self.compute_node_hash(b);
-            a_hash.cmp(&b_hash)
-        });
-
-        // Compute ranges
-        let my_lo = self.keyspace_lo() as u64;
-        let my_hi = self.keyspace_hi() as u64;
-        let my_range = my_hi - my_lo;
-
-        let total: u64 = sorted_children
-            .iter()
-            .map(|(_, size)| *size as u64)
+            .subtree_sizes()
+            .map(|s| s as u64)
             .sum::<u64>()
             + 1;
 
         if total == 0 {
             return;
         }
+
+        // Compute ranges
+        let my_lo = self.keyspace_lo() as u64;
+        let my_hi = self.keyspace_hi() as u64;
+        let my_range = my_hi - my_lo;
 
         // Use reciprocal multiplication for fast division on 32-bit MCUs
         let fast_div = FastDivisor::new(total);
@@ -749,15 +742,19 @@ where
         let parent_slice = fast_div.div(my_range);
         let mut current_lo = my_lo + parent_slice;
 
-        // Clear old ranges
-        self.child_ranges_mut().clear();
+        // Collect children info in hash order (avoids borrow issues with iter_by_hash_mut)
+        let children_info: Vec<(NodeId, u32)> = self
+            .children()
+            .iter_by_hash()
+            .map(|(_, entry)| (entry.node_id, entry.subtree_size))
+            .collect();
 
         // Assign ranges to children.
         // IMPORTANT: Last child's range extends to my_hi to avoid gaps from integer division.
         // Without this fix, integer division precision loss creates unclaimed addresses at the
         // end of the keyspace, causing DHT PUBLISH messages to those addresses to be dropped.
-        let num_children = sorted_children.len();
-        for (i, (child_id, subtree_size)) in sorted_children.iter().enumerate() {
+        let num_children = children_info.len();
+        for (i, (child_id, subtree_size)) in children_info.iter().enumerate() {
             let child_range = fast_div.div(my_range * (*subtree_size as u64));
             let child_hi = if i == num_children - 1 {
                 // Last child gets everything up to my_hi to avoid gaps
@@ -766,8 +763,8 @@ where
                 current_lo + child_range
             };
 
-            self.child_ranges_mut()
-                .insert(*child_id, (current_lo as u32, child_hi as u32));
+            self.children_mut()
+                .set_range(child_id, current_lo as u32, child_hi as u32);
 
             current_lo = child_hi;
         }
@@ -776,7 +773,7 @@ where
     /// Recalculate subtree size from children.
     pub(crate) fn recalculate_subtree_size(&mut self) {
         let mut size: u32 = 1; // Self
-        for &child_size in self.children().values() {
+        for child_size in self.children().subtree_sizes() {
             size = size.saturating_add(child_size);
         }
         self.set_subtree_size(size);
@@ -787,7 +784,7 @@ where
     /// Returns true if the child was present and removed.
     fn remove_child(&mut self, child_id: &NodeId) -> bool {
         if self.children_mut().remove(child_id).is_some() {
-            self.child_ranges_mut().remove(child_id);
+            // Range is removed with the entry (stored in ChildEntry)
             self.recalculate_subtree_size();
             self.recompute_child_ranges();
             // If we are root, update tree_size to match subtree_size
@@ -851,22 +848,21 @@ where
         // Track size for bandwidth-aware scheduling
         let size = encoded.len();
 
-        // Send via protocol queue (high priority)
-        match self.transport().protocol_outgoing().try_send(encoded) {
-            Ok(()) => {
-                self.record_protocol_sent();
+        // Send via priority queue (BroadcastProtocol priority)
+        if self.transport().outgoing().try_send(msg) {
+            self.record_protocol_sent();
 
-                #[cfg(feature = "debug")]
-                self.emit_debug(crate::debug::DebugEvent::PulseSent {
-                    timestamp: now,
-                    tree_size: debug_info.0,
-                    root_hash: debug_info.1,
-                    child_count: debug_info.2,
-                    has_pubkey: debug_info.3,
-                    need_pubkey: debug_info.4,
-                });
-            }
-            Err(_) => self.record_protocol_dropped(),
+            #[cfg(feature = "debug")]
+            self.emit_debug(crate::debug::DebugEvent::PulseSent {
+                timestamp: now,
+                tree_size: debug_info.0,
+                root_hash: debug_info.1,
+                child_count: debug_info.2,
+                has_pubkey: debug_info.3,
+                need_pubkey: debug_info.4,
+            });
+        } else {
+            self.record_protocol_dropped();
         }
         self.set_last_pulse(Some(now));
         self.set_last_pulse_size(size);
@@ -895,15 +891,12 @@ where
 
     /// Build a Pulse message.
     fn build_pulse(&mut self) -> Pulse {
-        // Build children list sorted by hash
-        let mut children = ChildrenList::new();
-        for (&child_id, &subtree_size) in self.children().iter() {
-            let child_hash = self.compute_node_hash(&child_id);
-            children.push((child_hash, subtree_size));
-        }
-
-        // Sort children by hash (lexicographic big-endian)
-        children.sort_by(|a, b| a.0.cmp(&b.0));
+        // Build children list - iter_by_hash() returns entries already in hash order
+        let children: ChildrenList = self
+            .children()
+            .iter_by_hash()
+            .map(|(hash, entry)| (*hash, entry.subtree_size))
+            .collect();
 
         // Determine flags - include pending_parent as "has parent" so prospective
         // parent can see we want to join them
@@ -1104,7 +1097,8 @@ mod tests {
 
         // Add a child
         let child_id: NodeId = [2u8; 16];
-        node.children_mut().insert(child_id, 5); // subtree_size = 5
+        let child_hash = node.compute_node_hash(&child_id);
+        node.children_mut().insert(child_hash, child_id, 5); // subtree_size = 5
 
         // Add neighbor timing for child (last seen long ago)
         let old_time = Timestamp::from_secs(100);
@@ -1489,8 +1483,13 @@ mod tests {
         assert_ne!(child1, child2, "Test setup: NodeIds should be different");
 
         // Manually add first child to the children map
-        node.children_mut().insert(child1, 1);
+        node.children_mut().insert(hash1, child1, 1);
         assert_eq!(node.children().len(), 1);
+
+        // Add pubkey to cache for child2 (required for pulse processing)
+        // CollisionCrypto.verify() always returns true, so any pubkey works
+        let fake_pubkey: crate::PublicKey = [0xCC; 32];
+        node.insert_pubkey_cache(child2, fake_pubkey, now);
 
         // Create a pulse from the second child claiming us as parent
         let my_hash = node.compute_node_hash(node.node_id());
@@ -1509,10 +1508,12 @@ mod tests {
         };
 
         // Add neighbor timing (required for pulse processing)
+        // Use old last_seen to avoid rate limiting (min_interval = 2*tau)
+        let old_time = Timestamp::from_secs(100);
         node.insert_neighbor_time(
             child2,
             NeighborTiming {
-                last_seen: now,
+                last_seen: old_time,
                 prev_seen: None,
                 rssi: Some(-70),
                 root_hash: hash2,
@@ -1538,6 +1539,114 @@ mod tests {
         assert!(
             !node.children().contains_key(&child2),
             "Colliding child should not be added"
+        );
+    }
+
+    #[test]
+    fn test_direct_child_update() {
+        // Simplified test: directly update child via insert (bypassing handle_pulse)
+        let mut node = make_node();
+
+        let child_id: NodeId = [2u8; 16];
+        let child_hash = node.compute_node_hash(&child_id);
+
+        // Insert initial child
+        node.children_mut().insert(child_hash, child_id, 5);
+        assert_eq!(node.children().get(&child_id).unwrap().subtree_size, 5);
+
+        // Update via insert (same hash, same node_id, new subtree_size)
+        node.children_mut().insert(child_hash, child_id, 10);
+        assert_eq!(
+            node.children().get(&child_id).unwrap().subtree_size,
+            10,
+            "Direct insert should update subtree_size"
+        );
+    }
+
+    #[test]
+    fn test_existing_child_update_with_same_hash_accepted() {
+        // Tests that an existing child can update its subtree_size via pulse
+        // (same NodeId, same hash - should be accepted as update, not rejected as collision)
+        let mut node = make_node();
+        let now = Timestamp::from_secs(1000);
+
+        // Add a child
+        let child_id: NodeId = [2u8; 16];
+        let child_hash = node.compute_node_hash(&child_id);
+        node.children_mut().insert(child_hash, child_id, 5); // Initial subtree_size = 5
+        assert_eq!(node.children().len(), 1);
+        assert_eq!(node.children().get(&child_id).unwrap().subtree_size, 5);
+
+        // Add pubkey to cache for child (required for pulse processing)
+        // FastTestCrypto requires valid pubkey and signature
+        let fake_pubkey: crate::PublicKey = [0xDD; 32];
+        node.insert_pubkey_cache(child_id, fake_pubkey, now);
+
+        // Add neighbor timing (required for pulse processing)
+        // Use an old last_seen time to avoid rate limiting (min_interval = 2*tau)
+        let old_time = Timestamp::from_secs(100); // Well before `now`
+        node.insert_neighbor_time(
+            child_id,
+            NeighborTiming {
+                last_seen: old_time,
+                prev_seen: None,
+                rssi: Some(-70),
+                root_hash: child_hash,
+                tree_size: 10,
+                keyspace_range: (0, u32::MAX),
+                children_count: 0,
+            },
+        );
+
+        // Create a valid signature for FastTestCrypto (algorithm=0x01, non-zero sig)
+        let valid_sig = Signature {
+            algorithm: 0x01, // FastTestCrypto's algorithm
+            sig: [0xFF; 64], // Non-zero signature passes FastTestCrypto::verify()
+        };
+
+        // Create a pulse from the same child with updated subtree_size
+        let my_hash = node.compute_node_hash(node.node_id());
+        let pulse = Pulse {
+            node_id: child_id,
+            flags: Pulse::build_flags(true, false, false, 0), // has_parent = true
+            parent_hash: Some(my_hash),                       // Claims us as parent
+            root_hash: *node.root_hash(),
+            subtree_size: 10, // Updated from 5 to 10
+            tree_size: node.tree_size(),
+            keyspace_lo: 0,
+            keyspace_hi: u32::MAX,
+            pubkey: None,
+            children: vec![],
+            signature: valid_sig,
+        };
+
+        // Verify hashes match (same compute_node_hash should produce same result)
+        let computed_my_hash = node.compute_node_hash(node.node_id());
+        assert_eq!(my_hash, computed_my_hash, "my_hash should be deterministic");
+        assert_eq!(
+            pulse.parent_hash,
+            Some(my_hash),
+            "pulse.parent_hash should match my_hash"
+        );
+        assert_eq!(
+            node.children().get(&child_id).unwrap().subtree_size,
+            5,
+            "subtree_size should be 5 before handle_pulse"
+        );
+
+        // Process the pulse - should be accepted as update
+        node.handle_pulse(pulse, Some(-70), now);
+
+        // Child should still exist with updated subtree_size
+        assert_eq!(node.children().len(), 1, "Child count should remain 1");
+        assert!(
+            node.children().contains_key(&child_id),
+            "Child should still be present"
+        );
+        assert_eq!(
+            node.children().get(&child_id).unwrap().subtree_size,
+            10,
+            "Subtree size should be updated to 10"
         );
     }
 }

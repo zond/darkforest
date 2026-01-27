@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use crate::config::NodeConfig;
 use crate::node::{AckHash, Node};
 use crate::time::Timestamp;
-use crate::traits::{Clock, Crypto, Random, Transport};
+use crate::traits::{Ackable, Clock, Crypto, Outgoing, Random, Transport};
 use crate::types::{
     ChildHash, Error, NodeId, Routed, Signature, DEFAULT_TTL, MSG_DATA, MSG_FOUND, MSG_LOOKUP,
     MSG_PUBLISH,
@@ -68,7 +68,7 @@ where
 
         // Duplicate detection: check if we've recently forwarded this message
         // Note: hash excludes TTL so it's the same at any hop
-        let msg_hash = self.compute_ack_hash(&msg);
+        let msg_hash = msg.ack_hash(self.crypto());
 
         if let Some(&(_, stored_ttl)) = self.recently_forwarded().get(&msg_hash) {
             if stored_ttl == original_ttl {
@@ -90,16 +90,16 @@ where
     /// Used when we receive a duplicate message - the sender is waiting for confirmation
     /// that we received it, so we send a minimal ACK instead of re-forwarding.
     pub(crate) fn send_explicit_ack(&mut self, hash: AckHash) {
-        let ack = Ack { hash };
-        let encoded = Message::Ack(ack).encode_to_vec();
+        let sender_hash = self.compute_node_hash(self.node_id());
+        let ack = Ack { hash, sender_hash };
+        let msg = Message::Ack(ack);
 
         // ACK is small (9 bytes) so MTU check is unlikely to fail, but be safe
-        if encoded.len() > self.transport().mtu() {
+        if msg.encode_to_vec().len() > self.transport().mtu() {
             return;
         }
 
-        let result = self.transport().protocol_outgoing().try_send(encoded);
-        if result.is_ok() {
+        if self.transport().outgoing().try_send(msg) {
             self.record_protocol_sent();
         }
         // Don't track drops for ACKs - they're best-effort
@@ -157,18 +157,6 @@ where
         }
     }
 
-    /// Compute the 8-byte ACK hash for a Routed message.
-    ///
-    /// Uses `routed_sign_data()` which excludes TTL, so the hash is invariant across hops.
-    /// This allows the original sender to recognize the message when overhearing a forwarder.
-    pub(crate) fn compute_ack_hash(&self, msg: &Routed) -> AckHash {
-        let sign_data = routed_sign_data(msg);
-        let full_hash = self.crypto().hash(sign_data.as_slice());
-        let mut hash = [0u8; 8];
-        hash.copy_from_slice(&full_hash[..8]);
-        hash
-    }
-
     /// Forward a routed message toward its destination.
     fn forward_routed(&mut self, mut msg: Routed, now: Timestamp) {
         let dest = msg.dest_addr;
@@ -195,11 +183,17 @@ where
         let mut best: Option<(NodeId, u64)> = None; // (node_id, range_size)
 
         // Check children
-        for (child_id, &(lo, hi)) in self.child_ranges() {
+        for (_, entry) in self.children().iter_by_hash() {
+            let lo = entry.keyspace_lo;
+            let hi = entry.keyspace_hi;
             if dest >= lo && dest < hi {
                 let range_size = (hi as u64).saturating_sub(lo as u64);
                 if best.map_or(true, |(_, best_size)| range_size < best_size) {
-                    best = Some((*child_id, range_size));
+                    best = Some((entry.node_id, range_size));
+                    // Early exit: can't find a tighter range than size 1
+                    if range_size == 1 {
+                        return best.map(|(id, _)| id);
+                    }
                 }
             }
         }
@@ -210,6 +204,10 @@ where
                 let range_size = (hi as u64).saturating_sub(lo as u64);
                 if best.map_or(true, |(_, best_size)| range_size < best_size) {
                     best = Some((*shortcut_id, range_size));
+                    // Early exit: can't find a tighter range than size 1
+                    if range_size == 1 {
+                        return best.map(|(id, _)| id);
+                    }
                 }
             }
         }
@@ -226,23 +224,25 @@ where
     /// Inserts the message hash into pending_acks for retransmission if no ACK is received.
     fn send_to_neighbor(&mut self, _neighbor: NodeId, msg: Routed, now: Timestamp) {
         let sent_ttl = msg.ttl;
-        let encoded = crate::wire::Message::Routed(msg.clone()).encode_to_vec();
+
+        // Compute ACK hash while we still have &msg (avoids cloning)
+        let ack_hash = msg.ack_hash(self.crypto());
+
+        // Move msg into Message (no clone needed)
+        let wire_msg = Message::Routed(msg);
+        let priority = wire_msg.priority();
+        let encoded = wire_msg.encode_to_vec();
 
         if encoded.len() > self.transport().mtu() {
             self.record_protocol_dropped();
             return;
         }
 
-        // Compute ACK hash for tracking (uses routed_sign_data which excludes TTL)
-        let ack_hash = self.compute_ack_hash(&msg);
-
         // Track pending ACK before sending (with TTL for implicit ACK verification)
-        self.insert_pending_ack(ack_hash, encoded.clone(), sent_ttl, now);
+        self.insert_pending_ack(ack_hash, encoded, priority, sent_ttl, now);
 
-        // Broadcast on protocol channel (neighbors will hear it)
-        let result = self.transport().protocol_outgoing().try_send(encoded);
-
-        if result.is_ok() {
+        // Broadcast (neighbors will hear it) - priority determined by message type
+        if self.transport().outgoing().try_send(wire_msg) {
             self.record_protocol_sent();
         } else {
             // Send failed - remove pending ACK since we never actually sent
@@ -369,8 +369,8 @@ where
 
         // If we own the destination, handle locally
         if self.owns_key(dest) {
-            let encoded = crate::wire::Message::Routed(msg.clone()).encode_to_vec();
-            if encoded.len() > self.transport().mtu() {
+            let wire_msg = Message::Routed(msg.clone());
+            if wire_msg.encode_to_vec().len() > self.transport().mtu() {
                 return Err(Error::MessageTooLarge);
             }
             // Handle locally as if we received it
@@ -385,23 +385,15 @@ where
             return Ok(());
         }
 
-        // Encode and send
-        let encoded = crate::wire::Message::Routed(msg).encode_to_vec();
+        // Build message - priority is determined automatically by msg_type
+        let wire_msg = Message::Routed(msg);
 
-        if encoded.len() > self.transport().mtu() {
+        if wire_msg.encode_to_vec().len() > self.transport().mtu() {
             return Err(Error::MessageTooLarge);
         }
 
-        // Use app channel for DATA, protocol channel for others
-        let channel = if msg_type == MSG_DATA {
-            self.transport().app_outgoing()
-        } else {
-            self.transport().protocol_outgoing()
-        };
-
-        let result = channel.try_send(encoded);
-
-        if result.is_ok() {
+        // Send via priority queue - priority determined by Message::priority()
+        if self.transport().outgoing().try_send(wire_msg) {
             if msg_type == MSG_DATA {
                 self.record_app_sent();
             } else {
@@ -415,6 +407,71 @@ where
                 self.record_protocol_dropped();
             }
             Err(Error::QueueFull)
+        }
+    }
+
+    /// Send a BACKUP_PUBLISH broadcast to random neighbors.
+    ///
+    /// Called after storing a location entry to ensure backup nodes have a copy.
+    pub(crate) fn send_backup_publish(&mut self, entry: &crate::types::LocationEntry) {
+        use crate::types::{Broadcast, BCAST_PAYLOAD_BACKUP};
+        use crate::wire::{broadcast_sign_data, Encode, Message};
+
+        // Select 2 random neighbors to send backup to
+        let neighbors: Vec<_> = self.neighbor_times().keys().copied().collect();
+        if neighbors.is_empty() {
+            return;
+        }
+
+        // Get 2 random neighbors (or fewer if we don't have 2)
+        let num_targets = core::cmp::min(2, neighbors.len());
+        let mut destinations = Vec::with_capacity(num_targets);
+
+        // Simple random selection using the random generator
+        let mut selected = alloc::collections::BTreeSet::new();
+        while destinations.len() < num_targets && selected.len() < neighbors.len() {
+            let idx = self.random_mut().gen_u32() as usize % neighbors.len();
+            if selected.insert(idx) {
+                let neighbor_id = neighbors[idx];
+                let hash = self.compute_node_hash(&neighbor_id);
+                destinations.push(hash);
+            }
+        }
+
+        if destinations.is_empty() {
+            return;
+        }
+
+        // Build payload: BCAST_PAYLOAD_BACKUP (1 byte) + encoded LocationEntry
+        let mut payload = alloc::vec![BCAST_PAYLOAD_BACKUP];
+        let entry_bytes = entry.encode_to_vec();
+        payload.extend(entry_bytes);
+
+        // Build the broadcast message (without signature)
+        let mut broadcast = Broadcast {
+            src_node_id: *self.node_id(),
+            destinations,
+            payload,
+            signature: crate::types::Signature::default(),
+        };
+
+        // Sign the broadcast
+        let sign_data = broadcast_sign_data(&broadcast);
+        broadcast.signature = self.crypto().sign(self.secret(), sign_data.as_slice());
+
+        // Build wire message
+        let wire_msg = Message::Broadcast(broadcast);
+
+        // Check MTU
+        if wire_msg.encode_to_vec().len() > self.transport().mtu() {
+            return; // Message too large
+        }
+
+        // Send via priority queue (backup is protocol traffic - BroadcastProtocol priority)
+        if self.transport().outgoing().try_send(wire_msg) {
+            self.record_protocol_sent();
+        } else {
+            self.record_protocol_dropped();
         }
     }
 
@@ -519,7 +576,11 @@ mod tests {
 
     use super::*;
     use crate::config::{DefaultConfig, SmallConfig};
+    use crate::time::{Duration, Timestamp};
     use crate::traits::test_impls::{FastTestCrypto, MockClock, MockRandom, MockTransport};
+    use crate::traits::Ackable;
+    use crate::types::{Priority, RECENTLY_FORWARDED_TTL_MULTIPLIER};
+    use crate::wire::{Ack, Decode, Encode, Message};
 
     /// Type alias for test nodes using default config.
     type TestNode = Node<MockTransport, FastTestCrypto, MockRandom, MockClock, DefaultConfig>;
@@ -586,7 +647,9 @@ mod tests {
 
         // Add a child with keyspace range [1000, 2000)
         let child_id: NodeId = [1u8; 16];
-        node.child_ranges_mut().insert(child_id, (1000, 2000));
+        let child_hash = node.compute_node_hash(&child_id);
+        node.children_mut().insert(child_hash, child_id, 1);
+        node.children_mut().set_range(&child_id, 1000, 2000);
 
         // Destination within child's range should return child
         assert_eq!(node.best_next_hop(1500), Some(child_id));
@@ -617,7 +680,9 @@ mod tests {
 
         // Add a child with wide range [0, 10000)
         let wide_child: NodeId = [1u8; 16];
-        node.child_ranges_mut().insert(wide_child, (0, 10000));
+        let wide_hash = node.compute_node_hash(&wide_child);
+        node.children_mut().insert(wide_hash, wide_child, 1);
+        node.children_mut().set_range(&wide_child, 0, 10000);
 
         // Add a shortcut with tight range [4000, 6000)
         let tight_shortcut: NodeId = [2u8; 16];
@@ -640,7 +705,9 @@ mod tests {
 
         // Add a child with tight range [5000, 7000)
         let tight_child: NodeId = [2u8; 16];
-        node.child_ranges_mut().insert(tight_child, (5000, 7000));
+        let tight_hash = node.compute_node_hash(&tight_child);
+        node.children_mut().insert(tight_hash, tight_child, 1);
+        node.children_mut().set_range(&tight_child, 5000, 7000);
 
         // Destination 6000 is in both ranges - should prefer tighter child
         assert_eq!(node.best_next_hop(6000), Some(tight_child));
@@ -655,9 +722,16 @@ mod tests {
         let child2: NodeId = [2u8; 16];
         let child3: NodeId = [3u8; 16];
 
-        node.child_ranges_mut().insert(child1, (0, 1000));
-        node.child_ranges_mut().insert(child2, (1000, 2000));
-        node.child_ranges_mut().insert(child3, (2000, 3000));
+        let hash1 = node.compute_node_hash(&child1);
+        let hash2 = node.compute_node_hash(&child2);
+        let hash3 = node.compute_node_hash(&child3);
+
+        node.children_mut().insert(hash1, child1, 1);
+        node.children_mut().set_range(&child1, 0, 1000);
+        node.children_mut().insert(hash2, child2, 1);
+        node.children_mut().set_range(&child2, 1000, 2000);
+        node.children_mut().insert(hash3, child3, 1);
+        node.children_mut().set_range(&child3, 2000, 3000);
 
         // Each destination should route to correct child
         assert_eq!(node.best_next_hop(500), Some(child1));
@@ -669,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_ack_hash_invariant() {
+    fn test_ack_hash_invariant() {
         // Hash should be the same regardless of TTL (routed_sign_data excludes TTL)
         let node = make_node();
 
@@ -689,8 +763,8 @@ mod tests {
         let mut msg2 = msg1.clone();
         msg2.ttl = 100; // Different TTL
 
-        let hash1 = node.compute_ack_hash(&msg1);
-        let hash2 = node.compute_ack_hash(&msg2);
+        let hash1 = msg1.ack_hash(node.crypto());
+        let hash2 = msg2.ack_hash(node.crypto());
 
         assert_eq!(
             hash1, hash2,
@@ -699,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_ack_hash_different_content() {
+    fn test_ack_hash_different_content() {
         // Different message content should produce different hashes
         let node = make_node();
 
@@ -720,8 +794,8 @@ mod tests {
         let mut msg2 = msg1.clone();
         msg2.payload = b"ZZZZZZZZ".to_vec();
 
-        let hash1 = node.compute_ack_hash(&msg1);
-        let hash2 = node.compute_ack_hash(&msg2);
+        let hash1 = msg1.ack_hash(node.crypto());
+        let hash2 = msg2.ack_hash(node.crypto());
 
         assert_ne!(
             hash1, hash2,
@@ -731,9 +805,6 @@ mod tests {
 
     #[test]
     fn test_implicit_ack_clears_pending() {
-        use crate::time::Timestamp;
-        use crate::wire::{Decode, Encode, Message};
-
         let mut node = make_node();
         let now = Timestamp::from_secs(1000);
 
@@ -751,10 +822,16 @@ mod tests {
             signature: Signature::default(),
         };
 
-        let hash = node.compute_ack_hash(&msg);
+        let hash = msg.ack_hash(node.crypto());
 
         // Manually insert a pending ACK (sent_ttl = 255)
-        node.insert_pending_ack(hash, vec![1, 2, 3], 255, now);
+        node.insert_pending_ack(
+            hash,
+            vec![1, 2, 3],
+            crate::types::Priority::RoutedData,
+            255,
+            now,
+        );
         assert!(node.pending_acks().contains_key(&hash));
 
         // Simulate receiving the message (which should clear pending ACK via implicit ACK)
@@ -764,7 +841,7 @@ mod tests {
         // Decode and process - this simulates what handle_transport_rx does
         let decoded = Message::decode_from_slice(&encoded).unwrap();
         if let Message::Routed(routed) = decoded {
-            let received_hash = node.compute_ack_hash(&routed);
+            let received_hash = routed.ack_hash(node.crypto());
             node.pending_acks_mut().remove(&received_hash);
         }
 
@@ -777,8 +854,6 @@ mod tests {
 
     #[test]
     fn test_duplicate_tracked_in_recently_forwarded() {
-        use crate::time::Timestamp;
-
         let mut node = make_node();
         let now = Timestamp::from_secs(1000);
 
@@ -795,7 +870,7 @@ mod tests {
             signature: Signature::default(),
         };
 
-        let hash = node.compute_ack_hash(&msg);
+        let hash = msg.ack_hash(node.crypto());
 
         // Initially not tracked
         assert!(!node.recently_forwarded().contains_key(&hash));
@@ -845,24 +920,23 @@ mod tests {
 
     #[test]
     fn test_ack_roundtrip_encoding() {
-        use crate::node::AckHash;
-        use crate::wire::{Ack, Decode, Encode, Message};
-
-        let hash: AckHash = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
-        let ack = Ack { hash };
+        let hash: AckHash = [0x01, 0x02, 0x03, 0x04];
+        let sender_hash: AckHash = [0x05, 0x06, 0x07, 0x08];
+        let ack = Ack { hash, sender_hash };
         let msg = Message::Ack(ack);
 
         let encoded = msg.encode_to_vec();
         assert_eq!(
             encoded.len(),
             9,
-            "Ack message should be 9 bytes (1 type + 8 hash)"
+            "Ack message should be 9 bytes (1 type + 4 hash + 4 sender_hash)"
         );
 
         let decoded = Message::decode_from_slice(&encoded).unwrap();
         match decoded {
             Message::Ack(decoded_ack) => {
                 assert_eq!(decoded_ack.hash, hash);
+                assert_eq!(decoded_ack.sender_hash, sender_hash);
             }
             _ => panic!("Expected Ack message"),
         }
@@ -870,16 +944,13 @@ mod tests {
 
     #[test]
     fn test_cleanup_recently_forwarded_expiry() {
-        use crate::time::{Duration, Timestamp};
-        use crate::types::RECENTLY_FORWARDED_TTL_MULTIPLIER;
-
         let mut node = make_node();
         let tau = node.tau();
         let ttl = tau * RECENTLY_FORWARDED_TTL_MULTIPLIER;
 
         let now = Timestamp::from_secs(1000);
-        let hash1: [u8; 8] = [1; 8];
-        let hash2: [u8; 8] = [2; 8];
+        let hash1: [u8; 4] = [1; 4];
+        let hash2: [u8; 4] = [2; 4];
 
         // Insert two entries at different times (with dummy TTL values)
         node.insert_recently_forwarded(hash1, 255, now);
@@ -906,22 +977,20 @@ mod tests {
 
     #[test]
     fn test_pending_ack_eviction_at_capacity() {
-        use crate::time::Timestamp;
-
         let mut node = make_node();
         let now = Timestamp::from_secs(1000);
 
         // Fill pending_acks to capacity (using DefaultConfig)
         for i in 0..DefaultConfig::MAX_PENDING_ACKS {
-            let hash: [u8; 8] = [i as u8; 8];
-            node.insert_pending_ack(hash, vec![i as u8], 255, now);
+            let hash: [u8; 4] = [i as u8; 4];
+            node.insert_pending_ack(hash, vec![i as u8], Priority::RoutedProtocol, 255, now);
         }
 
         assert_eq!(node.pending_acks().len(), DefaultConfig::MAX_PENDING_ACKS);
 
         // Insert one more - should evict oldest
-        let new_hash: [u8; 8] = [0xFF; 8];
-        node.insert_pending_ack(new_hash, vec![0xFF], 255, now);
+        let new_hash: [u8; 4] = [0xFF; 4];
+        node.insert_pending_ack(new_hash, vec![0xFF], Priority::RoutedProtocol, 255, now);
 
         // Should still be at capacity (not exceed)
         assert_eq!(
@@ -937,14 +1006,12 @@ mod tests {
 
     #[test]
     fn test_recently_forwarded_eviction_at_capacity() {
-        use crate::time::Timestamp;
-
         let mut node = make_node();
         let now = Timestamp::from_secs(1000);
 
         // Fill recently_forwarded to capacity (using DefaultConfig)
         for i in 0..DefaultConfig::MAX_RECENTLY_FORWARDED {
-            let mut hash: [u8; 8] = [0; 8];
+            let mut hash: [u8; 4] = [0; 4];
             hash[0] = (i >> 8) as u8;
             hash[1] = (i & 0xFF) as u8;
             node.insert_recently_forwarded(hash, 255, now);
@@ -956,7 +1023,7 @@ mod tests {
         );
 
         // Insert one more - should evict oldest
-        let new_hash: [u8; 8] = [0xFF; 8];
+        let new_hash: [u8; 4] = [0xFF; 4];
         node.insert_recently_forwarded(new_hash, 255, now);
 
         // Should still be at capacity (not exceed)
@@ -973,8 +1040,6 @@ mod tests {
 
     #[test]
     fn test_explicit_ack_sent_on_duplicate() {
-        use crate::time::Timestamp;
-
         let mut node = make_node();
         let now = Timestamp::from_secs(1000);
 
@@ -991,7 +1056,7 @@ mod tests {
             signature: Signature::default(),
         };
 
-        let hash = node.compute_ack_hash(&msg);
+        let hash = msg.ack_hash(node.crypto());
 
         // Mark as recently forwarded (simulating first forward)
         node.insert_recently_forwarded(hash, 255, now);
@@ -1003,7 +1068,7 @@ mod tests {
         node.send_explicit_ack(hash);
 
         // Check that an ACK was sent
-        let sent = node.transport().take_protocol_sent();
+        let sent = node.transport().take_sent();
         assert_eq!(sent.len(), 1, "Should send one ACK message");
         assert_eq!(sent[0].len(), 9, "ACK should be 9 bytes");
         assert_eq!(sent[0][0], 0x03, "ACK wire type should be 0x03");
@@ -1011,16 +1076,14 @@ mod tests {
 
     #[test]
     fn test_small_config_eviction() {
-        use crate::time::Timestamp;
-
         let mut node = make_small_node();
         let now = Timestamp::from_secs(1000);
 
         // SmallConfig::MAX_PENDING_ACKS = 8 (vs DefaultConfig = 32)
         // Fill to capacity
         for i in 0..SmallConfig::MAX_PENDING_ACKS {
-            let hash: [u8; 8] = [i as u8; 8];
-            node.insert_pending_ack(hash, vec![i as u8], 255, now);
+            let hash: [u8; 4] = [i as u8; 4];
+            node.insert_pending_ack(hash, vec![i as u8], Priority::RoutedProtocol, 255, now);
         }
 
         assert_eq!(
@@ -1030,8 +1093,8 @@ mod tests {
         );
 
         // Insert one more - should evict oldest
-        let new_hash: [u8; 8] = [0xFF; 8];
-        node.insert_pending_ack(new_hash, vec![0xFF], 255, now);
+        let new_hash: [u8; 4] = [0xFF; 4];
+        node.insert_pending_ack(new_hash, vec![0xFF], Priority::RoutedProtocol, 255, now);
 
         // Should still be at SmallConfig capacity
         assert_eq!(

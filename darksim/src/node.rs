@@ -5,20 +5,21 @@ use std::future::{ready, Ready};
 
 use darktree::config::DefaultConfig;
 use darktree::traits::{
-    test_impls::FastTestCrypto, Clock, Random, Received, Transport, TransportInChannel,
-    TransportOutChannel,
+    test_impls::FastTestCrypto, Clock, PriorityQueue, Random, Transport, TransportInChannel,
 };
-use darktree::{Duration, Node, NodeId, OutgoingData, PublicKey, Timestamp};
+use darktree::{Duration, Incoming, Node, NodeId, OutgoingData, PublicKey, Timestamp};
 use embassy_sync::channel::Channel;
+
+/// Queue size for SimTransport.
+const SIM_QUEUE_SIZE: usize = 32;
 
 /// Mock transport for simulation.
 ///
-/// Provides separate protocol and app channels, and tracks MTU/bandwidth.
+/// Uses a single priority queue for all outgoing messages.
 pub struct SimTransport {
     mtu: usize,
     bw: Option<u32>,
-    protocol_outgoing: TransportOutChannel,
-    app_outgoing: TransportOutChannel,
+    outgoing: PriorityQueue,
     incoming: TransportInChannel,
 }
 
@@ -27,8 +28,7 @@ impl SimTransport {
         Self {
             mtu: 255,
             bw: None,
-            protocol_outgoing: Channel::new(),
-            app_outgoing: Channel::new(),
+            outgoing: PriorityQueue::new(SIM_QUEUE_SIZE),
             incoming: Channel::new(),
         }
     }
@@ -40,16 +40,13 @@ impl SimTransport {
 
     /// Inject a message as if received from the radio.
     pub fn inject_rx(&self, data: Vec<u8>, rssi: Option<i16>) {
-        let _ = self.incoming.try_send(Received { data, rssi });
+        let _ = self.incoming.try_send(Incoming::new(data, rssi));
     }
 
-    /// Take all outgoing messages (protocol first, then app).
+    /// Take all outgoing messages in priority order.
     pub fn take_sent(&self) -> Vec<Vec<u8>> {
         let mut msgs = Vec::new();
-        while let Ok(msg) = self.protocol_outgoing.try_receive() {
-            msgs.push(msg);
-        }
-        while let Ok(msg) = self.app_outgoing.try_receive() {
+        while let Some(msg) = self.outgoing.try_receive() {
             msgs.push(msg);
         }
         msgs
@@ -71,12 +68,8 @@ impl Transport for SimTransport {
         self.bw
     }
 
-    fn protocol_outgoing(&self) -> &TransportOutChannel {
-        &self.protocol_outgoing
-    }
-
-    fn app_outgoing(&self) -> &TransportOutChannel {
-        &self.app_outgoing
+    fn outgoing(&self) -> &PriorityQueue {
+        &self.outgoing
     }
 
     fn incoming(&self) -> &TransportInChannel {

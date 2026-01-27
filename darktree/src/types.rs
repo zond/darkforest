@@ -48,6 +48,93 @@ pub const ALGORITHM_ED25519: u8 = 0x01;
 pub(crate) const DOMAIN_PULSE: &[u8] = b"PULSE:";
 pub(crate) const DOMAIN_ROUTE: &[u8] = b"ROUTE:";
 pub(crate) const DOMAIN_LOC: &[u8] = b"LOC:";
+pub(crate) const DOMAIN_BCAST: &[u8] = b"BCAST:";
+
+// Broadcast payload type identifiers
+/// Application data broadcast.
+pub const BCAST_PAYLOAD_DATA: u8 = 0x00;
+/// Backup publish for DHT redundancy.
+pub const BCAST_PAYLOAD_BACKUP: u8 = 0x01;
+
+/// Message priority levels for transport scheduling.
+///
+/// Higher-priority messages (lower numeric value) are sent before lower-priority ones.
+/// This ensures protocol traffic (tree maintenance, DHT operations) works even under
+/// heavy application load.
+///
+/// Priority ordering (highest to lowest):
+/// 1. Ack - Reliability; enables retransmission
+/// 2. BroadcastProtocol - DHT backup protocol (BACKUP_PUBLISH)
+/// 3. RoutedProtocol - DHT operations (PUBLISH, LOOKUP, FOUND)
+/// 4. BroadcastData - Application broadcast
+/// 5. RoutedData - Application unicast
+///
+/// Note: Pulse uses BroadcastProtocol priority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum Priority {
+    /// Explicit ACKs for link-layer reliability.
+    Ack = 0,
+    /// Protocol-level broadcast (Pulse, BACKUP_PUBLISH).
+    BroadcastProtocol = 1,
+    /// Protocol-level routed messages (PUBLISH, LOOKUP, FOUND).
+    RoutedProtocol = 2,
+    /// Application-level broadcast data.
+    BroadcastData = 3,
+    /// Application-level routed data.
+    RoutedData = 4,
+}
+
+impl Priority {
+    /// Returns true if this is a protocol-level priority.
+    ///
+    /// Useful for metrics and monitoring to categorize traffic.
+    #[allow(dead_code)] // Public API for library consumers
+    pub fn is_protocol(&self) -> bool {
+        matches!(
+            self,
+            Priority::Ack | Priority::BroadcastProtocol | Priority::RoutedProtocol
+        )
+    }
+}
+
+/// Incoming message wrapper for lazy decoding.
+///
+/// Wraps raw bytes received from the transport layer. Use with
+/// `Message::decode_from_slice(&incoming.data)` to parse when ready.
+#[derive(Debug, Clone)]
+pub struct Incoming {
+    /// Raw message bytes.
+    pub data: Vec<u8>,
+    /// Signal strength in dBm (if available from transport).
+    pub rssi: Option<i16>,
+}
+
+impl Incoming {
+    /// Create a new incoming message wrapper.
+    pub fn new(data: Vec<u8>, rssi: Option<i16>) -> Self {
+        Self { data, rssi }
+    }
+}
+
+/// Pre-encoded message for retransmission.
+///
+/// Used when we have already-encoded bytes and need to send them with a
+/// specific priority (e.g., retransmitting cached messages).
+#[derive(Debug, Clone)]
+pub struct PreEncoded {
+    /// Pre-encoded message bytes.
+    pub data: Vec<u8>,
+    /// Priority for this message.
+    pub priority: Priority,
+}
+
+impl PreEncoded {
+    /// Create a new pre-encoded message.
+    pub fn new(data: Vec<u8>, priority: Priority) -> Self {
+        Self { data, priority }
+    }
+}
 
 /// 16-byte node identifier derived from public key hash.
 pub type NodeId = [u8; 16];
@@ -290,6 +377,26 @@ impl Default for Routed {
             signature: Signature::default(),
         }
     }
+}
+
+/// Maximum number of destinations in a Broadcast message.
+pub const MAX_BROADCAST_DESTINATIONS: usize = 16;
+
+/// Broadcast message for multi-destination delivery (e.g., backup publishing).
+///
+/// Unlike Routed messages which target a single keyspace address, Broadcast
+/// messages are sent to a small set of specific neighbors identified by their
+/// 4-byte child hashes.
+#[derive(Clone, Debug, Default)]
+pub struct Broadcast {
+    /// Source node identifier.
+    pub src_node_id: NodeId,
+    /// Truncated hashes of designated recipients (max 16).
+    pub destinations: Vec<ChildHash>,
+    /// Payload (first byte indicates type: DATA=0x00, BACKUP_PUBLISH=0x01).
+    pub payload: Payload,
+    /// Ed25519 signature over "BCAST:" || src_node_id || dest_count || destinations || payload.
+    pub signature: Signature,
 }
 
 /// Location entry stored in the DHT.

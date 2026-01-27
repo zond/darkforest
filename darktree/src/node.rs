@@ -45,13 +45,14 @@
 //! let data = node.incoming().receive().await;
 //! ```
 
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use hashbrown::HashMap;
 
 use embassy_sync::channel::Channel;
 
+use crate::children::ChildrenStore;
 use crate::config::{DefaultConfig, NodeConfig};
 use crate::fraud::{FraudDetection, HllSecretKey};
 use crate::time::{Duration, Timestamp};
@@ -59,6 +60,7 @@ use crate::traits::{
     AppInChannel, AppOutChannel, Clock, Crypto, EventChannel, IncomingData, OutgoingData, Random,
     Transport,
 };
+use crate::tree::FastDivisor;
 use crate::types::{
     ChildHash, Event, LocationEntry, NodeId, PublicKey, Routed, SecretKey, TransportMetrics,
     RECENTLY_FORWARDED_TTL_MULTIPLIER,
@@ -106,9 +108,6 @@ pub(crate) struct JoinContext {
 }
 
 // Type aliases for collections
-pub(crate) type ChildMap = BTreeMap<NodeId, u32>;
-/// Child ranges: child_id -> (keyspace_lo, keyspace_hi).
-pub(crate) type ChildRanges = HashMap<NodeId, (u32, u32)>;
 /// Shortcuts: shortcut_id -> (keyspace_lo, keyspace_hi).
 pub(crate) type ShortcutMap = HashMap<NodeId, (u32, u32)>;
 pub(crate) type NeighborTimingMap = HashMap<NodeId, NeighborTiming>;
@@ -129,8 +128,8 @@ pub(crate) type DistrustedMap = HashMap<NodeId, Timestamp>;
 /// Messages awaiting pubkey for a specific node_id (keyed by the node whose pubkey is needed).
 pub(crate) type PendingPubkeyMap = HashMap<NodeId, VecDeque<Routed>>;
 
-/// 8-byte hash used for ACK identification.
-pub(crate) type AckHash = [u8; 8];
+/// 4-byte hash used for ACK identification.
+pub(crate) type AckHash = [u8; 4];
 
 /// Pending ACK entry for link-layer reliability.
 ///
@@ -139,6 +138,8 @@ pub(crate) type AckHash = [u8; 8];
 pub(crate) struct PendingAck {
     /// Original encoded message bytes for retransmission.
     pub original_bytes: Vec<u8>,
+    /// Priority for retransmission.
+    pub priority: crate::types::Priority,
     /// Number of retries attempted so far.
     pub retries: u8,
     /// Timestamp when next retry should occur.
@@ -153,6 +154,24 @@ pub(crate) type PendingAckMap = HashMap<AckHash, PendingAck>;
 /// Map of recently forwarded message hashes for duplicate detection.
 /// Stores (timestamp, ttl) to distinguish retransmissions from alternate paths.
 pub(crate) type RecentlyForwardedMap = HashMap<AckHash, (Timestamp, u8)>;
+
+/// Backup entry for DHT redundancy.
+///
+/// Stores a location entry received via BACKUP_PUBLISH, along with metadata
+/// about which storage node we're backing up for.
+#[derive(Clone, Debug)]
+pub(crate) struct BackupEntry {
+    /// The location entry being backed up.
+    pub entry: LocationEntry,
+    /// Child hash of the storage node we're backing up for.
+    pub backed_up_for: ChildHash,
+    /// When this backup was received.
+    pub received_at: Timestamp,
+}
+
+/// Backup store: (node_id, replica_index) -> BackupEntry.
+/// Keyed the same as LocationStore to allow efficient lookup and deduplication.
+pub(crate) type BackupStore = HashMap<(NodeId, u8), BackupEntry>;
 
 /// The main protocol node.
 ///
@@ -195,8 +214,7 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     keyspace_hi: u32,
 
     // Neighbors
-    children: ChildMap,
-    child_ranges: ChildRanges,
+    children: ChildrenStore,
     shortcuts: ShortcutMap,
     neighbor_times: NeighborTimingMap,
 
@@ -206,6 +224,7 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     neighbors_need_pubkey: NeighborsNeedPubkeySet,
     location_store: LocationStore,
     location_cache: LocationCache,
+    backup_store: BackupStore,
 
     // Pending operations
     pending_lookups: PendingLookupMap,
@@ -238,6 +257,8 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
 
     // Cached computations (avoid u64 division on 32-bit MCUs)
     cached_tau_ms: u64,
+    /// Cached fast divisor for bandwidth (bw is constant for node lifetime).
+    cached_bw_divisor: Option<FastDivisor>,
 
     // Debug events channel (only with "debug" feature)
     #[cfg(feature = "debug")]
@@ -273,15 +294,18 @@ where
         // Compute root_hash from our node_id (we are initially root of our own tree)
         let root_hash = Self::compute_node_hash_static(&crypto, &node_id);
 
-        // Cache tau to avoid u64 division on 32-bit MCUs at runtime.
+        // Cache tau and FastDivisor(bw) to avoid u64 division on 32-bit MCUs at runtime.
         // Note: tau is computed once at initialization. If transport bandwidth
         // changes dynamically, create a new Node instance.
-        let cached_tau_ms = match transport.bw() {
+        let (cached_tau_ms, cached_bw_divisor) = match transport.bw() {
             Some(bw) if bw > 0 => {
                 let ms = (transport.mtu() as u64 * 1000) / bw as u64;
-                ms.max(crate::types::MIN_TAU_MS)
+                (
+                    ms.max(crate::types::MIN_TAU_MS),
+                    Some(FastDivisor::new(bw as u64)),
+                )
             }
-            _ => crate::types::MIN_TAU_MS,
+            _ => (crate::types::MIN_TAU_MS, None),
         };
 
         // Derive HLL secret key from identity for deterministic behavior.
@@ -321,8 +345,7 @@ where
             keyspace_lo: 0,
             keyspace_hi: u32::MAX,
 
-            children: BTreeMap::new(),
-            child_ranges: HashMap::new(),
+            children: ChildrenStore::new(),
             shortcuts: HashMap::new(),
             neighbor_times: HashMap::new(),
 
@@ -331,6 +354,7 @@ where
             neighbors_need_pubkey: BTreeSet::new(),
             location_store: HashMap::new(),
             location_cache: HashMap::new(),
+            backup_store: HashMap::new(),
 
             pending_lookups: HashMap::new(),
             pending_data: HashMap::new(),
@@ -354,6 +378,7 @@ where
             metrics: TransportMetrics::new(),
 
             cached_tau_ms,
+            cached_bw_divisor,
 
             #[cfg(feature = "debug")]
             debug_channel: embassy_sync::channel::Channel::new(),
@@ -605,15 +630,16 @@ where
 
         // Minimum interval between pulses is 2*tau
         let min_interval = self.tau() * 2;
-        let interval = match self.transport.bw() {
-            Some(bw) if bw > 0 => {
+        let interval = match &self.cached_bw_divisor {
+            Some(divisor) => {
                 // Interval to stay within pulse bandwidth budget.
-                // Single division for better integer accuracy:
-                // secs = pulse_size / (bw / divisor) = pulse_size * divisor / bw
-                let secs = (self.last_pulse_size as u64 * PULSE_BW_DIVISOR as u64) / (bw as u64);
+                // Uses cached FastDivisor to avoid u64 software division on 32-bit MCUs.
+                // secs = pulse_size * divisor / bw
+                let numerator = self.last_pulse_size as u64 * PULSE_BW_DIVISOR as u64;
+                let secs = divisor.div(numerator);
                 Duration::from_secs(secs).max(min_interval)
             }
-            _ => min_interval,
+            None => min_interval,
         };
 
         let budget_time = last + interval;
@@ -684,7 +710,8 @@ where
                 // Implicit ACK: overhearing a Routed message clears pending ACK
                 // Only clear if TTL matches what we expect (sent_ttl - 1).
                 // This prevents false positives from messages arriving via alternate paths.
-                let received_hash = self.compute_ack_hash(&routed);
+                use crate::traits::Ackable;
+                let received_hash = routed.ack_hash(self.crypto());
                 let received_ttl = routed.ttl;
                 if let Some(pending) = self.pending_acks.get(&received_hash) {
                     if received_ttl == pending.sent_ttl.saturating_sub(1) {
@@ -700,7 +727,158 @@ where
                 // Explicit ACK: sender received duplicate and is confirming receipt
                 self.pending_acks.remove(&ack.hash);
             }
+            Message::Broadcast(broadcast) => {
+                self.record_protocol_received();
+                self.handle_broadcast(broadcast, now);
+            }
         }
+    }
+
+    /// Handle an incoming Broadcast message.
+    ///
+    /// Verifies the sender is a known neighbor, checks if we are a designated recipient,
+    /// verifies the signature, and dispatches based on payload type.
+    fn handle_broadcast(&mut self, broadcast: crate::types::Broadcast, now: Timestamp) {
+        // Step 1: Verify we are a designated recipient
+        let my_hash = self.compute_node_hash(self.node_id());
+        if !broadcast.destinations.contains(&my_hash) {
+            return; // Not for us
+        }
+
+        // Step 2: Verify sender is a known neighbor
+        if !self.neighbor_times.contains_key(&broadcast.src_node_id) {
+            return; // Unknown sender
+        }
+
+        // Step 3: Verify Broadcast signature
+        let pubkey = match self.pubkey_cache.get(&broadcast.src_node_id) {
+            Some((pk, _)) => *pk,
+            None => return, // No pubkey available, can't verify
+        };
+
+        let sign_data = crate::wire::broadcast_sign_data(&broadcast);
+        if !self
+            .crypto
+            .verify(&pubkey, sign_data.as_slice(), &broadcast.signature)
+        {
+            return; // Invalid signature
+        }
+
+        // Dispatch based on payload type (first byte)
+        if broadcast.payload.is_empty() {
+            return;
+        }
+
+        match broadcast.payload[0] {
+            crate::types::BCAST_PAYLOAD_DATA => {
+                // Application data broadcast - deliver to app
+                let payload = broadcast.payload[1..].to_vec();
+                self.push_incoming_data(broadcast.src_node_id, payload);
+            }
+            crate::types::BCAST_PAYLOAD_BACKUP => {
+                // BACKUP_PUBLISH - decode and handle the location entry
+                self.handle_backup_publish(&broadcast, pubkey, now);
+            }
+            _ => {
+                // Unknown payload type, ignore
+            }
+        }
+    }
+
+    /// Handle BACKUP_PUBLISH payload from a verified Broadcast.
+    ///
+    /// Steps 4-8 of the 8-step verification chain:
+    /// 4. Verify sender owns keyspace for entry
+    /// 5. Verify LOC: signature on entry
+    /// 6. Check seq (only store if newer)
+    /// 7. Check per-neighbor limit
+    /// 8. Evict oldest if at capacity
+    fn handle_backup_publish(
+        &mut self,
+        broadcast: &crate::types::Broadcast,
+        _sender_pubkey: crate::types::PublicKey,
+        now: Timestamp,
+    ) {
+        use crate::wire::{location_sign_data, Decode, Reader};
+
+        // Decode LocationEntry from payload (skip the first byte which is BCAST_PAYLOAD_BACKUP)
+        let payload = &broadcast.payload[1..];
+        let mut reader = Reader::new(payload);
+        let entry = match LocationEntry::decode(&mut reader) {
+            Ok(e) => e,
+            Err(_) => return, // Invalid payload
+        };
+
+        // Step 4: Verify sender owns keyspace for entry
+        // The sender should be the storage node for this entry's keyspace address
+        // We verify this by checking if the sender's keyspace range contains entry.keyspace_addr
+        let sender_timing = match self.neighbor_times.get(&broadcast.src_node_id) {
+            Some(t) => t,
+            None => return,
+        };
+        let (sender_lo, sender_hi) = sender_timing.keyspace_range;
+        if entry.keyspace_addr < sender_lo || entry.keyspace_addr >= sender_hi {
+            return; // Sender doesn't own this keyspace
+        }
+
+        // Step 5: Verify LOC: signature on entry
+        let loc_sign_data = location_sign_data(&entry.node_id, entry.keyspace_addr, entry.seq);
+        if !self
+            .crypto
+            .verify(&entry.pubkey, loc_sign_data.as_slice(), &entry.signature)
+        {
+            return; // Invalid location signature
+        }
+
+        // Compute sender's child hash for tracking
+        let sender_hash = self.compute_node_hash(&broadcast.src_node_id);
+
+        let key = (entry.node_id, entry.replica_index);
+
+        // Step 6: Check seq (only store if newer)
+        if let Some(existing) = self.backup_store.get(&key) {
+            if existing.entry.seq >= entry.seq {
+                return; // We have a newer or equal entry
+            }
+        }
+
+        // Step 7: Check per-neighbor limit
+        let count_from_sender = self
+            .backup_store
+            .values()
+            .filter(|e| e.backed_up_for == sender_hash)
+            .count();
+        if count_from_sender >= Cfg::MAX_BACKUPS_PER_NEIGHBOR {
+            // At limit for this neighbor - could evict oldest from this neighbor
+            // but for simplicity, just reject
+            return;
+        }
+
+        // Step 8: Evict oldest if at MAX_BACKUP_STORE
+        if self.backup_store.len() >= Cfg::MAX_BACKUP_STORE && !self.backup_store.contains_key(&key)
+        {
+            // Find and remove oldest entry
+            let oldest_key = self
+                .backup_store
+                .iter()
+                .min_by_key(|(_, v)| v.received_at)
+                .map(|(k, _)| *k);
+            if let Some(k) = oldest_key {
+                self.backup_store.remove(&k);
+            }
+        }
+
+        // Store the backup entry
+        let mut entry_with_timestamp = entry;
+        entry_with_timestamp.received_at = now;
+        self.backup_store.insert(
+            key,
+            BackupEntry {
+                entry: entry_with_timestamp,
+                backed_up_for: sender_hash,
+                received_at: now,
+            },
+        );
     }
 
     /// Handle application send request.
@@ -771,12 +949,16 @@ where
     /// Check ACK timeouts, returning entries needing action and next timeout.
     ///
     /// Returns ((retransmit_list, give_up_list), next_timeout_time).
+    /// Retransmit list contains (hash, bytes, priority, retries).
     #[allow(clippy::type_complexity)]
     fn check_ack_timeouts(
         &self,
         now: Timestamp,
     ) -> (
-        (Vec<(AckHash, Vec<u8>, u8)>, Vec<AckHash>),
+        (
+            Vec<(AckHash, Vec<u8>, crate::types::Priority, u8)>,
+            Vec<AckHash>,
+        ),
         Option<Timestamp>,
     ) {
         use crate::types::MAX_RETRIES;
@@ -788,7 +970,12 @@ where
         for (&hash, pending) in self.pending_acks.iter() {
             if now >= pending.next_retry_at {
                 if pending.retries < MAX_RETRIES {
-                    retransmit.push((hash, pending.original_bytes.clone(), pending.retries));
+                    retransmit.push((
+                        hash,
+                        pending.original_bytes.clone(),
+                        pending.priority,
+                        pending.retries,
+                    ));
                 } else {
                     give_up.push(hash);
                 }
@@ -808,10 +995,12 @@ where
     ///
     /// Returns the next timeout time (if any pending ACKs remain).
     fn handle_ack_timeouts(&mut self, now: Timestamp) -> Option<Timestamp> {
+        use crate::types::PreEncoded;
+
         let ((retransmit, give_up), next_timeout) = self.check_ack_timeouts(now);
 
         // Process retransmissions
-        for (hash, bytes, retries) in retransmit {
+        for (hash, bytes, priority, retries) in retransmit {
             // Calculate next retry time with exponential backoff and jitter
             let next_retry = now + self.retry_backoff(retries + 1);
 
@@ -821,9 +1010,9 @@ where
                 pending.next_retry_at = next_retry;
             }
 
-            // Retransmit
-            let result = self.transport().protocol_outgoing().try_send(bytes);
-            if result.is_ok() {
+            // Retransmit with original priority
+            let msg = PreEncoded::new(bytes, priority);
+            if self.transport().outgoing().try_send(msg) {
                 self.record_protocol_sent();
             } else {
                 self.record_protocol_dropped();
@@ -934,20 +1123,12 @@ where
 
     // --- Internal accessors for other modules ---
 
-    pub(crate) fn children(&self) -> &ChildMap {
+    pub(crate) fn children(&self) -> &ChildrenStore {
         &self.children
     }
 
-    pub(crate) fn children_mut(&mut self) -> &mut ChildMap {
+    pub(crate) fn children_mut(&mut self) -> &mut ChildrenStore {
         &mut self.children
-    }
-
-    pub(crate) fn child_ranges(&self) -> &ChildRanges {
-        &self.child_ranges
-    }
-
-    pub(crate) fn child_ranges_mut(&mut self) -> &mut ChildRanges {
-        &mut self.child_ranges
     }
 
     pub(crate) fn shortcuts(&self) -> &ShortcutMap {
@@ -996,6 +1177,16 @@ where
 
     pub(crate) fn location_store_mut(&mut self) -> &mut LocationStore {
         &mut self.location_store
+    }
+
+    #[allow(dead_code)] // Reserved for future backup retrieval
+    pub(crate) fn backup_store(&self) -> &BackupStore {
+        &self.backup_store
+    }
+
+    #[allow(dead_code)] // Reserved for future backup management
+    pub(crate) fn backup_store_mut(&mut self) -> &mut BackupStore {
+        &mut self.backup_store
     }
 
     pub(crate) fn pending_lookups(&self) -> &PendingLookupMap {
@@ -1332,6 +1523,7 @@ where
         &mut self,
         hash: AckHash,
         original_bytes: Vec<u8>,
+        priority: crate::types::Priority,
         sent_ttl: u8,
         now: Timestamp,
     ) {
@@ -1343,6 +1535,7 @@ where
 
         let pending = PendingAck {
             original_bytes,
+            priority,
             retries: 0,
             next_retry_at: now + self.tau(),
             sent_ttl,

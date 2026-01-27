@@ -146,7 +146,10 @@ where
             received_at: now,
         };
 
-        self.insert_location_store(owner_node_id, replica_index, entry);
+        self.insert_location_store(owner_node_id, replica_index, entry.clone());
+
+        // Send BACKUP_PUBLISH to random neighbors
+        self.send_backup_publish(&entry);
 
         // Update fraud detection counters (HyperLogLog cardinality estimation)
         let key = *self.hll_secret_key();

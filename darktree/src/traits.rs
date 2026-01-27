@@ -13,7 +13,9 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 
 use crate::time::Timestamp;
-use crate::types::{Event, NodeId, Payload, PublicKey, SecretKey, Signature};
+use crate::types::{
+    Event, Incoming, NodeId, Payload, PreEncoded, Priority, PublicKey, SecretKey, Signature,
+};
 
 /// Queue size for transport channels.
 pub(crate) const TRANSPORT_QUEUE_SIZE: usize = 8;
@@ -27,20 +29,8 @@ pub(crate) const EVENT_QUEUE_SIZE: usize = 16;
 /// Mutex type used for channels.
 pub(crate) type ChannelMutex = CriticalSectionRawMutex;
 
-/// Received message with optional signal strength.
-#[derive(Debug, Clone)]
-pub struct Received {
-    /// Message data.
-    pub data: Vec<u8>,
-    /// Signal strength in dBm (if available).
-    pub rssi: Option<i16>,
-}
-
-/// Outgoing transport message channel type.
-pub type TransportOutChannel = Channel<ChannelMutex, Vec<u8>, TRANSPORT_QUEUE_SIZE>;
-
 /// Incoming transport message channel type.
-pub type TransportInChannel = Channel<ChannelMutex, Received, TRANSPORT_QUEUE_SIZE>;
+pub type TransportInChannel = Channel<ChannelMutex, Incoming, TRANSPORT_QUEUE_SIZE>;
 
 /// Data received from another node (application level).
 #[derive(Debug, Clone)]
@@ -69,67 +59,282 @@ pub type AppOutChannel = Channel<ChannelMutex, OutgoingData, APP_QUEUE_SIZE>;
 /// Protocol event channel.
 pub type EventChannel = Channel<ChannelMutex, Event, EVENT_QUEUE_SIZE>;
 
+/// Trait for messages that can be sent via the priority queue.
+pub trait Outgoing {
+    /// Returns the priority of this message.
+    fn priority(&self) -> Priority;
+
+    /// Encodes the message to bytes.
+    fn encode(&self) -> Vec<u8>;
+}
+
+/// Trait for messages that can be acknowledged.
+///
+/// Implemented by `Routed` and `Broadcast` - the message types that support
+/// ACK-based reliability. The hash is computed from the message's signing data
+/// (excluding TTL for Routed, so it's invariant across hops).
+pub trait Ackable {
+    /// Compute the 4-byte ACK hash using the provided crypto.
+    ///
+    /// The hash uniquely identifies this message for duplicate detection
+    /// and acknowledgment tracking.
+    fn ack_hash<C: Crypto>(&self, crypto: &C) -> [u8; 4];
+}
+
+impl Outgoing for PreEncoded {
+    fn priority(&self) -> Priority {
+        self.priority
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        self.data.clone()
+    }
+}
+
+/// Priority queue for outgoing messages.
+///
+/// Messages are stored by priority and sequence number, ensuring:
+/// - Higher priority messages are sent first
+/// - Within the same priority, FIFO ordering is maintained
+///
+/// The queue has a configurable maximum size. When full, the lowest-priority
+/// message is dropped to make room for new messages (unless the new message
+/// is itself the lowest priority, in which case it's rejected).
+///
+/// # Design Choice: `alloc` + `BTreeMap`
+///
+/// This crate requires the `alloc` crate and uses `BTreeMap` for priority ordering.
+/// This is a deliberate choice for our target platforms (ESP32-class devices with
+/// 256KB+ RAM). Alternatives considered:
+///
+/// - **Multiple embassy Channels (one per priority)**: Simpler, but loses cross-priority
+///   eviction (can't drop low-priority to make room for high-priority when full).
+///   Also complicates async receive (must poll 5 channels).
+///
+/// - **`heapless` collections**: Would require compile-time capacity constants and
+///   doesn't support priority ordering without manual sorting.
+///
+/// **Heap fragmentation** is not a practical concern because:
+/// 1. Queue sizes are small (8-32 entries)
+/// 2. Message rates are low (LoRa tau ≈ 6.7 seconds)
+/// 3. Modern embedded allocators like `embedded-alloc` with TLSF handle this well
+///    (O(1) alloc/free, 4-byte overhead per allocation, designed for real-time)
+///
+/// If you're integrating darktree, use `embedded-alloc::TlsfHeap` or your platform's
+/// allocator (e.g., `esp-alloc` for ESP32). Avoid simple allocators like
+/// `linked_list_allocator` or `wee_alloc` which fragment poorly.
+///
+/// # Interrupt Safety
+///
+/// This queue uses `CriticalSectionRawMutex` which disables interrupts during
+/// lock operations. This provides the following safety guarantees:
+///
+/// - **ISR-safe for `try_send`**: Radio RX interrupt handlers can safely call
+///   `incoming().try_send()` to deliver received messages.
+/// - **Task-safe for all operations**: Any async task can call `try_send`,
+///   `try_receive`, or `receive`.
+/// - **No deadlock risk**: Critical sections are short (priority check + insert/remove).
+///   Message encoding happens BEFORE acquiring the lock to minimize interrupt latency.
+///
+/// # Critical Section Duration
+///
+/// With queue sizes of 8-32 entries and BTreeMap O(log n) operations:
+/// - `try_send`: ~5-15µs (priority check + optional eviction + insert)
+/// - `try_receive`: ~2-5µs (pop_first)
+///
+/// **Note:** These estimates assume a fast allocator (TLSF, dlmalloc). With a slow
+/// allocator like `linked_list_allocator`, BTreeMap operations can take 10-100×
+/// longer due to heap fragmentation and O(n) free-list traversal.
+///
+/// # Usage Contract
+///
+/// - Radio ISR → `transport.incoming().try_send()` (delivers raw bytes)
+/// - Protocol task → `transport.outgoing().try_send(msg)` (queues encoded messages)
+/// - Transmit task → `transport.outgoing().receive()` (dequeues for transmission)
+pub struct PriorityQueue {
+    /// Storage: BTreeMap sorted by (priority, sequence) for automatic ordering.
+    inner:
+        embassy_sync::blocking_mutex::Mutex<ChannelMutex, core::cell::RefCell<PriorityQueueInner>>,
+    /// Signal for async notification when items are added.
+    signal: embassy_sync::signal::Signal<ChannelMutex, ()>,
+}
+
+struct PriorityQueueInner {
+    items: alloc::collections::BTreeMap<(Priority, u64), Vec<u8>>,
+    next_seq: u64,
+    max_size: usize,
+}
+
+impl PriorityQueue {
+    /// Create a new priority queue with the specified maximum size.
+    pub const fn new(max_size: usize) -> Self {
+        Self {
+            inner: embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(
+                PriorityQueueInner {
+                    items: alloc::collections::BTreeMap::new(),
+                    next_seq: 0,
+                    max_size,
+                },
+            )),
+            signal: embassy_sync::signal::Signal::new(),
+        }
+    }
+
+    /// Try to send a message with the given priority.
+    ///
+    /// Returns true if the message was queued, false if rejected.
+    /// When the queue is full:
+    /// - If the new message has higher priority than the lowest in queue, drop lowest and accept
+    /// - Otherwise, reject the new message
+    ///
+    /// # Optimization: Pre-check Before Encoding
+    ///
+    /// This method checks capacity/priority before calling `msg.encode()` to avoid
+    /// unnecessary allocation when the message would be rejected. This requires two
+    /// brief critical sections instead of one, but avoids wasting memory when the
+    /// queue is full of higher-priority messages.
+    ///
+    /// # Race Window Between Critical Sections
+    ///
+    /// There is an intentional race window between the pre-check and insert:
+    /// 1. Pre-check says "queue has room or we can evict"
+    /// 2. Another context fills the queue with higher-priority messages
+    /// 3. We encode (potentially expensive for cryptographic signing)
+    /// 4. Re-check may now reject us (wasted encoding work)
+    ///
+    /// This is the correct tradeoff: the alternative (holding the lock during
+    /// encoding) would block all other contexts from sending, which is worse
+    /// for real-time systems. At LoRa message rates (~6.7s between messages),
+    /// this race is extremely unlikely to occur in practice.
+    pub fn try_send<T: Outgoing>(&self, msg: T) -> bool {
+        let priority = msg.priority();
+
+        // Quick pre-check: would this priority be accepted?
+        // Avoids encoding (allocation) when we'd definitely be rejected.
+        let dominated_by_higher = self.inner.lock(|cell| {
+            let inner = cell.borrow();
+            if inner.items.len() < inner.max_size {
+                false // Queue has room, will accept
+            } else if let Some((&lowest_key, _)) = inner.items.last_key_value() {
+                priority >= lowest_key.0 // Would be rejected (same or lower priority)
+            } else {
+                true // max_size=0, always reject
+            }
+        });
+
+        if dominated_by_higher {
+            return false;
+        }
+
+        // Now encode (may allocate)
+        let data = msg.encode();
+
+        // Insert with re-check (queue state may have changed between checks)
+        let success = self.inner.lock(|cell| {
+            let mut inner = cell.borrow_mut();
+
+            // Re-check: queue may have filled since pre-check
+            if inner.items.len() >= inner.max_size {
+                if let Some((&lowest_key, _)) = inner.items.last_key_value() {
+                    if priority >= lowest_key.0 {
+                        return false;
+                    }
+                    inner.items.pop_last();
+                } else {
+                    return false;
+                }
+            }
+
+            let seq = inner.next_seq;
+            inner.next_seq = inner.next_seq.wrapping_add(1);
+            inner.items.insert((priority, seq), data);
+            true
+        });
+
+        if success {
+            self.signal.signal(());
+        }
+        success
+    }
+
+    /// Try to receive the highest-priority message without blocking.
+    ///
+    /// Returns the message data if available, None if queue is empty.
+    pub fn try_receive(&self) -> Option<Vec<u8>> {
+        self.inner.lock(|cell| {
+            let mut inner = cell.borrow_mut();
+            // First entry has lowest key = highest priority
+            inner.items.pop_first().map(|(_, data)| data)
+        })
+    }
+
+    /// Wait for and receive the highest-priority message.
+    pub async fn receive(&self) -> Vec<u8> {
+        loop {
+            if let Some(data) = self.try_receive() {
+                return data;
+            }
+            self.signal.wait().await;
+        }
+    }
+
+    /// Returns the number of messages currently in the queue.
+    pub fn len(&self) -> usize {
+        self.inner.lock(|cell| cell.borrow().items.len())
+    }
+
+    /// Returns true if the queue is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Transport trait for radio/network backends.
 ///
-/// Provides channels for bidirectional communication with priority separation:
-/// - `protocol_outgoing()`: High-priority protocol messages (Pulse, PUBLISH, LOOKUP, FOUND)
-/// - `app_outgoing()`: Application data messages (DATA)
-/// - `incoming()`: All received messages
+/// Provides two channels:
+/// - `outgoing()`: Priority queue for all outgoing messages
+/// - `incoming()`: Channel for received messages (decodable to protocol messages)
 ///
 /// # Priority Model
 ///
-/// The transport implementation is responsible for scheduling between the two
-/// outgoing queues. Protocol messages should be prioritized to ensure tree
-/// maintenance and DHT operations work even under heavy application load.
+/// The outgoing priority queue automatically orders messages by priority:
+/// 1. Ack (highest) - Link-layer reliability
+/// 2. BroadcastProtocol - DHT backup (BACKUP_PUBLISH)
+/// 3. RoutedProtocol - DHT operations (PUBLISH, LOOKUP, FOUND)
+/// 4. BroadcastData - Application broadcast
+/// 5. RoutedData (lowest) - Application unicast
+///
+/// Pulse messages are sent directly (timer-driven) and bypass the queue.
 ///
 /// # Usage Pattern
 ///
 /// ```
 /// use darktree::traits::test_impls::MockTransport;
-/// use darktree::Transport;
+/// use darktree::traits::{Transport, Outgoing};
+/// use darktree::Priority;
+///
+/// // Simple wrapper for raw bytes with priority
+/// struct PriorityMessage { priority: Priority, data: Vec<u8> }
+/// impl Outgoing for PriorityMessage {
+///     fn priority(&self) -> Priority { self.priority }
+///     fn encode(&self) -> Vec<u8> { self.data.clone() }
+/// }
 ///
 /// let transport = MockTransport::new();
 ///
-/// // Node sends protocol message (Pulse, LOOKUP, etc.)
-/// transport.protocol_outgoing().try_send(vec![1, 2, 3]).ok();
+/// // Send messages with different priorities
+/// transport.outgoing().try_send(PriorityMessage {
+///     priority: Priority::RoutedData,
+///     data: vec![1, 2, 3],
+/// });
+/// transport.outgoing().try_send(PriorityMessage {
+///     priority: Priority::Ack,
+///     data: vec![4, 5, 6],
+/// });
 ///
-/// // Node sends application data
-/// transport.app_outgoing().try_send(vec![4, 5, 6]).ok();
-///
-/// // Radio task transmits - check protocol queue first (priority)
-/// let data = transport.protocol_outgoing().try_receive()
-///     .or_else(|_| transport.app_outgoing().try_receive());
-/// assert_eq!(data.unwrap(), vec![1, 2, 3]); // Protocol message first
-/// ```
-///
-/// # Simulation
-///
-/// For simulation, the simulator reads from both outgoing queues:
-///
-/// ```
-/// use darktree::traits::test_impls::MockTransport;
-/// use darktree::{Transport, Received};
-///
-/// let transport_a = MockTransport::new();
-/// let transport_b = MockTransport::new();
-///
-/// // Node A sends a message
-/// transport_a.protocol_outgoing().try_send(vec![1, 2, 3]).ok();
-///
-/// // Simulator delivers from A to B
-/// for queue in [transport_a.protocol_outgoing(), transport_a.app_outgoing()] {
-///     while let Ok(msg) = queue.try_receive() {
-///         transport_b.incoming().try_send(Received {
-///             data: msg,
-///             rssi: Some(-50),
-///         }).ok();
-///     }
-/// }
-///
-/// // Node B receives the message
-/// let received = transport_b.incoming().try_receive().unwrap();
-/// assert_eq!(received.data, vec![1, 2, 3]);
-/// assert_eq!(received.rssi, Some(-50));
+/// // Receive returns highest priority first
+/// assert_eq!(transport.outgoing().try_receive(), Some(vec![4, 5, 6])); // Ack first
+/// assert_eq!(transport.outgoing().try_receive(), Some(vec![1, 2, 3])); // Then data
 /// ```
 pub trait Transport {
     /// Maximum transmission unit for this transport.
@@ -147,24 +352,15 @@ pub trait Transport {
     ///
     /// Returns `Some(bytes_per_second)` for constrained transports (LoRa, BLE, etc.)
     /// where the Node should limit its transmission rate.
-    ///
-    /// This allows the Node to budget bandwidth across message types (e.g., limiting
-    /// Pulse overhead to 1/5 of available bandwidth) without knowing transport details.
     fn bw(&self) -> Option<u32> {
         None
     }
 
-    /// Channel for outgoing protocol messages (Pulse, PUBLISH, LOOKUP, FOUND).
+    /// Priority queue for outgoing messages.
     ///
-    /// Transport should prioritize this queue over `app_outgoing()` to ensure
-    /// tree maintenance and DHT operations work under load.
-    fn protocol_outgoing(&self) -> &TransportOutChannel;
-
-    /// Channel for outgoing application data (DATA messages).
-    ///
-    /// Lower priority than protocol messages. May be delayed or dropped
-    /// when protocol queue has pending messages.
-    fn app_outgoing(&self) -> &TransportOutChannel;
+    /// Messages are automatically ordered by priority and sent highest-first.
+    /// Within the same priority level, FIFO order is maintained.
+    fn outgoing(&self) -> &PriorityQueue;
 
     /// Channel for incoming messages.
     ///
@@ -311,12 +507,14 @@ pub mod test_impls {
 
     use super::*;
 
-    /// Mock transport for testing using embassy-sync channels.
+    /// Default queue size for MockTransport.
+    pub const MOCK_QUEUE_SIZE: usize = 16;
+
+    /// Mock transport for testing using priority queue.
     pub struct MockTransport {
         mtu: usize,
         bw: Option<u32>,
-        protocol_outgoing: TransportOutChannel,
-        app_outgoing: TransportOutChannel,
+        outgoing: PriorityQueue,
         incoming: TransportInChannel,
     }
 
@@ -325,8 +523,7 @@ pub mod test_impls {
             Self {
                 mtu: 255,
                 bw: None,
-                protocol_outgoing: Channel::new(),
-                app_outgoing: Channel::new(),
+                outgoing: PriorityQueue::new(MOCK_QUEUE_SIZE),
                 incoming: Channel::new(),
             }
         }
@@ -351,42 +548,20 @@ pub mod test_impls {
             Self {
                 mtu,
                 bw,
-                protocol_outgoing: Channel::new(),
-                app_outgoing: Channel::new(),
+                outgoing: PriorityQueue::new(MOCK_QUEUE_SIZE),
                 incoming: Channel::new(),
             }
         }
 
         /// Inject a message as if it was received (for testing).
         pub fn inject_rx(&self, data: Vec<u8>, rssi: Option<i16>) {
-            let _ = self.incoming.try_send(Received { data, rssi });
+            let _ = self.incoming.try_send(Incoming::new(data, rssi));
         }
 
-        /// Take all sent messages from both queues (protocol first, for testing).
+        /// Take all sent messages in priority order (for testing).
         pub fn take_sent(&self) -> Vec<Vec<u8>> {
             let mut msgs = Vec::new();
-            while let Ok(msg) = self.protocol_outgoing.try_receive() {
-                msgs.push(msg);
-            }
-            while let Ok(msg) = self.app_outgoing.try_receive() {
-                msgs.push(msg);
-            }
-            msgs
-        }
-
-        /// Take only protocol messages (for testing).
-        pub fn take_protocol_sent(&self) -> Vec<Vec<u8>> {
-            let mut msgs = Vec::new();
-            while let Ok(msg) = self.protocol_outgoing.try_receive() {
-                msgs.push(msg);
-            }
-            msgs
-        }
-
-        /// Take only application messages (for testing).
-        pub fn take_app_sent(&self) -> Vec<Vec<u8>> {
-            let mut msgs = Vec::new();
-            while let Ok(msg) = self.app_outgoing.try_receive() {
+            while let Some(msg) = self.outgoing.try_receive() {
                 msgs.push(msg);
             }
             msgs
@@ -402,12 +577,8 @@ pub mod test_impls {
             self.bw
         }
 
-        fn protocol_outgoing(&self) -> &TransportOutChannel {
-            &self.protocol_outgoing
-        }
-
-        fn app_outgoing(&self) -> &TransportOutChannel {
-            &self.app_outgoing
+        fn outgoing(&self) -> &PriorityQueue {
+            &self.outgoing
         }
 
         fn incoming(&self) -> &TransportInChannel {
