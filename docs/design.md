@@ -55,6 +55,7 @@ These constants define protocol limits and memory bounds. Implementations MUST r
 | Constant | Value | Rationale |
 |----------|-------|-----------|
 | MAX_CHILDREN | 12 | Ensures worst-case Pulse fits in 252 bytes |
+| MAX_TREE_DEPTH | 255 | Allows long chains in sparse networks |
 | K_REPLICAS | 3 | Location directory replication factor |
 | DEFAULT_TTL | 255 | Maximum hop count for Routed messages |
 | MISSED_PULSES_TIMEOUT | 8 | Pulses before declaring neighbor dead |
@@ -65,7 +66,7 @@ These constants define protocol limits and memory bounds. Implementations MUST r
 |----------|-------|-----------|
 | MIN_TAU_MS | 100 | Floor for unlimited-bandwidth links |
 | RECENTLY_FORWARDED_TTL | 320τ | Must exceed worst-case retry (~280τ) |
-| LOOKUP_TIMEOUT | 32τ | Per-replica lookup timeout |
+| LOOKUP_TIMEOUT | 3τ + 3τ × max_tree_depth | Per-replica; scales with tree depth |
 | DISTRUST_TTL | 24 hours | How long to avoid fraudulent nodes |
 
 ### Memory Bounds
@@ -168,6 +169,8 @@ struct Pulse {
     flags: u8,                          // 1 byte (see layout below)
     parent_hash: Option<[u8; 4]>,       // 0 or 4 bytes (truncated hash of parent node_id)
     root_hash: [u8; 4],                 // 4 bytes (truncated hash of root node_id)
+    depth: u8,                          // 1 byte (distance from root, 0 = root)
+    max_depth: u8,                      // 1 byte (max depth in subtree below)
     subtree_size: varint,               // 1-3 bytes
     tree_size: varint,                  // 1-3 bytes
     keyspace_lo: u32,                   // 4 bytes (start of owned keyspace range)
@@ -184,12 +187,13 @@ struct Pulse {
 - bit 0: has_parent (if set, parent_hash is present)
 - bit 1: need_pubkey (requesting pubkeys from neighbors)
 - bit 2: has_pubkey (if set, pubkey field is present)
-- bits 3-7: child_count (0-31 encodable, but values > 12 MUST be rejected)
+- bit 3: unstable (node is in transition, don't join as child)
+- bits 4-7: child_count (0-15 encodable, but values > 12 MUST be rejected)
 
-Example: 5 children, has parent, includes pubkey → 0b00101_101 = 0x2D
+Example: 5 children, has parent, includes pubkey → 0b0101_0_101 = 0x55
 ```
 
-**Note:** While bits 3-7 can encode values 0-31, only 0-12 are valid. Messages with child_count > MAX_CHILDREN (12) MUST be rejected during parsing.
+**Note:** While bits 4-7 can encode values 0-15, only 0-12 are valid. Messages with child_count > MAX_CHILDREN (12) MUST be rejected during parsing.
 
 ### Keyspace Range
 
@@ -207,8 +211,8 @@ A node's "address" for routing is the center of its range: `keyspace_lo + (keysp
 
 Signature covers ALL fields (domain-separated):
 ```
-"PULSE:" || node_id || flags || parent_hash || root_hash || subtree_size ||
-            tree_size || keyspace_lo || keyspace_hi || pubkey || children
+"PULSE:" || node_id || flags || parent_hash || root_hash || depth || max_depth ||
+            subtree_size || tree_size || keyspace_lo || keyspace_hi || pubkey || children
 ```
 
 ### Children Encoding (ChildList)
@@ -220,7 +224,7 @@ fn child_hash(node_id: &NodeId) -> [u8; 4] {
 }
 ```
 
-**Format:** For each child (count from flags bits 3-7):
+**Format:** For each child (count from flags bits 4-7):
 ```
 [hash: [u8; 4]] [subtree_size: varint]
 ```
@@ -275,16 +279,16 @@ Pulses have no sequence number. This is a deliberate tradeoff:
 
 | Scenario | Size |
 |----------|------|
-| Root (no parent, no children, no pubkey) | ~94 bytes |
-| Leaf (no pubkey) | ~98 bytes |
-| Leaf (with pubkey) | ~130 bytes |
-| 8 children + pubkey | ~175 bytes |
-| 12 children + pubkey | ~205 bytes |
-| 12 children + pubkey (worst) | ~247 bytes |
+| Root (no parent, no children, no pubkey) | ~96 bytes |
+| Leaf (no pubkey) | ~100 bytes |
+| Leaf (with pubkey) | ~132 bytes |
+| 8 children + pubkey | ~177 bytes |
+| 12 children + pubkey | ~207 bytes |
+| 12 children + pubkey (worst) | ~250 bytes |
 
-**Size formula:** `94 + has_parent×4 + has_pubkey×32 + children×(4+varint) + varint_overhead`
+**Size formula:** `96 + has_parent×4 + has_pubkey×32 + children×(4+varint) + varint_overhead`
 
-Base: 16 (node_id) + 1 (flags) + 4 (root_hash) + 2 (subtree_size) + 2 (tree_size) + 4 (keyspace_lo) + 4 (keyspace_hi) + 64 (signature) = 97 bytes. Subtract 4 for no parent ≈ 94 bytes minimum.
+Base: 16 (node_id) + 1 (flags) + 4 (root_hash) + 1 (depth) + 1 (max_depth) + 2 (subtree_size) + 2 (tree_size) + 4 (keyspace_lo) + 4 (keyspace_hi) + 65 (signature) = 100 bytes. Subtract 4 for no parent ≈ 96 bytes minimum.
 
 **MTU constraints:** MAX_CHILDREN is set to 12 to guarantee worst-case Pulse (with pubkey and maximum varints) fits within 252 bytes, leaving headroom for any transport framing.
 
@@ -375,7 +379,8 @@ The effective Pulse interval is approximately 3τ under normal conditions (based
 |----------|---------------|----------------|
 | Join (get keyspace range) | 6-9τ | 2-4τ |
 | Merge detection | 0-3τ | 1-2τ |
-| Merge shopping | 3τ | 3τ |
+| Shopping (leaf) | 3τ | 3τ |
+| Shopping (5 levels below) | 13τ | 13τ |
 | State propagation | 0-3τ | 1-2τ |
 | Pubkey exchange | 3-6τ | 2-4τ |
 
@@ -515,6 +520,8 @@ N → Pulse{
   node_id: N,
   parent_hash: None,
   root_hash: hash(N)[..4],
+  depth: 0,
+  max_depth: 0,
   subtree_size: 1,
   tree_size: 1,
   keyspace_lo: 0,
@@ -525,51 +532,100 @@ N → Pulse{
 N state:
   parent = None
   root = N
+  depth = 0
+  max_depth = 0
   tree_size = 1
   keyspace = [0, 2³²)
 ```
 
-N is root of its own single-node tree.
+N is root of its own single-node tree (depth=0, max_depth=0).
 
-### Merge Shopping (Parent Selection)
+### Parent Selection
 
-Nodes always boot as root of a single-node tree (see Bootstrap). Parent selection happens through **merge shopping** — a unified mechanism used both at first boot and when merging into a dominating tree.
+Nodes always boot as root of a single-node tree (see Bootstrap). Parent selection happens through **shopping** — a mechanism that collects neighbor Pulses before choosing a parent.
 
-**When merge shopping triggers:**
-1. **First boot** — Immediately after first Pulse, node starts merge shopping to find a parent
-2. **Dominating tree seen** — When a node sees a Pulse from a better tree (larger tree_size, or equal size with lower root_hash)
+#### Shopping Triggers
 
-**Merge shopping phase (3τ):**
-1. Node starts a merge timer (3τ) to collect neighbor Pulses
-2. When timer fires, node evaluates all candidates from the target tree
-3. If no valid candidates, stay as root and retry on next dominating Pulse
+Three events trigger shopping:
 
-**Candidate filtering:** A neighbor is skipped if:
+- **First boot** — node starts as a 1-node tree root, immediately shops for a parent
+- **Dominating tree seen** — neighbor's tree is larger (or equal size with lower root_hash)
+- **Parent lost** — 8 missed Pulses or explicit rejection (child not in parent's children list after 3 Pulses)
+
+#### Shopping Procedure
+
+When shopping is triggered:
+
+1. **Remember `old_parent` and `old_tree`** (current root_hash, may be None for first boot)
+2. **Set `unstable = true`** — signals to neighbors not to join this node during shopping
+3. **Start shopping timer** with scaled duration: `3τ + 2τ × levels_below_me`
+4. **Collect Pulses from ALL neighbors** — the trigger started shopping, but we might find an even better option during the window
+5. **When timer fires, select parent using preference order:**
+   a. If candidates exist in a dominating tree → pick best, switch to that tree
+   b. Else if `old_parent` is valid (responding, not full) → stay with them
+   c. Else if candidates exist in current tree (`old_tree`) → pick best
+   d. Else → become root (or stay root for first boot)
+6. **Clear `unstable`** after shopping completes
+
+The scaled duration gives subtrees time to propagate changes upward before the node decides. A leaf shops for 3τ. A node with 5 levels below it shops for 13τ.
+
+**Why this preference order works:**
+
+- *First boot with no neighbors* → step 5d, stays as root
+- *First boot with neighbors* → step 5a or 5c, joins best tree
+- *Dominating tree seen, valid parent there* → step 5a, switches trees (merge)
+- *Dominating tree seen, no valid parent there* → step 5b, stays with old parent
+- *Parent lost, new candidate found* → step 5a or 5c, switches to new parent
+- *Parent lost, old parent reappears* → step 5b, stays with old parent
+- *Parent lost, no candidates* → step 5d, becomes root
+
+**Retry after becoming root:** Step 5d is not permanent. If a node becomes root due to no valid candidates, the next dominating Pulse it receives will trigger shopping again. This allows recovery when the network topology changes.
+
+#### The Unstable Flag
+
+A node sets `unstable = true` whenever it is shopping for a parent. This signals to neighbors: "don't join me as a child right now — my position in the tree might change."
+
+**A node is stable (unstable = false) when:**
+- It is root (no claimed parent) AND not currently shopping, OR
+- It has a claimed parent AND is receiving Pulses from that parent (within 8-Pulse timeout) AND not currently shopping
+
+**A node becomes unstable when:**
+- It starts shopping (any trigger: first boot, dominating tree, or parent loss)
+- Its claimed parent stops responding (8 missed Pulses) — this triggers shopping
+
+**Why this matters:** During shopping, a node's depth and tree membership might change. If another node joins it as a child based on stale information, this could create inconsistencies or cycles. The unstable flag prevents this.
+
+#### Selecting Best Candidate
+
+During shopping, candidates are evaluated as follows:
+
+1. **Pick the best tree** — if multiple trees visible, choose largest tree_size (tie-break: lowest root_hash). This becomes the "target tree."
+2. **Filter by signal strength** — if 3+ candidates and RSSI data available, remove bottom 50% by RSSI. This is a soft defense for reliable links, not a security guarantee (RSSI can be manipulated). Skip this step for non-radio transports (e.g., UDP) or when fewer than 3 candidates.
+3. **Pick shallowest** — from remaining candidates, choose the one with smallest depth (tie-break: best RSSI, or arbitrary if no RSSI). This keeps trees wide and shallow. The `depth` field in Pulses is the authoritative measure of tree position.
+
+This algorithm is used in step 5a/5c of the Shopping Procedure. The preference order in that step handles fallback when no valid candidates exist.
+
+#### Candidate Filtering
+
+A neighbor is **skipped** during candidate evaluation if:
 - It has `children.len() >= MAX_CHILDREN` (parent is full)
 - It is in the distrusted set
-- Its root_hash doesn't match the target tree (for merges)
+- It has `unstable = true` in its Pulse flags — **except `old_parent`**, since we're already their child
+- **Same tree AND depth >= our depth** (would create cycle — see below)
 
-**Parent selection algorithm:**
-1. **Pick the best tree** — if multiple roots visible, choose largest tree_size (tie-break: lowest root_hash). This becomes the "target tree" for candidate filtering.
-2. **Filter by signal strength** — if 3+ candidates and RSSI data available, remove bottom 50% by RSSI. This is a soft defense for reliable links, not a security guarantee (RSSI can be manipulated). Skip this step for non-radio transports (e.g., UDP) or when fewer than 3 candidates.
-3. **Pick shallowest** — from remaining candidates, choose the one with largest keyspace range (tie-break: best RSSI, or arbitrary if no RSSI). This keeps trees wide and shallow.
+**Racing shopping:** If `old_parent` is also shopping when we choose to stay with them (step 5b), they might switch trees before we finish. This is safe: the scaled shopping duration (`3τ + 2τ × levels_below_me`) means nodes with more descendants shop longer, so children typically finish before parents. If `old_parent` does switch trees, they won't include us in their children list (wrong root_hash), triggering implicit rejection and new shopping.
 
-If no valid candidates remain from the target tree, fall back to candidates from the next-best tree using the same algorithm. If still no valid candidates, the node stays root of its single-node tree (or subtree during merges).
+**Why depth check prevents cycles:** In the same tree, a node can only join a shallower node (smaller depth). This forms a DAG that converges to a tree. Joining a node at equal or greater depth could create a cycle where A→B→...→A.
 
-**Mutual parent detection:** If a node claims a parent but sees that parent also claiming it as parent (via parent_hash), one of them is in an invalid state. The node from the dominated tree (smaller tree_size, or equal size with higher root_hash) should back off and retry merge shopping.
+**Mutual parent detection:** If a node claims a parent but sees that parent also claiming it as parent (via parent_hash), one of them is in an invalid state. The node from the dominated tree (smaller tree_size, or equal size with higher root_hash) should back off and retry shopping.
 
-**Why 3τ?** This window allows time for:
-- Neighbors to respond to the node's Pulse
-- Multiple neighbors to send their periodic Pulses
-- The node to receive Pulses from neighbors at different distances
+#### After Joining
 
-**After joining:** Once a node has a parent, it only switches parent when:
-- **Merge** — node sees a better tree (triggers new merge shopping phase)
-- **Parent timeout** — after 8 missed Pulses, node becomes root of its own subtree (see "Partition and Reconnection")
+Once a node has a parent, it only switches parent when:
+- **Dominating tree** — node sees a better tree (triggers shopping)
+- **Parent timeout** — after 8 missed Pulses (triggers shopping)
 
-This unified mechanism ensures both new nodes and merging subtrees find optimal shallow positions. Without merge shopping, a node might join the first neighbor it sees even when a much shallower position is reachable.
-
-This prioritization naturally produces wide, shallow trees. Larger keyspace ranges indicate shallower positions in the tree.
+This mechanism ensures nodes find optimal shallow positions. Without shopping, a node might join the first neighbor it sees even when a much shallower position is reachable.
 
 **Implicit rejection:** When a node claims a parent (by setting `parent_hash` in its Pulse), the parent decides whether to accept by including the child in its `children` list. A parent silently ignores a child if it already has `MAX_CHILDREN` children.
 
@@ -578,37 +634,40 @@ If a joining node doesn't see itself in the parent's `children` list after 3 Pul
 **Join sequence example:**
 
 ```
-t=0: N → Pulse{node_id: N, parent_hash: None, root_hash: hash(N), tree_size: 1, ...}
+t=0: N → Pulse{node_id: N, parent_hash: None, root_hash: hash(N), tree_size: 1, depth: 0, ...}
 
 t=0: P receives N's Pulse:
   - Unknown node_id → schedule proactive Pulse, need_pubkey=true
 
 t≈1.5τ: P → proactive Pulse{node_id: P, parent_hash: hash(G), root_hash: hash(R), tree_size: 500,
-            keyspace_lo: X, keyspace_hi: Y, need_pubkey: true, ...}
+            keyspace_lo: X, keyspace_hi: Y, depth: 2, need_pubkey: true, ...}
 
 t≈1.5τ: N receives P's Pulse:
   - Different root_hash
-  - N.tree_size(1) < P.tree_size(500) → N joins P's tree
-  - N.parent = P, N.root = R
+  - N.tree_size(1) < P.tree_size(500) → N starts shopping (dominating tree trigger)
+  - Target tree: hash(R)
+
+t≈3τ: N evaluates candidates, picks P (shallowest from target tree)
+  - N.parent = P, N.root = R, N.depth = 3
   - State changed → schedule proactive Pulse with pubkey
 
-t≈3τ: N → proactive Pulse{node_id: N, parent_hash: hash(P), root_hash: hash(R), tree_size: 500,
-          keyspace_lo: 0, keyspace_hi: 0,  // doesn't know range yet
+t≈4.5τ: N → proactive Pulse{node_id: N, parent_hash: hash(P), root_hash: hash(R), tree_size: 500,
+          keyspace_lo: 0, keyspace_hi: 0, depth: 3,  // doesn't know range yet
           pubkey: pubkey_N, ...}
 
-t≈3τ: P receives N's Pulse:
+t≈4.5τ: P receives N's Pulse:
   - N.pubkey present → cache it
   - N claims parent_hash = hash(P) → P.children.insert(N)
   - P.subtree_size += 1
   - State changed → schedule proactive Pulse
 
-t≈4.5τ: P → proactive Pulse{..., children: [(hash(N), 1), ...], ...}
+t≈6τ: P → proactive Pulse{..., children: [(hash(N), 1), ...], ...}
 
-t≈4.5τ: N receives P's Pulse:
+t≈6τ: N receives P's Pulse:
   - N finds itself in P.children (by hash) → computes keyspace range from P's range
 ```
 
-**Total join time: ~4.5τ** (for LoRa with τ≈1s, this is ~4.5 seconds vs 50-75 seconds with periodic-only Pulses)
+**Total join time: ~6τ** (for LoRa with τ≈6.7s, this is ~40 seconds)
 
 ### Merging
 
@@ -702,18 +761,26 @@ Step 4 (t≈4.5τ): Inversion propagates to Rb
 
 ```
 Before:
-      R (tree_size=100)
+      R (tree_size=100, depth=0)
      / \
     A   B
    /
-  C (subtree_size=30)
+  C (subtree_size=30, depth=2, max_depth=5)
 
-Link A-C breaks. After ~24τ (8 missed Pulses, ~160s for LoRa):
+Link A-C breaks. After 8 missed Pulses:
 
 C (no Pulse from parent A):
-  C.parent = None
-  C.root_id = C
-  C.tree_size = 30
+  - C starts shopping (parent lost trigger, see Parent Selection)
+  - C sets unstable=true in Pulse flags
+  - Shopping duration: 3τ + 2τ × (5-2) = 9τ
+
+During C's shopping period:
+  - C's children see unstable=true, don't try to switch parents
+  - Other nodes won't try to join C as children
+
+After C's shopping timer (9τ):
+  - If A's Pulse received: C stays with A, clears unstable
+  - If no valid parent: C becomes root, C.tree_size = 30, clears unstable
 
 A (no Pulse from child C):
   A.children.remove(C)
@@ -728,7 +795,10 @@ Two separate trees: R (70 nodes), C (30 nodes)
 A and C back in radio range.
 
 C receives A's Pulse:
-  - C.tree_size(30) < A.tree_size(70) → C dominated
+  - C.tree_size(30) < A.tree_size(70) → C starts shopping (dominating tree trigger)
+  - Target tree: hash(R)
+
+After shopping:
   - C.parent = A
   - C.root_id = R
 
@@ -789,9 +859,75 @@ impl Node {
 
 | Relationship | Timeout | Effect |
 |--------------|---------|--------|
-| Parent | ~24τ (8 × ~3τ interval) | Become root of subtree |
+| Parent | ~24τ (8 × ~3τ interval) | Start shopping (parent lost) |
 | Child | ~24τ (8 × ~3τ interval) | Remove from children |
 | Shortcut | ~24τ (8 × ~3τ interval) | Remove from shortcuts |
+
+### Depth Propagation
+
+The `depth` and `max_depth` fields enable cycle prevention and scaled shopping durations.
+
+**Depth computation:**
+- Root has `depth = 0`
+- Child has `depth = parent_depth + 1` (saturating at 255)
+- Learned from parent's Pulse (a joining node sets `depth = parent.depth + 1`)
+
+**Max depth computation:**
+- Leaf has `max_depth = depth` (no children below)
+- Non-leaf has `max_depth = max(child.max_depth for all children)`
+- Propagated up from children via their Pulses
+
+**Example:**
+
+```
+        R (depth=0, max_depth=3)
+       / \
+      A   B (depth=1, max_depth=1)
+     /
+    C (depth=2, max_depth=3)
+   /
+  D (depth=3, max_depth=3)  ← leaf
+```
+
+When D joins as C's child:
+1. D sets `depth = C.depth + 1 = 3`
+2. D sets `max_depth = 3` (leaf)
+3. C sees D's max_depth=3, updates `max_depth = max(3) = 3`
+4. A sees C's max_depth=3, updates `max_depth = max(3) = 3`
+5. R sees A's max_depth=3, updates `max_depth = max(3, 1) = 3`
+
+**Why depth matters for cycle prevention:** When switching parents within the same tree, a node can only join a node with smaller depth. This ensures the parent relationship forms a DAG that converges to a tree. Without depth checking, two nodes could potentially claim each other as parent.
+
+**Why max_depth matters for shopping duration:** A node's shopping duration scales with `levels_below_me = max_depth - depth`. This gives subtrees time to propagate state changes before the ancestor makes decisions. See Shopping Duration Scaling below.
+
+### Shopping Duration Scaling
+
+Shopping duration scales with tree depth to prevent cascading instability:
+
+```
+shopping_duration = 3τ + 2τ × levels_below_me
+
+Where: levels_below_me = max_depth - depth
+```
+
+**Examples:**
+- Leaf (depth=5, max_depth=5): `3τ + 2τ × 0 = 3τ`
+- Node with 3 levels below (depth=2, max_depth=5): `3τ + 2τ × 3 = 9τ`
+- Root with 10-deep tree (depth=0, max_depth=10): `3τ + 2τ × 10 = 23τ`
+
+**Why scaling is needed:** When a node starts shopping, its subtree is affected. Children see state changes and may react. By giving nodes with larger subtrees more shopping time:
+1. Leaves decide quickly (3τ) — they have no dependents
+2. Interior nodes wait longer — giving children time to propagate changes upward
+3. State changes bubble up before ancestors make decisions
+
+**For LoRa (τ≈6.7s):**
+- Leaf: ~20 seconds
+- 5 levels below: ~87 seconds
+- 10 levels below: ~154 seconds
+
+This ensures that even in deep trees, state converges before parent decisions are made.
+
+**Note:** Shopping duration is calculated once when shopping starts, using the then-current `max_depth`. If the subtree changes during shopping (nodes join or leave), the duration is not recalculated.
 
 ### Tree Size Verification
 
@@ -2142,12 +2278,15 @@ impl Node {
 Lookups find a node's current keyspace address by querying replicas.
 
 ```rust
-// LOOKUP_TIMEOUT = 32τ per replica
+// LOOKUP_TIMEOUT = 3τ + 3τ × max_tree_depth per replica
 // Accounts for: multi-hop routing (2×depth), retransmissions at each hop
-// For LoRa (τ=6.7s): ~3.5 minutes per replica
-// For UDP (τ=0.1s): ~3 seconds per replica
+// For LoRa (τ=6.7s) with 10-deep tree: ~33τ ≈ 3.7 minutes per replica
+// For UDP (τ=0.1s) with 10-deep tree: ~33τ ≈ 3.3 seconds per replica
+//
+// max_tree_depth source: use the root's max_depth from its Pulse if known,
+// otherwise use MAX_TREE_DEPTH (255) as a safe upper bound.
 fn lookup_timeout(&self) -> Duration {
-    self.tau() * 32
+    self.tau() * (3 + 3 * self.max_tree_depth as u32)
 }
 
 impl Node {
@@ -2208,7 +2347,7 @@ The target is identified by `dest_hash`. The storage node finds an entry matchin
 
 **Lookup process:**
 1. Send LOOKUP for replica 0
-2. If no FOUND within 32τ, try replica 1
+2. If no FOUND within LOOKUP_TIMEOUT (3τ + 3τ × max_tree_depth), try replica 1
 3. If still no response, try replica 2
 4. After all replicas timeout, lookup fails
 
@@ -2371,7 +2510,9 @@ Future version 1 Pulse = 0x09 (version 1, type 1) — (1 << 3) | 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                         root_hash (4 bytes)                   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  subtree_size (varint 1-3)  |   tree_size (varint 1-3)  |
+|     depth     |   max_depth   |  subtree_size (varint 1-3)   ...
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+...  |   tree_size (varint 1-3)   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                       keyspace_lo (4 bytes)                   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -2389,7 +2530,14 @@ Future version 1 Pulse = 0x09 (version 1, type 1) — (1 << 3) | 1
 - bit 0: has_parent
 - bit 1: need_pubkey
 - bit 2: has_pubkey
-- bits 3-7: child_count (0-12)
+- bit 3: unstable (node is in transition, don't join as child)
+- bits 4-7: child_count (0-12)
+
+**Depth fields:**
+- `depth` (u8): Distance from root. Root has depth=0. Max value 255.
+- `max_depth` (u8): Maximum depth in this node's subtree. Leaf has max_depth=depth.
+
+Pulses with `max_depth < depth` MUST be rejected during parsing (invalid by construction).
 
 **Note:** The `subtree_size` and `tree_size` fields are varints with variable length (1-3 bytes each). Fields after these varints have variable byte offsets. The diagram shows typical placement; actual offsets depend on varint lengths.
 
@@ -2553,8 +2701,8 @@ Signatures are computed over a canonical byte encoding of message fields. The en
 **Pulse signature input:**
 ```
 "PULSE:" || node_id || flags || [parent_hash if has_parent] || root_hash ||
-subtree_size (varint) || tree_size (varint) || keyspace_lo || keyspace_hi ||
-[pubkey if has_pubkey] || children (raw wire encoding)
+depth || max_depth || subtree_size (varint) || tree_size (varint) ||
+keyspace_lo || keyspace_hi || [pubkey if has_pubkey] || children (raw wire encoding)
 ```
 
 **Routed signature input:**
@@ -2750,6 +2898,8 @@ min_interval = max(2τ, airtime / pulse_budget)
 |----------|----------------------|
 | Join (get keyspace range) | 2-4τ (~13-27s) |
 | Merge detection | 1-2τ (~7-13s) |
+| Shopping (leaf) | 3τ (~20s) |
+| Shopping (5 levels below) | 13τ (~87s) |
 | State propagation | 1-2τ (~7-13s) |
 | Pubkey exchange | 2-4τ (~13-27s) |
 | Parent timeout | 24τ (~160s) |
@@ -2821,10 +2971,10 @@ Total hops ≈ 3 × depth
 | Scenario | Detection | Effect |
 |----------|-----------|--------|
 | Leaf dies | Parent: 8 missed Pulses (~24τ) | Remove from children |
-| Internal node dies | Children: 8 missed Pulses (~24τ) | Each child becomes subtree root |
-| Root dies | Children: 8 missed Pulses (~24τ) | Children merge (largest wins) |
-| Partition | 8 missed Pulses (~24τ) | Two independent trees |
-| Partition heals | Pulses from other tree | Merge (larger wins) |
+| Internal node dies | Children: 8 missed Pulses (~24τ) | Each child starts shopping (parent lost) |
+| Root dies | Children: 8 missed Pulses (~24τ) | Children start shopping, merge if they meet |
+| Partition | 8 missed Pulses (~24τ) | Affected nodes start shopping (parent lost) |
+| Partition heals | Pulses from other tree | Shopping (dominating tree, larger wins) |
 
 ### Cryptographic Performance
 
