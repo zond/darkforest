@@ -155,6 +155,21 @@ Within each budget (protocol/application), higher-priority messages are sent fir
 - **FOUND is idempotent:** Lost responses cause timeout and retry.
 - **DATA is application's responsibility:** Applications needing reliability implement their own acks.
 
+**Link quality filtering:**
+
+Transports MAY implement RSSI-based filtering to avoid selecting parents with unreliable links. The threshold is transport-specific because different physical layers have vastly different signal characteristics:
+
+| Transport | Typical Threshold | Rationale |
+|-----------|-------------------|-----------|
+| LoRa | -110 dBm | Conservative margin above -120 dBm noise floor |
+| WiFi | -80 dBm | Weak signal, high packet loss |
+| Bluetooth | -90 dBm | Near receiver sensitivity limit |
+| UDP/TCP | N/A | No RSSI concept |
+
+The Transport trait provides `is_acceptable_rssi(rssi: Option<i16>) -> bool` for this purpose. Default returns `true` (no filtering). Transports without RSSI semantics (e.g., UDP) should use the default.
+
+This is a **link reliability optimization**, not a security control. See "Security note on RSSI" in the Parent Selection section.
+
 ---
 
 ## Pulse
@@ -472,14 +487,18 @@ impl Node {
 }
 ```
 
-**A node's "address"** is the center of its keyspace range:
+**A node's "address"** is the center of its *owned slice*, not the full keyspace range:
 ```rust
 fn my_address(&self) -> u32 {
-    self.keyspace_lo + (self.keyspace_hi - self.keyspace_lo) / 2
+    let range = self.keyspace_hi - self.keyspace_lo;
+    let own_slice_size = range / self.subtree_size;
+    self.keyspace_lo + own_slice_size / 2
 }
 ```
 
-This address is what gets published to the location directory and used in `dest_addr` for routing.
+The owned slice is 1/subtree_size of the total range, starting at keyspace_lo. Using the center of this slice (rather than the full range) ensures the address falls within keyspace the node actually owns. This is critical for LOOKUP responses - if a node published an address in keyspace delegated to children, FOUND messages would route to the wrong node.
+
+This address is what gets published to the location directory and used in `src_addr` for routing replies.
 
 ### Metadata
 
@@ -600,10 +619,12 @@ A node sets `unstable = true` whenever it is shopping for a parent. This signals
 During shopping, candidates are evaluated as follows:
 
 1. **Pick the best tree** — if multiple trees visible, choose largest tree_size (tie-break: lowest root_hash). This becomes the "target tree."
-2. **Filter by signal strength** — if 3+ candidates and RSSI data available, remove bottom 50% by RSSI. This is a soft defense for reliable links, not a security guarantee (RSSI can be manipulated). Skip this step for non-radio transports (e.g., UDP) or when fewer than 3 candidates.
+2. **Filter by minimum signal quality** — remove candidates where `transport.is_acceptable_rssi(rssi)` returns false. This is an absolute threshold filter that rejects links likely to be unreliable. Transports define their own thresholds based on physical layer characteristics (see Transport Requirements). If no RSSI data is available (rssi = None), the candidate is not filtered.
 3. **Pick shallowest** — from remaining candidates, choose the one with smallest depth (tie-break: best RSSI, or arbitrary if no RSSI). This keeps trees wide and shallow. The `depth` field in Pulses is the authoritative measure of tree position.
 
 This algorithm is used in step 5a/5c of the Shopping Procedure. The preference order in that step handles fallback when no valid candidates exist.
+
+**Security note on RSSI:** RSSI filtering is a soft defense for link reliability, not a security guarantee. An adversary with physical-layer capabilities (high-power transmitter, directional antenna) can manipulate apparent signal strength. The protocol's security properties rely on cryptographic identity verification (Ed25519 signatures binding node_id to pubkey), not radio signal characteristics. RSSI filtering reduces churn from flaky links; it does not defend against active attackers with radio capabilities.
 
 #### Candidate Filtering
 

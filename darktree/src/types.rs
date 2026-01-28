@@ -188,11 +188,13 @@ impl fmt::Debug for Signature {
 // - bit 0: has_parent
 // - bit 1: need_pubkey
 // - bit 2: has_pubkey
-// - bits 3-7: child_count (0-12, max MAX_CHILDREN)
+// - bit 3: unstable (shopping for parent)
+// - bits 4-7: child_count (0-12, max MAX_CHILDREN)
 pub(crate) const PULSE_FLAG_HAS_PARENT: u8 = 0x01;
 pub(crate) const PULSE_FLAG_NEED_PUBKEY: u8 = 0x02;
 pub(crate) const PULSE_FLAG_HAS_PUBKEY: u8 = 0x04;
-pub(crate) const PULSE_CHILD_COUNT_SHIFT: u8 = 3;
+pub(crate) const PULSE_FLAG_UNSTABLE: u8 = 0x08;
+pub(crate) const PULSE_CHILD_COUNT_SHIFT: u8 = 4;
 
 /// Periodic broadcast message for tree maintenance.
 ///
@@ -201,12 +203,16 @@ pub(crate) const PULSE_CHILD_COUNT_SHIFT: u8 = 3;
 pub struct Pulse {
     /// Node's unique identifier.
     pub node_id: NodeId,
-    /// Packed flags byte (has_parent, need_pubkey, has_pubkey, child_count).
+    /// Packed flags byte (has_parent, need_pubkey, has_pubkey, unstable, child_count).
     pub flags: u8,
     /// Truncated hash of parent (None if root).
     pub parent_hash: Option<ChildHash>,
     /// Truncated hash of root node.
     pub root_hash: ChildHash,
+    /// Distance from root (0 = root).
+    pub depth: u8,
+    /// Maximum depth in subtree rooted at this node.
+    pub max_depth: u8,
     /// Size of subtree rooted at this node.
     pub subtree_size: u32,
     /// Total size of the tree.
@@ -239,6 +245,11 @@ impl Pulse {
         self.flags & PULSE_FLAG_HAS_PUBKEY != 0
     }
 
+    /// Check if this node is unstable (shopping for parent).
+    pub fn is_unstable(&self) -> bool {
+        self.flags & PULSE_FLAG_UNSTABLE != 0
+    }
+
     /// Get the child count from flags.
     pub fn child_count(&self) -> u8 {
         self.flags >> PULSE_CHILD_COUNT_SHIFT
@@ -249,6 +260,7 @@ impl Pulse {
         has_parent: bool,
         need_pubkey: bool,
         has_pubkey: bool,
+        unstable: bool,
         child_count: u8,
     ) -> u8 {
         let mut flags = 0u8;
@@ -260,6 +272,9 @@ impl Pulse {
         }
         if has_pubkey {
             flags |= PULSE_FLAG_HAS_PUBKEY;
+        }
+        if unstable {
+            flags |= PULSE_FLAG_UNSTABLE;
         }
         flags |= (child_count.min(16)) << PULSE_CHILD_COUNT_SHIFT;
         flags
@@ -273,6 +288,8 @@ impl Default for Pulse {
             flags: 0,
             parent_hash: None,
             root_hash: [0u8; 4],
+            depth: 0,
+            max_depth: 0,
             subtree_size: 1,
             tree_size: 1,
             keyspace_lo: 0,

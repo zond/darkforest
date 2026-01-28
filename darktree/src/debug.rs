@@ -1,18 +1,17 @@
 //! Debug events for protocol tracing.
 //!
-//! Enabled via the `debug` feature. These events help trace protocol flow
+//! Enabled in test builds. These events help trace protocol flow
 //! during simulation and testing.
 
 use crate::time::Timestamp;
-use crate::traits::ChannelMutex;
 use crate::types::NodeId;
-use embassy_sync::channel::Channel;
 
-/// Queue size for debug events.
-pub const DEBUG_QUEUE_SIZE: usize = 256;
-
-/// Debug event channel type.
-pub type DebugChannel = Channel<ChannelMutex, DebugEvent, DEBUG_QUEUE_SIZE>;
+/// Trait for receiving debug events from a node.
+/// Implemented by test harnesses to collect/print events.
+pub trait DebugEmitter: Send {
+    /// Called when a debug event is emitted.
+    fn emit(&mut self, event: DebugEvent);
+}
 
 /// Debug events emitted by the node for protocol tracing.
 #[derive(Debug, Clone)]
@@ -93,4 +92,77 @@ pub enum DebugEvent {
     },
     /// Message decode failed.
     MessageDecodeFailed { data_len: usize },
+    /// Routed message sent (PUBLISH, LOOKUP, etc.)
+    RoutedSent {
+        msg_type: u8,
+        dest_addr: u32,
+        ttl: u8,
+    },
+    /// Routed message forwarded DOWN to a child/shortcut.
+    RoutedForwardedDown {
+        msg_type: u8,
+        dest_addr: u32,
+        next_hop: NodeId,
+        ttl: u8,
+        my_keyspace: (u32, u32),
+    },
+    /// Routed message forwarded UP to parent (no child owns dest).
+    RoutedForwardedUp {
+        msg_type: u8,
+        dest_addr: u32,
+        next_hop: NodeId,
+        ttl: u8,
+        my_keyspace: (u32, u32),
+    },
+    /// Routed message delivered locally (we own the keyspace).
+    RoutedDelivered {
+        msg_type: u8,
+        dest_addr: u32,
+        from: NodeId,
+    },
+    /// Routed message dropped (no route found).
+    RoutedDropped {
+        msg_type: u8,
+        dest_addr: u32,
+        reason: &'static str,
+    },
+    /// PUBLISH stored in location_store.
+    PublishStored {
+        owner: NodeId,
+        replica_index: u8,
+        dest_addr: u32,
+        keyspace_lo: u32,
+        keyspace_hi: u32,
+        own_hi: u32,
+    },
+    /// Location publish started.
+    LocationPublishStarted { node_id: NodeId, seq: u32 },
+    /// Location entry removed (rebalance or expiry).
+    LocationRemoved {
+        owner: NodeId,
+        replica_index: u8,
+        reason: &'static str,
+    },
+    /// Duplicate routed message detected (already in recently_forwarded).
+    RoutedDuplicate {
+        msg_type: u8,
+        dest_addr: u32,
+        original_ttl: u8,
+        stored_ttl: u8,
+        action: &'static str,
+    },
+    /// Bounce-back scheduled for delayed forward.
+    BounceBackScheduled {
+        msg_type: u8,
+        dest_addr: u32,
+        seen_count: u8,
+        delay_ms: u64,
+    },
+    /// Delayed forward executed after bounce-back.
+    DelayedForwardExecuted {
+        msg_type: u8,
+        dest_addr: u32,
+        ttl: u8,
+        has_route: bool,
+    },
 }

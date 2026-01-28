@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! node_id (16) || flags (1) || [parent_hash (4)] || root_hash (4)
-//! || subtree_size (varint) || tree_size (varint)
+//! || depth (1) || max_depth (1) || subtree_size (varint) || tree_size (varint)
 //! || keyspace_lo (4) || keyspace_hi (4)
 //! || [pubkey (32)] || children (N × (hash(4) + subtree_size(varint)))
 //! || signature (65)
@@ -15,7 +15,8 @@
 //! - bit 0: has_parent (determines if parent_hash present)
 //! - bit 1: need_pubkey
 //! - bit 2: has_pubkey (determines if pubkey present)
-//! - bits 3-7: child_count (0-16)
+//! - bit 3: unstable (shopping for parent)
+//! - bits 4-7: child_count (0-12)
 //!
 //! Children are sorted by hash (lexicographic big-endian).
 //! ```
@@ -68,6 +69,14 @@ pub enum DecodeError {
     InvalidFlags,
     /// Semantic validation failed (e.g., children not sorted, invalid size relationships).
     InvalidValue,
+    /// max_depth < depth
+    MaxDepthLessThanDepth,
+    /// subtree_size == 0
+    ZeroSubtreeSize,
+    /// keyspace_lo > keyspace_hi
+    InvalidKeyspace,
+    /// Children not sorted
+    ChildrenNotSorted,
 }
 
 /// Zero-copy reader over a byte slice.
@@ -458,6 +467,8 @@ impl Encode for Pulse {
         }
 
         w.write_child_hash(&self.root_hash);
+        w.write_u8(self.depth);
+        w.write_u8(self.max_depth);
         w.write_varint(self.subtree_size);
         w.write_varint(self.tree_size);
         w.write_u32_be(self.keyspace_lo);
@@ -497,20 +508,23 @@ impl Decode for Pulse {
         };
 
         let root_hash = r.read_child_hash()?;
+        let depth = r.read_u8()?;
+        let max_depth = r.read_u8()?;
         let subtree_size = r.read_varint()?;
         let tree_size = r.read_varint()?;
         let keyspace_lo = r.read_u32_be()?;
         let keyspace_hi = r.read_u32_be()?;
 
-        // Fail fast: validate sizes and keyspace before allocating children
+        // Fail fast: validate sizes, depth, and keyspace before allocating children
+        if max_depth < depth {
+            return Err(DecodeError::MaxDepthLessThanDepth);
+        }
         if subtree_size == 0 {
-            return Err(DecodeError::InvalidValue);
+            return Err(DecodeError::ZeroSubtreeSize);
         }
-        if tree_size < subtree_size {
-            return Err(DecodeError::InvalidValue);
-        }
+        // Note: tree_size < subtree_size is valid during merges (transient state)
         if keyspace_lo > keyspace_hi {
-            return Err(DecodeError::InvalidValue);
+            return Err(DecodeError::InvalidKeyspace);
         }
 
         // pubkey (conditional on has_pubkey flag)
@@ -538,7 +552,7 @@ impl Decode for Pulse {
         // Strict validation: children must be sorted by hash (ascending)
         for i in 1..children.len() {
             if children[i - 1].0 >= children[i].0 {
-                return Err(DecodeError::InvalidValue);
+                return Err(DecodeError::ChildrenNotSorted);
             }
         }
 
@@ -549,6 +563,8 @@ impl Decode for Pulse {
             flags,
             parent_hash,
             root_hash,
+            depth,
+            max_depth,
             subtree_size,
             tree_size,
             keyspace_lo,
@@ -887,6 +903,8 @@ pub(crate) fn pulse_sign_data(pulse: &Pulse) -> Writer {
     }
 
     w.write_child_hash(&pulse.root_hash);
+    w.write_u8(pulse.depth);
+    w.write_u8(pulse.max_depth);
     w.write_varint(pulse.subtree_size);
     w.write_varint(pulse.tree_size);
     w.write_u32_be(pulse.keyspace_lo);
@@ -990,9 +1008,11 @@ mod tests {
     fn test_pulse_roundtrip() {
         let pulse = Pulse {
             node_id: [1u8; 16],
-            flags: Pulse::build_flags(true, true, true, 2),
+            flags: Pulse::build_flags(true, true, true, false, 2),
             parent_hash: Some([2u8; 4]),
             root_hash: [3u8; 4],
+            depth: 2,
+            max_depth: 5,
             subtree_size: 10,
             tree_size: 100,
             keyspace_lo: 0x1000_0000,
@@ -1012,6 +1032,8 @@ mod tests {
         assert_eq!(pulse.flags, decoded.flags);
         assert_eq!(pulse.parent_hash, decoded.parent_hash);
         assert_eq!(pulse.root_hash, decoded.root_hash);
+        assert_eq!(pulse.depth, decoded.depth);
+        assert_eq!(pulse.max_depth, decoded.max_depth);
         assert_eq!(pulse.subtree_size, decoded.subtree_size);
         assert_eq!(pulse.tree_size, decoded.tree_size);
         assert_eq!(pulse.keyspace_lo, decoded.keyspace_lo);
@@ -1025,9 +1047,11 @@ mod tests {
     fn test_pulse_no_parent_no_pubkey() {
         let pulse = Pulse {
             node_id: [1u8; 16],
-            flags: Pulse::build_flags(false, false, false, 0),
+            flags: Pulse::build_flags(false, false, false, false, 0),
             parent_hash: None,
             root_hash: [3u8; 4],
+            depth: 0,
+            max_depth: 0,
             subtree_size: 1,
             tree_size: 1,
             keyspace_lo: 0,
@@ -1397,16 +1421,22 @@ mod tests {
             children.dedup_by(|a, b| a.0 == b.0);
 
             let sig: [u8; 64] = u.arbitrary()?;
+            let depth: u8 = u.arbitrary()?;
+            let max_depth: u8 = u.int_in_range(depth..=255)?;
+            let unstable: bool = u.arbitrary()?;
             let pulse = Pulse {
                 node_id,
                 flags: Pulse::build_flags(
                     has_parent,
                     need_pubkey,
                     has_pubkey,
+                    unstable,
                     children.len() as u8,
                 ),
                 parent_hash,
                 root_hash,
+                depth,
+                max_depth,
                 subtree_size,
                 tree_size,
                 keyspace_lo,
@@ -1547,20 +1577,23 @@ mod tests {
     #[test]
     fn test_unsorted_children_rejected() {
         // Manually construct a pulse with unsorted children
+        // Note: We skip the wire type byte since we call Pulse::decode_from_slice directly
         let mut w = Writer::new();
-
-        // Wire type
-        w.write_u8(0x01);
 
         // node_id
         w.write_node_id(&[1u8; 16]);
 
-        // flags: has_parent=false, need_pubkey=false, has_pubkey=false, child_count=2
-        let flags = 2 << 3; // 2 children, no other flags
+        // flags: has_parent=false, need_pubkey=false, has_pubkey=false, unstable=false, child_count=2
+        use crate::types::PULSE_CHILD_COUNT_SHIFT;
+        let flags = 2 << PULSE_CHILD_COUNT_SHIFT;
         w.write_u8(flags);
 
         // root_hash
         w.write_child_hash(&[0xAA; 4]);
+
+        // depth, max_depth
+        w.write_u8(0);
+        w.write_u8(0);
 
         // subtree_size, tree_size
         w.write_varint(3);
@@ -1583,8 +1616,9 @@ mod tests {
         let encoded = w.finish();
         let result = Pulse::decode_from_slice(&encoded);
         assert!(
-            matches!(result, Err(DecodeError::InvalidValue)),
-            "unsorted children should be rejected with InvalidValue"
+            matches!(result, Err(DecodeError::ChildrenNotSorted)),
+            "unsorted children should be rejected with ChildrenNotSorted, got {:?}",
+            result
         );
     }
 }

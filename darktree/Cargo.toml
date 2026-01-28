@@ -21,6 +21,7 @@ critical-section = "1.1"
 hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
 libm = "0.2"
 siphasher = { version = "1", default-features = false }
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [dev-dependencies]
 rand = "0.8"

@@ -42,6 +42,11 @@ where
 
         // Do I own this keyspace location?
         if self.owns_key(dest) {
+            self.emit_debug(crate::debug::DebugEvent::RoutedDelivered {
+                msg_type,
+                dest_addr: dest,
+                from: msg.src_node_id,
+            });
             // Handle locally based on message type
             match msg_type {
                 MSG_PUBLISH => self.handle_publish(msg, now),
@@ -70,13 +75,30 @@ where
         // Note: hash excludes TTL so it's the same at any hop
         let msg_hash = msg.ack_hash(self.crypto());
 
-        if let Some(&(_, stored_ttl)) = self.recently_forwarded().get(&msg_hash) {
+        if let Some(&(_stored_time, stored_ttl, _)) = self.recently_forwarded().get(&msg_hash) {
             if stored_ttl == original_ttl {
                 // Same TTL = retransmission from sender who didn't hear our forward
                 // Send explicit ACK to confirm we received and forwarded it
+                self.emit_debug(crate::debug::DebugEvent::RoutedDuplicate {
+                    msg_type,
+                    dest_addr: dest,
+                    original_ttl,
+                    stored_ttl,
+                    action: "ack_retransmit",
+                });
                 self.send_explicit_ack(msg_hash);
+                return;
             }
-            // Different TTL = same message via alternate path, ignore silently
+            // Different TTL = message looped back to us, schedule delayed retry
+            // with exponential backoff to let tree routing stabilize
+            self.emit_debug(crate::debug::DebugEvent::RoutedDuplicate {
+                msg_type,
+                dest_addr: dest,
+                original_ttl,
+                stored_ttl,
+                action: "bounce_back",
+            });
+            self.handle_bounce_back(msg, msg_hash, original_ttl, now);
             return;
         }
 
@@ -103,6 +125,176 @@ where
             self.record_protocol_sent();
         }
         // Don't track drops for ACKs - they're best-effort
+    }
+
+    /// Handle a bounce-back: message returned with different TTL during tree restructuring.
+    ///
+    /// Instead of dropping, we delay and retry with exponential backoff, giving the tree
+    /// time to stabilize.
+    fn handle_bounce_back(
+        &mut self,
+        msg: Routed,
+        ack_hash: AckHash,
+        original_ttl: u8,
+        now: Timestamp,
+    ) {
+        use crate::types::RECENTLY_FORWARDED_TTL_MULTIPLIER;
+
+        // Always ACK upstream so they don't retry while we delay (or drop)
+        self.send_explicit_ack(ack_hash);
+
+        // TTL=1 would become TTL=0 (expired) on forward - just drop it
+        // Note: msg.ttl is already decremented, so check original_ttl
+        if original_ttl <= 1 {
+            return;
+        }
+
+        // Clear our own pending_ack if present (bounce proves downstream heard us)
+        self.pending_acks_mut().remove(&ack_hash);
+
+        // Update recently_forwarded entry: increment seen_count and refresh expiration
+        let seen_count = if let Some(entry) = self.recently_forwarded_mut().get_mut(&ack_hash) {
+            entry.0 = now; // Refresh timestamp
+            entry.1 = original_ttl; // Update TTL
+            entry.2 = entry.2.saturating_add(1); // Increment seen_count
+            entry.2
+        } else {
+            // Entry was evicted - recreate it
+            self.insert_recently_forwarded(ack_hash, original_ttl, now);
+            1
+        };
+
+        // Schedule delayed forward with exponential backoff
+        // Backoff: 1τ, 2τ, 4τ, 8τ, ..., capped at 128τ
+        // Note: Duration * u64 uses saturating_mul internally, so this is overflow-safe.
+        let tau = self.tau();
+        let multiplier = 1u64 << (seen_count.saturating_sub(1)).min(7);
+        let delay = tau * multiplier;
+        let scheduled_time = now + delay;
+
+        // Refresh the recently_forwarded expiration to survive the delay
+        let expiry = tau * RECENTLY_FORWARDED_TTL_MULTIPLIER;
+        let extended_expiry = expiry.max(delay + tau); // Ensure it lives past the scheduled forward
+        if let Some(entry) = self.recently_forwarded_mut().get_mut(&ack_hash) {
+            // Set timestamp so that cleanup won't expire it before the delayed forward fires
+            entry.0 = now + extended_expiry - (tau * RECENTLY_FORWARDED_TTL_MULTIPLIER);
+        }
+
+        self.emit_debug(crate::debug::DebugEvent::BounceBackScheduled {
+            msg_type: msg.msg_type(),
+            dest_addr: msg.dest_addr,
+            seen_count,
+            delay_ms: delay.as_millis(),
+        });
+
+        self.schedule_delayed_forward(msg, ack_hash, seen_count, scheduled_time);
+    }
+
+    /// Schedule a delayed forward for bounce-back dampening.
+    ///
+    /// Deduplication: if hash exists, double the remaining delay.
+    /// Eviction: when full, drop entry with longest delay (unless new entry is longer).
+    fn schedule_delayed_forward(
+        &mut self,
+        msg: Routed,
+        ack_hash: AckHash,
+        seen_count: u8,
+        scheduled_time: Timestamp,
+    ) {
+        use crate::node::DelayedForward;
+
+        let now = self.now();
+
+        // Deduplication: extend delay if this hash already has a pending forward.
+        // Safety: delay doubling cannot grow unbounded because:
+        // 1. Message TTL limits total hops (default 64), so message eventually expires
+        // 2. The recently_forwarded entry expires after 320τ, dropping the delayed forward
+        // 3. Timestamp arithmetic is saturating, so overflow is impossible
+        if let Some(existing) = self.delayed_forwards_mut().get_mut(&ack_hash) {
+            let remaining = existing.scheduled_time.saturating_sub(now);
+            existing.scheduled_time = now + remaining * 2;
+            existing.seen_count = seen_count;
+            return;
+        }
+
+        // Eviction: when full, drop entry with longest delay (most likely to exceed TTL)
+        if self.delayed_forwards().len() >= Cfg::MAX_DELAYED_FORWARDS {
+            let longest = self
+                .delayed_forwards()
+                .iter()
+                .max_by_key(|(_, df)| df.scheduled_time);
+
+            if let Some((key, df)) = longest {
+                if scheduled_time < df.scheduled_time {
+                    let key = *key;
+                    self.delayed_forwards_mut().remove(&key);
+                } else {
+                    // New entry has longer delay, reject it
+                    return;
+                }
+            }
+        }
+
+        self.delayed_forwards_mut().insert(
+            ack_hash,
+            DelayedForward {
+                msg,
+                seen_count,
+                scheduled_time,
+            },
+        );
+    }
+
+    /// Process delayed forwards whose scheduled time has arrived.
+    ///
+    /// For each ready entry: recompute next_hop and forward if TTL permits.
+    pub(crate) fn handle_delayed_forwards(&mut self, now: Timestamp) {
+        // Two-phase approach to avoid cloning Routed messages (which contain Vec<u8> payload):
+        // 1. Collect just the keys of ready entries (cheap 4-byte AckHash copies)
+        // 2. Remove and process each entry, taking ownership of the message
+        let ready_keys: Vec<_> = self
+            .delayed_forwards()
+            .iter()
+            .filter(|(_, df)| now >= df.scheduled_time)
+            .map(|(k, _)| *k)
+            .collect();
+
+        for ack_hash in ready_keys {
+            // Remove entry and take ownership of the message (no clone needed)
+            let Some(entry) = self.delayed_forwards_mut().remove(&ack_hash) else {
+                continue;
+            };
+            let mut msg = entry.msg;
+
+            // TTL was already decremented when message was received
+            if msg.ttl == 0 {
+                continue;
+            }
+
+            // Recompute route: prefer child/shortcut, fall back to parent
+            let dest = msg.dest_addr;
+            let next_hop_id = self.best_next_hop(dest).or_else(|| self.parent());
+
+            self.emit_debug(crate::debug::DebugEvent::DelayedForwardExecuted {
+                msg_type: msg.msg_type(),
+                dest_addr: dest,
+                ttl: msg.ttl,
+                has_route: next_hop_id.is_some(),
+            });
+
+            if let Some(hop_id) = next_hop_id {
+                msg.next_hop = self.compute_node_hash(&hop_id);
+                self.send_to_neighbor(hop_id, msg, now);
+            }
+        }
+    }
+
+    /// Get the earliest scheduled time from delayed_forwards, if any.
+    pub(crate) fn next_delayed_forward_time(&self) -> Option<Timestamp> {
+        self.delayed_forwards()
+            .values()
+            .map(|df| df.scheduled_time)
+            .min()
     }
 
     /// Verify a Routed message signature.
@@ -160,18 +352,41 @@ where
     /// Forward a routed message toward its destination.
     fn forward_routed(&mut self, mut msg: Routed, now: Timestamp) {
         let dest = msg.dest_addr;
+        let msg_type = msg.msg_type();
+        let ttl = msg.ttl;
+        let (my_lo, my_hi) = self.keyspace_range();
 
         // Try to find best next hop
         if let Some(next_hop_id) = self.best_next_hop(dest) {
+            self.emit_debug(crate::debug::DebugEvent::RoutedForwardedDown {
+                msg_type,
+                dest_addr: dest,
+                next_hop: next_hop_id,
+                ttl,
+                my_keyspace: (my_lo, my_hi),
+            });
             // Set next_hop to the intended forwarder's hash
             msg.next_hop = self.compute_node_hash(&next_hop_id);
             self.send_to_neighbor(next_hop_id, msg, now);
         } else if let Some(parent_id) = self.parent() {
+            self.emit_debug(crate::debug::DebugEvent::RoutedForwardedUp {
+                msg_type,
+                dest_addr: dest,
+                next_hop: parent_id,
+                ttl,
+                my_keyspace: (my_lo, my_hi),
+            });
             // Forward upward to parent as fallback
             msg.next_hop = self.compute_node_hash(&parent_id);
             self.send_to_neighbor(parent_id, msg, now);
+        } else {
+            // No route - drop the message
+            self.emit_debug(crate::debug::DebugEvent::RoutedDropped {
+                msg_type,
+                dest_addr: dest,
+                reason: "no route (no next_hop or parent)",
+            });
         }
-        // If no route, drop the message
     }
 
     /// Find the best next hop for a destination keyspace address.
@@ -366,6 +581,13 @@ where
     pub(crate) fn send_routed(&mut self, msg: Routed) -> Result<(), Error> {
         let dest = msg.dest_addr;
         let msg_type = msg.msg_type();
+        let ttl = msg.ttl;
+
+        self.emit_debug(crate::debug::DebugEvent::RoutedSent {
+            msg_type,
+            dest_addr: dest,
+            ttl,
+        });
 
         // If we own the destination, handle locally
         if self.owns_key(dest) {
@@ -1105,6 +1327,69 @@ mod tests {
         assert!(
             node.pending_acks().contains_key(&new_hash),
             "New entry should be present"
+        );
+    }
+
+    /// Test case from simulation: Node 30 should route to Node 33 (child),
+    /// not Node 15 (parent in shortcuts), because Node 33 has tighter keyspace.
+    ///
+    /// Tree structure (from publish_test_output9.txt):
+    /// - Node 15: ks=[0x13333332,0xbffffffe) - parent, in shortcuts
+    /// - Node 30: ks=[0x19999998,0x46666664) - "us"
+    /// - Node 33: ks=[0x1ffffffe,0x3ffffffd) - child
+    /// - Node 38: ks=[0x3ffffffd,0x46666664) - child
+    ///
+    /// dest_addr = 0x37180340 (924494144) is in:
+    /// - Node 15's range (but wider: 0x13333332 to 0xbffffffe)
+    /// - Node 33's range (tighter: 0x1ffffffe to 0x3ffffffd)
+    ///
+    /// So routing should prefer Node 33.
+    #[test]
+    fn test_routing_loop_regression() {
+        let mut node = make_node();
+
+        // Node 15 (parent) - added to shortcuts with wide range
+        let node_15: NodeId = [15u8; 16];
+        node.shortcuts_mut()
+            .insert(node_15, (0x13333332, 0xbffffffe));
+
+        // Node 33 (child) - tight range covering dest
+        let node_33: NodeId = [33u8; 16];
+        let hash_33 = node.compute_node_hash(&node_33);
+        node.children_mut().insert(hash_33, node_33, 5);
+        node.children_mut()
+            .set_range(&node_33, 0x1ffffffe, 0x3ffffffd);
+
+        // Node 38 (child) - doesn't cover dest
+        let node_38: NodeId = [38u8; 16];
+        let hash_38 = node.compute_node_hash(&node_38);
+        node.children_mut().insert(hash_38, node_38, 1);
+        node.children_mut()
+            .set_range(&node_38, 0x3ffffffd, 0x46666664);
+
+        // dest_addr from the simulation
+        let dest: u32 = 0x37180340; // 924494144
+
+        // Verify dest is in both ranges
+        assert!(
+            dest >= 0x13333332 && dest < 0xbffffffe,
+            "dest should be in Node 15's range"
+        );
+        assert!(
+            dest >= 0x1ffffffe && dest < 0x3ffffffd,
+            "dest should be in Node 33's range"
+        );
+        assert!(
+            !(dest >= 0x3ffffffd && dest < 0x46666664),
+            "dest should NOT be in Node 38's range"
+        );
+
+        // Node 33's range is tighter, so it should win
+        let next_hop = node.best_next_hop(dest);
+        assert_eq!(
+            next_hop,
+            Some(node_33),
+            "Should route to Node 33 (child with tighter range), not Node 15 (shortcut with wider range)"
         );
     }
 }

@@ -42,6 +42,12 @@ pub struct ScenarioBuilder {
     actions: Vec<(Timestamp, ScenarioAction)>,
     /// Snapshot interval.
     snapshot_interval: Option<Duration>,
+    /// Enable debug print output.
+    debug_print: bool,
+    /// Enable shared debug event collection.
+    shared_debug_events: bool,
+    /// Enable per-node debug event collection.
+    per_node_debug: bool,
 }
 
 impl Default for ScenarioBuilder {
@@ -66,7 +72,29 @@ impl ScenarioBuilder {
             bandwidth: None,
             actions: Vec::new(),
             snapshot_interval: None,
+            debug_print: false,
+            shared_debug_events: false,
+            per_node_debug: false,
         }
+    }
+
+    /// Enable debug print mode: all debug events are printed to stderr.
+    pub fn with_debug_print(mut self) -> Self {
+        self.debug_print = true;
+        self
+    }
+
+    /// Enable shared debug event collection for chronological analysis.
+    pub fn with_shared_debug_events(mut self) -> Self {
+        self.shared_debug_events = true;
+        self
+    }
+
+    /// Enable per-node debug event collection.
+    /// Use `sim.take_node_debug_events(node_id)` to retrieve events.
+    pub fn with_per_node_debug(mut self) -> Self {
+        self.per_node_debug = true;
+        self
     }
 
     /// Set the RNG seed for deterministic simulation.
@@ -172,6 +200,15 @@ impl ScenarioBuilder {
     /// Build the simulator with all nodes and topology.
     pub fn build(self) -> (Simulator, Vec<NodeId>) {
         let mut sim = Simulator::new(self.seed);
+
+        // Set debug mode if specified (must be before adding nodes)
+        if self.debug_print {
+            sim = sim.with_debug_print();
+        } else if self.shared_debug_events {
+            sim = sim.with_shared_debug_events();
+        } else if self.per_node_debug {
+            sim = sim.with_per_node_debug();
+        }
 
         // Set snapshot interval if specified
         if let Some(interval) = self.snapshot_interval {

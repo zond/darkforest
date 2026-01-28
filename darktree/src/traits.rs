@@ -368,6 +368,21 @@ pub trait Transport {
     /// - Simulator calls `incoming().try_send(msg)` to deliver messages
     /// - Node calls `incoming().receive().await` to receive
     fn incoming(&self) -> &TransportInChannel;
+
+    /// Check if the given RSSI indicates acceptable link quality.
+    ///
+    /// Returns `false` for RSSI values below the transport's reliability threshold.
+    /// Returns `true` for acceptable values or when RSSI is not applicable.
+    ///
+    /// Default implementation accepts all RSSI values (no filtering).
+    /// Radio transports should override with appropriate thresholds:
+    /// - LoRa: -110 dBm (margin above -120 dBm noise floor)
+    /// - WiFi: -80 dBm
+    /// - Bluetooth: -90 dBm
+    fn is_acceptable_rssi(&self, rssi: Option<i16>) -> bool {
+        let _ = rssi;
+        true
+    }
 }
 
 /// Time source trait for real or simulated time.
@@ -650,14 +665,14 @@ pub mod test_impls {
             Self { seed }
         }
 
-        /// Fast 256-bit hash using simple XOR mixing.
+        /// Fast 256-bit hash using xxh3 (called twice for 256 bits).
         #[inline(always)]
         fn fast_hash(data: &[u8]) -> [u8; 32] {
+            let h1 = xxhash_rust::xxh3::xxh3_128_with_seed(data, 0);
+            let h2 = xxhash_rust::xxh3::xxh3_128_with_seed(data, 1);
             let mut hash = [0u8; 32];
-            for (i, &byte) in data.iter().enumerate() {
-                hash[i % 32] ^= byte;
-                hash[(i + 1) % 32] = hash[(i + 1) % 32].wrapping_add(byte);
-            }
+            hash[..16].copy_from_slice(&h1.to_le_bytes());
+            hash[16..].copy_from_slice(&h2.to_le_bytes());
             hash
         }
     }

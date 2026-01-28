@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::future::{ready, Ready};
+use std::sync::{Arc, Mutex};
 
 use darktree::config::DefaultConfig;
 use darktree::traits::{
@@ -9,6 +10,105 @@ use darktree::traits::{
 };
 use darktree::{Duration, Incoming, Node, NodeId, OutgoingData, PublicKey, Timestamp};
 use embassy_sync::channel::Channel;
+
+/// Debug emitter that collects events into a shared Vec.
+///
+/// # Simulation Only
+///
+/// This emitter uses `std::sync::Mutex` which can block and panic on contention.
+/// It is intended only for use in the simulation crate (darksim), not for embedded
+/// deployment. Do not use in interrupt service routines or real-time contexts.
+pub struct VecEmitter {
+    events: Arc<Mutex<Vec<darktree::debug::DebugEvent>>>,
+}
+
+impl VecEmitter {
+    pub fn new(events: Arc<Mutex<Vec<darktree::debug::DebugEvent>>>) -> Self {
+        Self { events }
+    }
+}
+
+impl darktree::debug::DebugEmitter for VecEmitter {
+    fn emit(&mut self, event: darktree::debug::DebugEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+/// Debug emitter that prints events to stderr with node identification.
+/// Events are printed immediately as they occur, providing chronological output.
+pub struct PrintEmitter {
+    node_idx: usize,
+    node_id_short: [u8; 4],
+}
+
+impl PrintEmitter {
+    pub fn new(node_idx: usize, node_id: &NodeId) -> Self {
+        Self {
+            node_idx,
+            node_id_short: [node_id[0], node_id[1], node_id[2], node_id[3]],
+        }
+    }
+}
+
+impl darktree::debug::DebugEmitter for PrintEmitter {
+    fn emit(&mut self, event: darktree::debug::DebugEvent) {
+        eprintln!(
+            "Node {:2} {:?}: {:?}",
+            self.node_idx, self.node_id_short, event
+        );
+    }
+}
+
+/// Timestamped debug event with node identification.
+#[derive(Debug, Clone)]
+pub struct TimestampedEvent {
+    pub time_ms: u64,
+    pub node_idx: usize,
+    pub node_id_short: [u8; 4],
+    pub event: darktree::debug::DebugEvent,
+}
+
+/// Debug emitter that collects timestamped events into a shared Vec.
+/// All nodes can share one SharedEmitter for chronological cross-node output.
+///
+/// # Simulation Only
+///
+/// This emitter uses `std::sync::Mutex` which can block and panic on contention.
+/// It is intended only for use in the simulation crate (darksim), not for embedded
+/// deployment. Do not use in interrupt service routines or real-time contexts.
+pub struct SharedEmitter {
+    events: Arc<Mutex<Vec<TimestampedEvent>>>,
+    node_idx: usize,
+    node_id_short: [u8; 4],
+    time_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl SharedEmitter {
+    pub fn new(
+        events: Arc<Mutex<Vec<TimestampedEvent>>>,
+        node_idx: usize,
+        node_id: &NodeId,
+        time_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
+        Self {
+            events,
+            node_idx,
+            node_id_short: [node_id[0], node_id[1], node_id[2], node_id[3]],
+            time_ms: time_fn,
+        }
+    }
+}
+
+impl darktree::debug::DebugEmitter for SharedEmitter {
+    fn emit(&mut self, event: darktree::debug::DebugEvent) {
+        self.events.lock().unwrap().push(TimestampedEvent {
+            time_ms: (self.time_ms)(),
+            node_idx: self.node_idx,
+            node_id_short: self.node_id_short,
+            event,
+        });
+    }
+}
 
 /// Queue size for SimTransport.
 const SIM_QUEUE_SIZE: usize = 32;
@@ -287,13 +387,10 @@ impl SimNode {
         *self.inner.pubkey()
     }
 
-    /// Take all debug events from the node's debug channel.
-    pub fn take_debug_events(&self) -> Vec<darktree::debug::DebugEvent> {
-        let mut events = Vec::new();
-        while let Ok(event) = self.inner.debug_channel().try_receive() {
-            events.push(event);
-        }
-        events
+    /// Set a custom debug emitter for this node.
+    /// Use this to redirect debug events to a shared collector or printer.
+    pub fn set_debug_emitter(&self, emitter: Box<dyn darktree::debug::DebugEmitter>) {
+        self.inner.set_debug_emitter(emitter);
     }
 }
 

@@ -26,6 +26,7 @@ where
     Cfg: NodeConfig,
 {
     /// Check if we own any replica key for a node_id in our keyspace.
+    #[cfg(test)]
     fn owns_replica_key(&self, node_id: &NodeId) -> bool {
         (0..K_REPLICAS).any(|replica| {
             let dest_addr = self.replica_addr(node_id, replica as u8);
@@ -37,6 +38,11 @@ where
     pub(crate) fn publish_location(&mut self, now: Timestamp) {
         let seq = self.next_location_seq();
         let my_addr = self.my_address();
+
+        self.emit_debug(crate::debug::DebugEvent::LocationPublishStarted {
+            node_id: *self.node_id(),
+            seq,
+        });
 
         // Build location signature
         let sign_data = location_sign_data(self.node_id(), my_addr, seq);
@@ -147,6 +153,18 @@ where
         };
 
         self.insert_location_store(owner_node_id, replica_index, entry.clone());
+        let (ks_lo, ks_hi) = self.keyspace_range();
+        let ks_range = ks_hi as u64 - ks_lo as u64;
+        let own_slice = ks_range / self.subtree_size() as u64;
+        let own_hi = ks_lo as u64 + own_slice;
+        self.emit_debug(crate::debug::DebugEvent::PublishStored {
+            owner: owner_node_id,
+            replica_index,
+            dest_addr,
+            keyspace_lo: ks_lo,
+            keyspace_hi: ks_hi,
+            own_hi: own_hi as u32,
+        });
 
         // Send BACKUP_PUBLISH to random neighbors
         self.send_backup_publish(&entry);
@@ -314,21 +332,29 @@ where
     /// Call this when tree position changes (after merge, parent switch, etc.)
     /// to ensure entries are moved to their new owners.
     pub(crate) fn rebalance_keyspace(&mut self, _now: Timestamp) {
-        // Collect entries we no longer own
+        // Collect entries we no longer own (check specific replica address, not any replica)
         let to_republish: Vec<LocationEntry> = self
             .location_store()
             .iter()
-            .filter(|((node_id, _replica), _)| !self.owns_replica_key(node_id))
+            .filter(|((node_id, replica), _)| {
+                let dest_addr = self.replica_addr(node_id, *replica);
+                !self.owns_key(dest_addr)
+            })
             .map(|(_, entry)| entry.clone())
             .collect();
 
         // Remove entries we no longer own
         for entry in &to_republish {
+            self.emit_debug(crate::debug::DebugEvent::LocationRemoved {
+                owner: entry.node_id,
+                replica_index: entry.replica_index,
+                reason: "rebalance",
+            });
             self.location_store_mut()
                 .remove(&(entry.node_id, entry.replica_index));
         }
 
-        // Re-publish to new owners
+        // Re-publish to new owners (only the specific replica we held)
         for entry in to_republish {
             // Build payload with the stored signature
             let mut payload = Writer::new();
@@ -340,13 +366,10 @@ where
             payload.write_signature(&entry.signature);
             let payload_bytes = payload.finish();
 
-            // Send to all replicas (they'll filter based on keyspace ownership)
-            for replica in 0..K_REPLICAS {
-                let dest_addr = self.replica_addr(&entry.node_id, replica as u8);
-
-                let msg = self.build_routed_no_reply(dest_addr, MSG_PUBLISH, payload_bytes.clone());
-                let _ = self.send_routed(msg);
-            }
+            // Send only to the specific replica address we held
+            let dest_addr = self.replica_addr(&entry.node_id, entry.replica_index);
+            let msg = self.build_routed_no_reply(dest_addr, MSG_PUBLISH, payload_bytes);
+            let _ = self.send_routed(msg);
         }
     }
 }

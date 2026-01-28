@@ -20,13 +20,16 @@ use crate::types::{
 };
 use crate::wire::{pulse_sign_data, Encode, Message};
 
-/// Compare two RSSI values, preferring stronger signals (higher values).
-/// Returns Ordering for b vs a (descending order: best signal first).
-/// Nodes with RSSI are preferred over nodes without.
+/// Compare two RSSI values for use with `min_by`, preferring stronger signals.
+///
+/// Returns Ordering such that min_by selects the entry with higher RSSI (stronger signal).
+/// Entries with RSSI are preferred over entries without RSSI.
 #[inline]
-fn cmp_rssi_desc(a_rssi: Option<i16>, b_rssi: Option<i16>) -> Ordering {
-    match (b_rssi, a_rssi) {
-        (Some(b), Some(a)) => b.cmp(&a),
+fn cmp_rssi_for_min_by(a_rssi: Option<i16>, b_rssi: Option<i16>) -> Ordering {
+    match (a_rssi, b_rssi) {
+        // Higher RSSI is "less" so min_by keeps it
+        (Some(a), Some(b)) => b.cmp(&a),
+        // Entry with RSSI is "less" (preferred)
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
@@ -132,21 +135,6 @@ where
             return;
         }
 
-        // Rate limiting: ignore pulses that arrive too fast (minimum 2*tau between pulses)
-        let min_interval = self.tau() * 2;
-        if let Some(timing) = self.neighbor_times().get(&pulse.node_id) {
-            if now < timing.last_seen + min_interval {
-                #[cfg(feature = "debug")]
-                self.emit_debug(crate::debug::DebugEvent::PulseRateLimited {
-                    from: pulse.node_id,
-                    now,
-                    last_seen: timing.last_seen,
-                    min_interval_ms: min_interval.as_millis(),
-                });
-                return; // Too soon
-            }
-        }
-
         // Handle pubkey exchange first (always process this part)
         self.handle_pubkey_exchange(&pulse, now);
 
@@ -161,30 +149,63 @@ where
             self.neighbors_need_pubkey_mut().remove(&pulse.node_id);
         }
 
-        // SECURITY: Require verified pubkey before processing tree operations
+        // SECURITY: Require verified pubkey before updating timing or tree state
         let pubkey = match self.get_pubkey(&pulse.node_id, now) {
             Some(pk) => pk,
             None => {
                 // Don't have pubkey yet - we've already requested it via need_pubkey
-                // Don't process tree operations until we can verify signatures
+                // Don't process anything until we can verify signatures
                 return;
             }
         };
 
-        // Verify signature
+        // Verify signature before any state updates
         let sign_data = pulse_sign_data(&pulse);
         if !self
             .crypto()
             .verify(&pubkey, sign_data.as_slice(), &pulse.signature)
         {
-            #[cfg(feature = "debug")]
             self.emit_debug(crate::debug::DebugEvent::SignatureVerifyFailed {
                 node_id: pulse.node_id,
             });
             return; // Invalid signature
         }
 
-        #[cfg(feature = "debug")]
+        // ALWAYS update neighbor timing after signature verification.
+        // This prevents spurious timeouts even if we rate-limit tree operations.
+        let prev = self
+            .neighbor_times()
+            .get(&pulse.node_id)
+            .map(|t| t.last_seen);
+        let is_new_neighbor = prev.is_none();
+        let timing = NeighborTiming {
+            last_seen: now,
+            rssi,
+            root_hash: pulse.root_hash,
+            tree_size: pulse.tree_size,
+            keyspace_range: (pulse.keyspace_lo, pulse.keyspace_hi),
+            children_count: pulse.child_count(),
+            depth: pulse.depth,
+            max_depth: pulse.max_depth,
+            unstable: pulse.is_unstable(),
+        };
+        self.insert_neighbor_time(pulse.node_id, timing);
+
+        // Rate limiting: skip tree operations if pulses arrive too fast.
+        // Timing is already updated above, so this only affects tree processing.
+        let min_interval = self.tau() * 2;
+        if let Some(prev_seen) = prev {
+            if now < prev_seen + min_interval {
+                self.emit_debug(crate::debug::DebugEvent::PulseRateLimited {
+                    from: pulse.node_id,
+                    now,
+                    last_seen: prev_seen,
+                    min_interval_ms: min_interval.as_millis(),
+                });
+                return; // Too soon for tree operations, but timing is updated
+            }
+        }
+
         self.emit_debug(crate::debug::DebugEvent::PulseReceived {
             timestamp: now,
             from: pulse.node_id,
@@ -193,23 +214,6 @@ where
             has_pubkey: pulse.has_pubkey(),
             need_pubkey: pulse.need_pubkey(),
         });
-
-        // Update neighbor timing (only after signature verification)
-        let prev = self
-            .neighbor_times()
-            .get(&pulse.node_id)
-            .map(|t| t.last_seen);
-        let is_new_neighbor = prev.is_none();
-        let timing = NeighborTiming {
-            last_seen: now,
-            prev_seen: prev,
-            rssi,
-            root_hash: pulse.root_hash,
-            tree_size: pulse.tree_size,
-            keyspace_range: (pulse.keyspace_lo, pulse.keyspace_hi),
-            children_count: pulse.child_count(),
-        };
-        self.insert_neighbor_time(pulse.node_id, timing);
 
         // If new neighbor, schedule proactive pulse to introduce ourselves
         if is_new_neighbor {
@@ -297,19 +301,28 @@ where
             self.set_root_hash(pulse.root_hash);
             self.set_tree_size(pulse.tree_size);
 
+            // Propagate depth: our depth = parent's depth + 1
+            let new_depth = pulse.depth.saturating_add(1);
+            let depth_changed = new_depth != self.depth();
+            if depth_changed {
+                self.set_depth(new_depth);
+                // Depth change affects max_depth calculation
+                self.recalculate_max_depth();
+            }
+
             // Clear pending state since we're acknowledged
             self.set_pending_parent(None);
             self.set_parent_rejection_count(0);
 
-            // If keyspace changed, schedule republish and rebalance
-            if keyspace_changed {
+            // If keyspace or depth changed, schedule republish and rebalance
+            if keyspace_changed || depth_changed {
                 // Jitter: 0-1τ
                 let tau_ms = self.tau().as_millis();
                 let jitter_ms = self.random_mut().gen_range(0, tau_ms);
                 self.set_next_publish(Some(now + Duration::from_millis(jitter_ms)));
                 // Move DHT entries that we no longer own to their new owners
                 self.rebalance_keyspace(now);
-                // Notify children of our new keyspace
+                // Notify children of our new keyspace/depth
                 self.schedule_proactive_pulse(now);
             }
         } else {
@@ -415,7 +428,6 @@ where
             return;
         }
 
-        #[cfg(feature = "debug")]
         if is_new {
             self.emit_debug(crate::debug::DebugEvent::ChildAdded {
                 timestamp: now,
@@ -435,8 +447,9 @@ where
         // Remove from shortcuts if present
         self.shortcuts_mut().remove(&pulse.node_id);
 
-        // Update subtree size
+        // Update subtree size and max_depth
         self.recalculate_subtree_size();
+        self.recalculate_max_depth();
 
         // If we are root, update tree_size to match our subtree_size
         if self.is_root() {
@@ -465,8 +478,9 @@ where
             self.set_parent(Some(parent_id));
             self.set_pending_parent(None);
 
-            // Remove new parent from our children if it was there (prevents cycles)
+            // Remove new parent from our children/shortcuts (prevents cycles and stale routing)
             self.remove_child(&parent_id);
+            self.shortcuts_mut().remove(&parent_id);
 
             // Compute our keyspace range
             let (new_lo, new_hi) = self.compute_child_keyspace(pulse, my_idx);
@@ -513,7 +527,6 @@ where
     fn consider_merge(&mut self, pulse: &Pulse, _sender_hash: &ChildHash, now: Timestamp) {
         // Don't start merge if already shopping - wait for select_best_parent
         if self.is_shopping() {
-            #[cfg(feature = "debug")]
             self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
                 from: pulse.node_id,
                 dominated: false,
@@ -524,7 +537,6 @@ where
 
         // Don't merge if already switching parents
         if self.pending_parent().is_some() {
-            #[cfg(feature = "debug")]
             self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
                 from: pulse.node_id,
                 dominated: false,
@@ -535,7 +547,6 @@ where
 
         // Ignore merge offers from distrusted nodes
         if self.is_distrusted(&pulse.node_id, now) {
-            #[cfg(feature = "debug")]
             self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
                 from: pulse.node_id,
                 dominated: false,
@@ -546,7 +557,6 @@ where
 
         // Same tree? No merge needed.
         if pulse.root_hash == *self.root_hash() {
-            #[cfg(feature = "debug")]
             self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
                 from: pulse.node_id,
                 dominated: false,
@@ -559,7 +569,6 @@ where
         let dominated = (pulse.tree_size, self.root_hash()) > (self.tree_size(), &pulse.root_hash);
 
         if !dominated {
-            #[cfg(feature = "debug")]
             self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
                 from: pulse.node_id,
                 dominated: false,
@@ -568,7 +577,6 @@ where
             return;
         }
 
-        #[cfg(feature = "debug")]
         self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
             from: pulse.node_id,
             dominated: true,
@@ -602,45 +610,49 @@ where
 
     /// Select the best parent from discovered neighbors.
     ///
-    /// Called when discovery phase ends. Implements the algorithm from design doc:
-    /// 1. Pick the best tree (largest tree_size, tie-break: lowest root_hash)
-    /// 2. Filter by signal strength (if 3+ candidates with RSSI, remove bottom 50%)
-    /// 3. Pick shallowest (largest keyspace range, tie-break: best RSSI)
+    /// Called when shopping phase ends. Implements unified parent selection:
+    /// 1. Filter: not full, not distrusted, not unstable (except old_parent)
+    /// 2. Preference order:
+    ///    a. Dominating tree candidates - pick shallowest by depth
+    ///    b. Old parent still valid?
+    ///    c. Current tree candidates - pick shallowest by depth
+    ///    d. Become root
     pub(crate) fn select_best_parent(&mut self, now: Timestamp) {
-        // Collect valid candidates: not full, not distrusted
-        let mut candidates: Vec<([u8; 16], &crate::node::NeighborTiming)> = self
+        let old_parent = self.old_parent();
+        let old_tree = self.old_tree();
+
+        // Collect valid candidates: not full, not distrusted, not unstable (except old_parent)
+        // Also filter by transport's RSSI threshold to avoid unreliable links
+        let candidates: Vec<([u8; 16], &crate::node::NeighborTiming)> = self
             .neighbor_times()
             .iter()
             .filter(|(id, timing)| {
-                timing.children_count < MAX_CHILDREN as u8 && !self.is_distrusted(id, now)
+                timing.children_count < MAX_CHILDREN as u8
+                    && !self.is_distrusted(id, now)
+                    && (!timing.unstable || Some(**id) == old_parent)
+                    && self.transport().is_acceptable_rssi(timing.rssi)
             })
             .map(|(id, timing)| (*id, timing))
             .collect();
 
         if candidates.is_empty() {
-            // No valid candidates - stay as root of single-node tree
-            // Will join via normal merge when we hear a larger tree
-            // Schedule location publish so others can find us
+            // No valid candidates - stay as root
+            self.become_root();
+            self.clear_shopping();
             self.schedule_location_publish(now);
             return;
         }
 
-        // Step 1: Pick the best tree
-        // Find the best (tree_size, root_hash) - largest tree_size, tie-break by lowest root_hash
+        // Find the dominating tree (largest tree_size, tie-break by lowest root_hash)
         let best_tree = candidates
             .iter()
             .map(|(_, t)| (t.tree_size, t.root_hash))
-            .max_by(|a, b| {
-                // Compare by tree_size descending, then root_hash ascending (lexicographic)
-                a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1))
-            })
+            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
             .unwrap(); // Safe: we checked candidates.is_empty() above
 
-        // Only join if the best tree dominates ours
-        // Dominated = (their_tree_size, our_root_hash) > (our_tree_size, their_root_hash)
+        // Check if the best tree dominates us
         let dominated = (best_tree.0, self.root_hash()) > (self.tree_size(), &best_tree.1);
 
-        #[cfg(feature = "debug")]
         self.emit_debug(crate::debug::DebugEvent::SelectBestParent {
             candidate_count: candidates.len(),
             best_tree_size: best_tree.0,
@@ -648,44 +660,68 @@ where
             dominated,
         });
 
-        if !dominated {
-            // Best tree doesn't dominate us - stay as root
-            // Schedule location publish so others can find us
-            self.schedule_location_publish(now);
-            return;
+        // 5a. Dominating tree candidates - pick shallowest by depth
+        if dominated {
+            let dominating: Vec<_> = candidates
+                .iter()
+                .filter(|(_, t)| t.tree_size == best_tree.0 && t.root_hash == best_tree.1)
+                .collect();
+
+            if let Some(best) = Self::pick_shallowest(&dominating) {
+                self.set_pending_parent(Some((best, 0)));
+                self.clear_shopping();
+                self.schedule_proactive_pulse(now);
+                return;
+            }
         }
 
-        // Filter to only candidates from the best tree
-        candidates.retain(|(_, t)| t.tree_size == best_tree.0 && t.root_hash == best_tree.1);
-
-        // Step 2: Filter by signal strength (if 3+ candidates with RSSI)
-        let rssi_count = candidates.iter().filter(|(_, t)| t.rssi.is_some()).count();
-        if candidates.len() >= 3 && rssi_count >= 3 {
-            // Sort by RSSI descending (best signal first)
-            candidates.sort_by(|(_, a), (_, b)| cmp_rssi_desc(a.rssi, b.rssi));
-            // Keep top 50% (remove bottom half)
-            let keep = candidates.len().div_ceil(2);
-            candidates.truncate(keep);
+        // 5b. Old parent still valid?
+        if let Some(old_p) = old_parent {
+            let old_p_valid = candidates.iter().any(|(id, _)| *id == old_p);
+            if old_p_valid {
+                self.set_pending_parent(Some((old_p, 0)));
+                self.clear_shopping();
+                self.schedule_proactive_pulse(now);
+                return;
+            }
         }
 
-        // Step 3: Pick shallowest (largest keyspace range, tie-break: best RSSI)
-        candidates.sort_by(|(_, a), (_, b)| {
-            let a_range = (a.keyspace_range.1 as u64).saturating_sub(a.keyspace_range.0 as u64);
-            let b_range = (b.keyspace_range.1 as u64).saturating_sub(b.keyspace_range.0 as u64);
-            // Descending by range (larger = shallower)
-            b_range
-                .cmp(&a_range)
-                .then_with(|| cmp_rssi_desc(a.rssi, b.rssi))
-        });
+        // 5c. Current tree candidates - pick shallowest from same tree
+        if let Some(old_root) = old_tree {
+            let same_tree: Vec<_> = candidates
+                .iter()
+                .filter(|(_, t)| t.root_hash == old_root)
+                .collect();
 
-        // Select the best candidate
-        let (parent_id, _) = candidates[0];
+            if let Some(best) = Self::pick_shallowest(&same_tree) {
+                self.set_pending_parent(Some((best, 0)));
+                self.clear_shopping();
+                self.schedule_proactive_pulse(now);
+                return;
+            }
+        }
 
-        // Start parent switch process (same as consider_merge)
-        self.set_pending_parent(Some((parent_id, 0)));
+        // 5d. Become root
+        self.become_root();
+        self.clear_shopping();
+        self.schedule_location_publish(now);
+    }
 
-        // Schedule proactive pulse to announce our intent to join
-        self.schedule_proactive_pulse(now);
+    /// Pick the shallowest candidate by depth (lowest depth value).
+    /// Tie-break by best RSSI.
+    fn pick_shallowest(
+        candidates: &[&([u8; 16], &crate::node::NeighborTiming)],
+    ) -> Option<[u8; 16]> {
+        candidates
+            .iter()
+            .min_by(|(_, a), (_, b)| {
+                // Primary: depth ascending (shallowest first)
+                a.depth.cmp(&b.depth).then_with(|| {
+                    // Secondary: RSSI descending (best signal first)
+                    cmp_rssi_for_min_by(a.rssi, b.rssi)
+                })
+            })
+            .map(|(id, _)| *id)
     }
 
     /// Become root of our own subtree.
@@ -695,7 +731,9 @@ where
         let my_hash = self.compute_node_hash(self.node_id());
         self.set_root_hash(my_hash);
         self.set_keyspace_range(0, u32::MAX);
+        self.set_depth(0); // Root is at depth 0
         self.recalculate_subtree_size();
+        self.recalculate_max_depth();
         self.set_tree_size(self.subtree_size());
         // Recompute child ranges for the full keyspace
         self.recompute_child_ranges();
@@ -779,6 +817,26 @@ where
         self.set_subtree_size(size);
     }
 
+    /// Recalculate max_depth from children's max_depth values.
+    ///
+    /// max_depth = max(depth, max(child.max_depth for all children))
+    /// If no children, max_depth = depth (leaf node).
+    pub(crate) fn recalculate_max_depth(&mut self) {
+        if self.children().is_empty() {
+            self.set_max_depth(self.depth());
+        } else {
+            // Get max of children's max_depth from neighbor_times
+            let max_child_depth = self
+                .children()
+                .iter_by_hash()
+                .filter_map(|(_, entry)| self.neighbor_times().get(&entry.node_id))
+                .map(|t| t.max_depth)
+                .max()
+                .unwrap_or(self.depth());
+            self.set_max_depth(max_child_depth.max(self.depth()));
+        }
+    }
+
     /// Remove a child and update all related state.
     ///
     /// Returns true if the child was present and removed.
@@ -786,6 +844,7 @@ where
         if self.children_mut().remove(child_id).is_some() {
             // Range is removed with the entry (stored in ChildEntry)
             self.recalculate_subtree_size();
+            self.recalculate_max_depth();
             self.recompute_child_ranges();
             // If we are root, update tree_size to match subtree_size
             if self.is_root() {
@@ -799,9 +858,9 @@ where
 
     /// Estimate current pulse size.
     fn estimate_pulse_size(&self) -> usize {
-        // Base: node_id(16) + flags(1) + root_hash(4) + subtree(varint~3) + tree_size(varint~3)
-        //     + keyspace_lo(4) + keyspace_hi(4) + signature(65)
-        let base = 16 + 1 + 4 + 3 + 3 + 4 + 4 + 65;
+        // Base: node_id(16) + flags(1) + root_hash(4) + depth(1) + max_depth(1)
+        //     + subtree(varint~3) + tree_size(varint~3) + keyspace_lo(4) + keyspace_hi(4) + signature(65)
+        let base = 16 + 1 + 4 + 1 + 1 + 3 + 3 + 4 + 4 + 65;
 
         // Optional parent_hash (4 bytes if has_parent)
         let parent_size = if self.parent().is_some() { 4 } else { 0 };
@@ -826,7 +885,6 @@ where
         let pulse = self.build_pulse();
 
         // Extract info for debug event before encoding consumes the pulse
-        #[cfg(feature = "debug")]
         let debug_info = (
             pulse.tree_size,
             pulse.root_hash,
@@ -852,7 +910,6 @@ where
         if self.transport().outgoing().try_send(msg) {
             self.record_protocol_sent();
 
-            #[cfg(feature = "debug")]
             self.emit_debug(crate::debug::DebugEvent::PulseSent {
                 timestamp: now,
                 tree_size: debug_info.0,
@@ -907,9 +964,16 @@ where
         let we_need_pubkeys = !self.need_pubkey().is_empty();
         let neighbors_need_ours = !self.neighbors_need_pubkey().is_empty();
         let include_pubkey = we_need_pubkeys || neighbors_need_ours;
+        let unstable = self.is_shopping();
         let child_count = children.len().min(MAX_CHILDREN) as u8;
 
-        let flags = Pulse::build_flags(has_parent, we_need_pubkeys, include_pubkey, child_count);
+        let flags = Pulse::build_flags(
+            has_parent,
+            we_need_pubkeys,
+            include_pubkey,
+            unstable,
+            child_count,
+        );
 
         // Parent hash - include pending_parent so prospective parent can adopt us
         let parent_hash = effective_parent.map(|pid| self.compute_node_hash(&pid));
@@ -919,6 +983,8 @@ where
             flags,
             parent_hash,
             root_hash: *self.root_hash(),
+            depth: self.depth(),
+            max_depth: self.max_depth(),
             subtree_size: self.subtree_size(),
             tree_size: self.tree_size(),
             keyspace_lo: self.keyspace_lo(),
@@ -939,13 +1005,16 @@ where
         pulse
     }
 
-    /// Calculate timeout timestamp for a neighbor based on their pulse interval.
+    /// Calculate timeout timestamp for a neighbor.
+    ///
+    /// Timeout is fixed at 24τ (= 8 missed pulses × 3τ expected interval).
+    /// This uses the expected pulse interval (3τ) rather than observed interval,
+    /// ensuring that rapidly-pulsing neighbors don't get spuriously short timeouts.
     fn neighbor_timeout(&self, timing: &NeighborTiming) -> Timestamp {
-        let interval = timing
-            .prev_seen
-            .map(|prev| timing.last_seen.saturating_sub(prev))
-            .unwrap_or_else(|| self.tau() * 5);
-        timing.last_seen + interval * MISSED_PULSES_TIMEOUT
+        // Expected pulse interval is 3τ (see design.md timing model)
+        // Timeout after 8 missed pulses = 24τ
+        let expected_interval = self.tau() * 3;
+        timing.last_seen + expected_interval * MISSED_PULSES_TIMEOUT
     }
 
     /// Check neighbor timeouts, returning timed out IDs and next timeout time.
@@ -1023,6 +1092,11 @@ where
 
         // Remove expired
         for key in expired {
+            self.emit_debug(crate::debug::DebugEvent::LocationRemoved {
+                owner: key.0,
+                replica_index: key.1,
+                reason: "expiry",
+            });
             self.location_store_mut().remove(&key);
         }
     }
@@ -1071,12 +1145,14 @@ mod tests {
             parent_id,
             NeighborTiming {
                 last_seen: old_time,
-                prev_seen: Some(Timestamp::from_secs(50)),
                 rssi: Some(-70),
                 root_hash: [0u8; 4],
                 tree_size: 1,
                 keyspace_range: (0, u32::MAX),
                 children_count: 0,
+                depth: 0,
+                max_depth: 0,
+                unstable: false,
             },
         );
 
@@ -1106,12 +1182,14 @@ mod tests {
             child_id,
             NeighborTiming {
                 last_seen: old_time,
-                prev_seen: Some(Timestamp::from_secs(50)),
                 rssi: Some(-80),
                 root_hash: [0u8; 4],
                 tree_size: 5,
                 keyspace_range: (0, u32::MAX),
                 children_count: 0,
+                depth: 0,
+                max_depth: 0,
+                unstable: false,
             },
         );
 
@@ -1185,9 +1263,11 @@ mod tests {
         // Create a pulse with parent owning full keyspace and 2 children
         let pulse = Pulse {
             node_id: [0u8; 16],
-            flags: Pulse::build_flags(false, false, false, 2),
+            flags: Pulse::build_flags(false, false, false, false, 2),
             parent_hash: None,
             root_hash: [0u8; 4],
+            depth: 0,
+            max_depth: 0,
             subtree_size: 11, // 1 parent + 5 + 5 children
             tree_size: 11,
             keyspace_lo: 0,
@@ -1235,9 +1315,11 @@ mod tests {
 
         let pulse = Pulse {
             node_id: other_id,
-            flags: Pulse::build_flags(false, false, false, 0),
+            flags: Pulse::build_flags(false, false, false, false, 0),
             parent_hash: None,
             root_hash: other_hash,
+            depth: 0,
+            max_depth: 0,
             subtree_size: 10,
             tree_size: 10,
             keyspace_lo: 0,
@@ -1254,12 +1336,14 @@ mod tests {
             other_id,
             NeighborTiming {
                 last_seen: now,
-                prev_seen: None,
                 rssi: Some(-70),
                 root_hash: other_hash,
                 tree_size: 10,
                 keyspace_range: (0, u32::MAX),
                 children_count: 0,
+                depth: 0,
+                max_depth: 0,
+                unstable: false,
             },
         );
 
@@ -1305,9 +1389,11 @@ mod tests {
 
         let pulse = Pulse {
             node_id: other_id,
-            flags: Pulse::build_flags(false, false, false, 0),
+            flags: Pulse::build_flags(false, false, false, false, 0),
             parent_hash: None,
             root_hash: other_hash,
+            depth: 0,
+            max_depth: 0,
             subtree_size: 5,
             tree_size: 5, // Same size
             keyspace_lo: 0,
@@ -1324,12 +1410,14 @@ mod tests {
             other_id,
             NeighborTiming {
                 last_seen: now,
-                prev_seen: None,
                 rssi: Some(-70),
                 root_hash: other_hash,
                 tree_size: 5,
                 keyspace_range: (0, u32::MAX),
                 children_count: 0,
+                depth: 0,
+                max_depth: 0,
+                unstable: false,
             },
         );
 
@@ -1495,9 +1583,11 @@ mod tests {
         let my_hash = node.compute_node_hash(node.node_id());
         let pulse = Pulse {
             node_id: child2,
-            flags: Pulse::build_flags(false, false, false, 0),
+            flags: Pulse::build_flags(false, false, false, false, 0),
             parent_hash: Some(my_hash), // Claims us as parent
             root_hash: hash2,
+            depth: 0,
+            max_depth: 0,
             subtree_size: 1,
             tree_size: 1,
             keyspace_lo: 0,
@@ -1514,12 +1604,14 @@ mod tests {
             child2,
             NeighborTiming {
                 last_seen: old_time,
-                prev_seen: None,
                 rssi: Some(-70),
                 root_hash: hash2,
                 tree_size: 1,
                 keyspace_range: (0, u32::MAX),
                 children_count: 0,
+                depth: 0,
+                max_depth: 0,
+                unstable: false,
             },
         );
 
@@ -1589,12 +1681,14 @@ mod tests {
             child_id,
             NeighborTiming {
                 last_seen: old_time,
-                prev_seen: None,
                 rssi: Some(-70),
                 root_hash: child_hash,
                 tree_size: 10,
                 keyspace_range: (0, u32::MAX),
                 children_count: 0,
+                depth: 0,
+                max_depth: 0,
+                unstable: false,
             },
         );
 
@@ -1608,9 +1702,11 @@ mod tests {
         let my_hash = node.compute_node_hash(node.node_id());
         let pulse = Pulse {
             node_id: child_id,
-            flags: Pulse::build_flags(true, false, false, 0), // has_parent = true
-            parent_hash: Some(my_hash),                       // Claims us as parent
+            flags: Pulse::build_flags(true, false, false, false, 0), // has_parent = true
+            parent_hash: Some(my_hash),                              // Claims us as parent
             root_hash: *node.root_hash(),
+            depth: 1,
+            max_depth: 1,
             subtree_size: 10, // Updated from 5 to 10
             tree_size: node.tree_size(),
             keyspace_lo: 0,

@@ -1,13 +1,15 @@
 //! Discrete event simulator for darktree protocol.
 
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use darktree::{Duration, NodeId, Timestamp};
 use hashbrown::HashMap;
 
 use crate::event::{Event, ScenarioAction, ScheduledEvent, SequenceNumber};
 use crate::metrics::{SimMetrics, SimulationResult, TreeSnapshot};
-use crate::node::SimNode;
+use crate::node::{PrintEmitter, SharedEmitter, SimNode, TimestampedEvent, VecEmitter};
 use crate::topology::Topology;
 
 /// Discrete event simulator for darktree networks.
@@ -16,6 +18,8 @@ pub struct Simulator {
     nodes: HashMap<NodeId, SimNode>,
     /// Seed used to create each node (for restart support).
     node_seeds: HashMap<NodeId, u64>,
+    /// Node index for debug output (assigned in order of creation).
+    node_indices: HashMap<NodeId, usize>,
     /// Network topology.
     topology: Topology,
     /// Current simulation time.
@@ -32,6 +36,16 @@ pub struct Simulator {
     snapshot_interval: Option<Duration>,
     /// Next snapshot time.
     next_snapshot: Option<Timestamp>,
+    /// Shared debug events (when using shared emitter mode).
+    shared_debug_events: Option<Arc<Mutex<Vec<TimestampedEvent>>>>,
+    /// Per-node debug events (when using per-node debug mode).
+    per_node_debug_events: HashMap<NodeId, Arc<Mutex<Vec<darktree::debug::DebugEvent>>>>,
+    /// Shared time for debug emitters (updated on each time advance).
+    shared_time_ms: Arc<AtomicU64>,
+    /// Debug mode: print events as they occur.
+    debug_print_enabled: bool,
+    /// Debug mode: collect events per node.
+    per_node_debug_enabled: bool,
     /// Debug: count of timer fires.
     #[cfg(test)]
     pub timer_fire_count: u64,
@@ -43,6 +57,7 @@ impl Simulator {
         Self {
             nodes: HashMap::new(),
             node_seeds: HashMap::new(),
+            node_indices: HashMap::new(),
             topology: Topology::new(),
             current_time: Timestamp::ZERO,
             event_queue: BinaryHeap::new(),
@@ -51,9 +66,54 @@ impl Simulator {
             rng_state: seed,
             snapshot_interval: None,
             next_snapshot: None,
+            shared_debug_events: None,
+            per_node_debug_events: HashMap::new(),
+            shared_time_ms: Arc::new(AtomicU64::new(0)),
+            debug_print_enabled: false,
+            per_node_debug_enabled: false,
             #[cfg(test)]
             timer_fire_count: 0,
         }
+    }
+
+    /// Enable debug print mode: all debug events are printed to stderr as they occur.
+    /// Must be called before adding nodes.
+    pub fn with_debug_print(mut self) -> Self {
+        self.debug_print_enabled = true;
+        self
+    }
+
+    /// Enable shared debug event collection: all events go to a shared Vec.
+    /// Must be called before adding nodes.
+    /// Use `take_shared_debug_events()` to retrieve the collected events.
+    pub fn with_shared_debug_events(mut self) -> Self {
+        self.shared_debug_events = Some(Arc::new(Mutex::new(Vec::new())));
+        self
+    }
+
+    /// Take all shared debug events (chronologically ordered across all nodes).
+    /// Returns None if shared debug events were not enabled.
+    pub fn take_shared_debug_events(&self) -> Option<Vec<TimestampedEvent>> {
+        self.shared_debug_events
+            .as_ref()
+            .map(|events| std::mem::take(&mut *events.lock().unwrap()))
+    }
+
+    /// Enable per-node debug event collection.
+    /// Must be called before adding nodes.
+    /// Use `take_node_debug_events(node_id)` to retrieve events.
+    pub fn with_per_node_debug(mut self) -> Self {
+        self.per_node_debug_enabled = true;
+        self
+    }
+
+    /// Take debug events for a specific node.
+    /// Returns empty Vec if per-node debug was not enabled or node doesn't exist.
+    pub fn take_node_debug_events(&self, node_id: &NodeId) -> Vec<darktree::debug::DebugEvent> {
+        self.per_node_debug_events
+            .get(node_id)
+            .map(|events| std::mem::take(&mut *events.lock().unwrap()))
+            .unwrap_or_default()
     }
 
     /// Set the network topology.
@@ -105,10 +165,35 @@ impl Simulator {
     }
 
     /// Internal helper to initialize and register a node.
-    fn add_node_internal(&mut self, mut node: SimNode) -> NodeId {
+    fn add_node_internal(&mut self, node: SimNode) -> NodeId {
         let node_id = node.node_id();
 
+        // Assign node index for debug output
+        let node_idx = self.node_indices.len();
+        self.node_indices.insert(node_id, node_idx);
+
+        // Set up debug emitter based on mode
+        if self.debug_print_enabled {
+            node.set_debug_emitter(Box::new(PrintEmitter::new(node_idx, &node_id)));
+        } else if let Some(shared_events) = &self.shared_debug_events {
+            let time_arc = self.shared_time_ms.clone();
+            let time_fn: Arc<dyn Fn() -> u64 + Send + Sync> =
+                Arc::new(move || time_arc.load(Ordering::Relaxed));
+            node.set_debug_emitter(Box::new(SharedEmitter::new(
+                shared_events.clone(),
+                node_idx,
+                &node_id,
+                time_fn,
+            )));
+        } else if self.per_node_debug_enabled {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            self.per_node_debug_events.insert(node_id, events.clone());
+            node.set_debug_emitter(Box::new(VecEmitter::new(events)));
+        }
+
         // Initialize the node (sends first pulse, starts discovery)
+        // Note: must happen after setting debug emitter to capture init events
+        let mut node = node;
         node.inner_mut().initialize(self.current_time);
 
         let tau = node.tau();
@@ -136,6 +221,18 @@ impl Simulator {
     /// Get all node IDs.
     pub fn node_ids(&self) -> Vec<NodeId> {
         self.nodes.keys().copied().collect()
+    }
+
+    /// Enable print debugging for all existing nodes.
+    ///
+    /// This can be called at any point during simulation to start
+    /// printing debug events to stderr.
+    pub fn enable_debug_print(&mut self) {
+        self.debug_print_enabled = true;
+        for (&node_id, node) in &self.nodes {
+            let node_idx = *self.node_indices.get(&node_id).unwrap_or(&0);
+            node.set_debug_emitter(Box::new(PrintEmitter::new(node_idx, &node_id)));
+        }
     }
 
     /// Get the current simulation time.
@@ -237,6 +334,9 @@ impl Simulator {
     fn advance_time(&mut self, time: Timestamp) {
         if time > self.current_time {
             self.current_time = time;
+            // Update shared time for debug emitters
+            self.shared_time_ms
+                .store(time.as_millis(), Ordering::Relaxed);
         }
     }
 
@@ -247,9 +347,9 @@ impl Simulator {
                 to,
                 data,
                 rssi,
-                from: _,
+                from,
             } => {
-                self.deliver_message(to, data, rssi);
+                self.deliver_message(to, data, rssi, from);
             }
             Event::TimerFire { node } => {
                 self.fire_timer(node);
@@ -264,8 +364,9 @@ impl Simulator {
     }
 
     /// Deliver a message to a node.
-    fn deliver_message(&mut self, to: NodeId, data: Vec<u8>, rssi: Option<i16>) {
+    fn deliver_message(&mut self, to: NodeId, data: Vec<u8>, rssi: Option<i16>, _from: NodeId) {
         let now = self.current_time;
+
         if let Some(node) = self.nodes.get_mut(&to) {
             node.handle_transport_rx(&data, rssi, now);
             self.metrics.messages_delivered += 1;

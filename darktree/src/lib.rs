@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! darktree - Tree-based DHT protocol for LoRa mesh networks
 //!
 //! A protocol for building mesh networks over LoRa radios with O(log N) routing.
@@ -101,7 +102,6 @@ extern crate alloc;
 
 pub mod children;
 pub mod config;
-#[cfg(feature = "debug")]
 pub mod debug;
 pub mod dht;
 pub mod fraud;
@@ -180,9 +180,11 @@ mod tests {
     fn test_pulse_roundtrip() {
         let pulse = Pulse {
             node_id: [1u8; 16],
-            flags: Pulse::build_flags(false, false, false, 0),
+            flags: Pulse::build_flags(false, false, false, false, 0),
             parent_hash: None,
             root_hash: [1u8, 2, 3, 4],
+            depth: 0,
+            max_depth: 0,
             subtree_size: 1,
             tree_size: 1,
             keyspace_lo: 0,
@@ -248,16 +250,17 @@ mod tests {
 
     #[test]
     fn test_lookup_timeout() {
-        // LoRa: tau = 6710ms, lookup_timeout = 32 * tau = 214720ms (~3.6 min)
+        // LoRa: tau = 6710ms, lookup_timeout = tau * (3 + 3*max_depth)
+        // With max_depth=0 (default), timeout = 3 * tau = 20130ms
         let transport = MockTransport::with_mtu_and_bw(255, Some(38));
         let crypto = FastTestCrypto::new(0);
         let random = MockRandom::new();
         let clock = MockClock::new();
 
         let node: TestNode = Node::new(transport, crypto, random, clock);
+        // New node has max_depth=0, so multiplier is 3 + 3*0 = 3
         let timeout = node.lookup_timeout();
-
-        assert_eq!(timeout.as_millis(), 6710 * 32);
+        assert_eq!(timeout.as_millis(), 6710 * 3);
     }
 
     #[test]

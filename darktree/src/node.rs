@@ -71,8 +71,6 @@ use crate::types::{
 pub(crate) struct NeighborTiming {
     /// Last time we received a Pulse from this neighbor.
     pub last_seen: Timestamp,
-    /// Previous Pulse time (for interval estimation).
-    pub prev_seen: Option<Timestamp>,
     /// Last observed signal strength in dBm (if available).
     pub rssi: Option<i16>,
     /// Root hash of the neighbor's tree.
@@ -83,6 +81,12 @@ pub(crate) struct NeighborTiming {
     pub keyspace_range: (u32, u32),
     /// Number of children the neighbor has.
     pub children_count: u8,
+    /// Neighbor's depth in tree (0 = root).
+    pub depth: u8,
+    /// Maximum depth in neighbor's subtree.
+    pub max_depth: u8,
+    /// Whether neighbor is shopping for parent.
+    pub unstable: bool,
 }
 
 /// Pending lookup state.
@@ -152,8 +156,9 @@ pub(crate) struct PendingAck {
 pub(crate) type PendingAckMap = HashMap<AckHash, PendingAck>;
 
 /// Map of recently forwarded message hashes for duplicate detection.
-/// Stores (timestamp, ttl) to distinguish retransmissions from alternate paths.
-pub(crate) type RecentlyForwardedMap = HashMap<AckHash, (Timestamp, u8)>;
+/// Stores (timestamp, ttl, seen_count) to distinguish retransmissions from alternate paths
+/// and track bounce-back occurrences for exponential backoff.
+pub(crate) type RecentlyForwardedMap = HashMap<AckHash, (Timestamp, u8, u8)>;
 
 /// Backup entry for DHT redundancy.
 ///
@@ -172,6 +177,25 @@ pub(crate) struct BackupEntry {
 /// Backup store: (node_id, replica_index) -> BackupEntry.
 /// Keyed the same as LocationStore to allow efficient lookup and deduplication.
 pub(crate) type BackupStore = HashMap<(NodeId, u8), BackupEntry>;
+
+/// Delayed forward entry for bounce-back dampening.
+///
+/// When a message bounces back during tree restructuring, it's queued here
+/// with exponential backoff to give the tree time to stabilize.
+#[derive(Clone, Debug)]
+pub(crate) struct DelayedForward {
+    /// The message to forward (with TTL already decremented once).
+    pub msg: Routed,
+    /// Number of times this message has bounced back.
+    /// Used to calculate backoff even if recently_forwarded entry is evicted.
+    pub seen_count: u8,
+    /// When the delayed forward should fire.
+    pub scheduled_time: Timestamp,
+}
+
+/// Map of delayed forwards keyed by ack_hash.
+/// At most one delayed forward per message hash (newer bounces extend the delay).
+pub(crate) type DelayedForwardMap = HashMap<AckHash, DelayedForward>;
 
 /// The main protocol node.
 ///
@@ -212,6 +236,8 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     subtree_size: u32,
     keyspace_lo: u32,
     keyspace_hi: u32,
+    depth: u8,     // Distance from root (0 = root)
+    max_depth: u8, // Max depth in subtree rooted at this node
 
     // Neighbors
     children: ChildrenStore,
@@ -243,6 +269,7 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     // Link-layer reliability
     pending_acks: PendingAckMap,
     recently_forwarded: RecentlyForwardedMap,
+    delayed_forwards: DelayedForwardMap,
 
     // Scheduling
     last_pulse: Option<Timestamp>,
@@ -251,6 +278,9 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     location_seq: u32,
     proactive_pulse_pending: Option<Timestamp>,
     shopping_deadline: Option<Timestamp>,
+    // Shopping state - preserved parent/tree before shopping started
+    old_parent: Option<NodeId>,
+    old_tree: Option<ChildHash>,
 
     // Metrics
     metrics: TransportMetrics,
@@ -260,9 +290,9 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     /// Cached fast divisor for bandwidth (bw is constant for node lifetime).
     cached_bw_divisor: Option<FastDivisor>,
 
-    // Debug events channel (only with "debug" feature)
+    // Debug emitter callback (only with "debug" feature)
     #[cfg(feature = "debug")]
-    debug_channel: crate::debug::DebugChannel,
+    debug_emitter: core::cell::RefCell<Option<alloc::boxed::Box<dyn crate::debug::DebugEmitter>>>,
 }
 
 impl<T, Cr, R, Clk, Cfg> Node<T, Cr, R, Clk, Cfg>
@@ -344,6 +374,8 @@ where
             subtree_size: 1,
             keyspace_lo: 0,
             keyspace_hi: u32::MAX,
+            depth: 0,
+            max_depth: 0,
 
             children: ChildrenStore::new(),
             shortcuts: HashMap::new(),
@@ -367,6 +399,7 @@ where
 
             pending_acks: HashMap::new(),
             recently_forwarded: HashMap::new(),
+            delayed_forwards: HashMap::new(),
 
             last_pulse: None,
             last_pulse_size: 0,
@@ -374,6 +407,8 @@ where
             location_seq: 0,
             proactive_pulse_pending: None,
             shopping_deadline: None,
+            old_parent: None,
+            old_tree: None,
 
             metrics: TransportMetrics::new(),
 
@@ -381,7 +416,7 @@ where
             cached_bw_divisor,
 
             #[cfg(feature = "debug")]
-            debug_channel: embassy_sync::channel::Channel::new(),
+            debug_emitter: core::cell::RefCell::new(None),
         }
     }
 
@@ -411,10 +446,18 @@ where
         (self.keyspace_lo, self.keyspace_hi)
     }
 
-    /// Get this node's keyspace address (center of range).
-    /// Uses overflow-safe calculation.
+    /// Get this node's keyspace address (center of owned slice).
+    ///
+    /// Returns the midpoint of the slice this node actually owns, not the full
+    /// keyspace range. The owned slice is 1/subtree_size of the total range.
     pub fn my_address(&self) -> u32 {
-        (self.keyspace_lo / 2) + (self.keyspace_hi / 2)
+        debug_assert!(self.subtree_size > 0, "subtree_size must be at least 1");
+        let lo = self.keyspace_lo as u64;
+        let hi = self.keyspace_hi as u64;
+        let range = hi - lo;
+        let own_slice_size = range / (self.subtree_size as u64);
+        // Midpoint of owned slice: lo + own_slice_size / 2
+        (lo + own_slice_size / 2) as u32
     }
 
     /// Check if this node owns a keyspace location.
@@ -489,19 +532,24 @@ where
         &self.events
     }
 
-    /// Channel for debug events (only with "debug" feature).
-    ///
-    /// Simulator/test can receive detailed protocol trace events.
+    /// Set the debug emitter callback (only with "debug" feature).
     #[cfg(feature = "debug")]
-    pub fn debug_channel(&self) -> &crate::debug::DebugChannel {
-        &self.debug_channel
+    pub fn set_debug_emitter(&self, emitter: alloc::boxed::Box<dyn crate::debug::DebugEmitter>) {
+        *self.debug_emitter.borrow_mut() = Some(emitter);
     }
 
     /// Emit a debug event (only with "debug" feature).
     #[cfg(feature = "debug")]
     pub(crate) fn emit_debug(&self, event: crate::debug::DebugEvent) {
-        let _ = self.debug_channel.try_send(event);
+        if let Some(emitter) = self.debug_emitter.borrow_mut().as_mut() {
+            emitter.emit(event);
+        }
     }
+
+    /// No-op emit_debug when "debug" feature is disabled.
+    #[cfg(not(feature = "debug"))]
+    #[inline(always)]
+    pub(crate) fn emit_debug(&self, _event: crate::debug::DebugEvent) {}
 
     /// Get the transport reference.
     pub fn transport(&self) -> &T {
@@ -515,11 +563,13 @@ where
         Duration::from_millis(self.cached_tau_ms)
     }
 
-    /// Lookup timeout: 32τ per replica
-    /// For LoRa (τ=6.7s): ~3.5 minutes
-    /// For UDP (τ=0.1s): ~3 seconds
+    /// Lookup timeout: τ × (3 + 3 × max_tree_depth)
+    /// Scales with tree depth to allow round-trip propagation.
+    /// For LoRa (τ=6.7s, depth=10): ~4 minutes
+    /// For UDP (τ=0.1s, depth=10): ~3.3 seconds
     pub(crate) fn lookup_timeout(&self) -> Duration {
-        self.tau() * 32
+        let multiplier = 3 + 3 * self.max_depth as u64;
+        self.tau() * multiplier
     }
 
     /// Get the crypto reference.
@@ -656,7 +706,7 @@ where
     /// Calculate next timeout time based on pending operations.
     ///
     /// Returns the earliest of: neighbor timeouts, pending ACK retries,
-    /// and pending lookup timeouts.
+    /// pending lookup timeouts, and delayed forward times.
     fn next_timeout_time(&self) -> Option<Timestamp> {
         let now = self.clock.now();
 
@@ -669,11 +719,19 @@ where
         // Get next lookup timeout
         let (_, lookup_timeout) = self.check_lookup_timeouts(now);
 
+        // Get next delayed forward time
+        let delayed_forward_timeout = self.next_delayed_forward_time();
+
         // Return minimum of all timeouts
-        [neighbor_timeout, ack_timeout, lookup_timeout]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            neighbor_timeout,
+            ack_timeout,
+            lookup_timeout,
+            delayed_forward_timeout,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Handle incoming transport message.
@@ -687,7 +745,6 @@ where
         let msg = match Message::decode_from_slice(data) {
             Ok(m) => m,
             Err(_e) => {
-                #[cfg(feature = "debug")]
                 self.emit_debug(crate::debug::DebugEvent::MessageDecodeFailed {
                     data_len: data.len(),
                 });
@@ -909,7 +966,6 @@ where
             if now >= deadline {
                 self.shopping_deadline = None;
 
-                #[cfg(feature = "debug")]
                 self.emit_debug(crate::debug::DebugEvent::ShoppingEnded {
                     timestamp: now,
                     neighbor_count: self.neighbor_times.len(),
@@ -941,6 +997,9 @@ where
         // Link-layer reliability maintenance
         self.handle_ack_timeouts(now);
         self.cleanup_recently_forwarded(now);
+
+        // Bounce-back dampening: process delayed forwards
+        self.handle_delayed_forwards(now);
 
         // Check for tree size fraud
         self.handle_fraud_check(now);
@@ -1031,7 +1090,7 @@ where
     pub(crate) fn cleanup_recently_forwarded(&mut self, now: Timestamp) {
         let expiry = self.tau() * RECENTLY_FORWARDED_TTL_MULTIPLIER;
         self.recently_forwarded
-            .retain(|_, &mut (timestamp, _)| now.saturating_sub(timestamp) < expiry);
+            .retain(|_, &mut (timestamp, _, _)| now.saturating_sub(timestamp) < expiry);
     }
 
     /// Calculate retry backoff duration with exponential growth and jitter.
@@ -1250,6 +1309,18 @@ where
         &self.recently_forwarded
     }
 
+    pub(crate) fn recently_forwarded_mut(&mut self) -> &mut RecentlyForwardedMap {
+        &mut self.recently_forwarded
+    }
+
+    pub(crate) fn delayed_forwards(&self) -> &DelayedForwardMap {
+        &self.delayed_forwards
+    }
+
+    pub(crate) fn delayed_forwards_mut(&mut self) -> &mut DelayedForwardMap {
+        &mut self.delayed_forwards
+    }
+
     pub(crate) fn fraud_detection(&self) -> &FraudDetection {
         &self.fraud_detection
     }
@@ -1319,6 +1390,37 @@ where
         self.keyspace_hi = hi;
     }
 
+    pub(crate) fn depth(&self) -> u8 {
+        self.depth
+    }
+
+    pub(crate) fn set_depth(&mut self, depth: u8) {
+        self.depth = depth;
+    }
+
+    pub(crate) fn max_depth(&self) -> u8 {
+        self.max_depth
+    }
+
+    pub(crate) fn set_max_depth(&mut self, max_depth: u8) {
+        self.max_depth = max_depth;
+    }
+
+    pub(crate) fn old_parent(&self) -> Option<NodeId> {
+        self.old_parent
+    }
+
+    pub(crate) fn old_tree(&self) -> Option<ChildHash> {
+        self.old_tree
+    }
+
+    /// Clear shopping state after parent selection is complete.
+    pub(crate) fn clear_shopping(&mut self) {
+        self.shopping_deadline = None;
+        self.old_parent = None;
+        self.old_tree = None;
+    }
+
     pub(crate) fn next_location_seq(&mut self) -> u32 {
         self.location_seq = self.location_seq.wrapping_add(1);
         self.location_seq
@@ -1349,13 +1451,21 @@ where
         self.shopping_deadline.is_some()
     }
 
-    /// Start shopping phase for 3τ.
+    /// Start shopping phase with scaled duration.
+    ///
+    /// Duration: 3τ + 2τ × levels_below_me, where levels_below = max_depth - depth.
+    /// This allows deeper subtrees more time to stabilize during parent selection.
     pub(crate) fn start_shopping(&mut self, now: Timestamp) {
-        let shopping_duration = self.tau() * 3;
+        // Preserve current parent and tree for preference ordering
+        self.old_parent = self.parent;
+        self.old_tree = Some(self.root_hash);
+
+        // Scaled duration: 3τ + 2τ × levels_below_me
+        let levels_below = self.max_depth.saturating_sub(self.depth);
+        let shopping_duration = self.tau() * (3 + 2 * levels_below as u64);
         let deadline = now + shopping_duration;
         self.shopping_deadline = Some(deadline);
 
-        #[cfg(feature = "debug")]
         self.emit_debug(crate::debug::DebugEvent::ShoppingStarted {
             timestamp: now,
             deadline,
@@ -1546,14 +1656,15 @@ where
     /// Insert a recently forwarded entry with bounded eviction.
     ///
     /// Evicts the oldest entry by timestamp when at capacity.
-    /// Stores both timestamp and TTL to distinguish retransmissions from alternate paths.
+    /// Stores timestamp, TTL, and seen_count to distinguish retransmissions from alternate paths
+    /// and track bounce-back occurrences.
     pub(crate) fn insert_recently_forwarded(&mut self, hash: AckHash, ttl: u8, now: Timestamp) {
         if self.recently_forwarded.len() >= Cfg::MAX_RECENTLY_FORWARDED
             && !self.recently_forwarded.contains_key(&hash)
         {
-            Self::evict_oldest_ack_by(&mut self.recently_forwarded, |&(ts, _)| ts);
+            Self::evict_oldest_ack_by(&mut self.recently_forwarded, |&(ts, _, _)| ts);
         }
-        self.recently_forwarded.insert(hash, (now, ttl));
+        self.recently_forwarded.insert(hash, (now, ttl, 1));
     }
 
     // =========================================================================
@@ -1599,5 +1710,11 @@ where
     #[cfg(feature = "test-support")]
     pub fn test_replica_addr(&self, node_id: &NodeId, replica: u8) -> u32 {
         self.replica_addr(node_id, replica)
+    }
+
+    /// Trigger a location publish (for testing DHT).
+    #[cfg(feature = "test-support")]
+    pub fn test_publish_location(&mut self, now: Timestamp) {
+        self.publish_location(now);
     }
 }

@@ -54,6 +54,7 @@
 //!     const MAX_RECENTLY_FORWARDED: usize = 32;
 //!     const MAX_BACKUP_STORE: usize = 64;
 //!     const MAX_BACKUPS_PER_NEIGHBOR: usize = 16;
+//!     const MAX_DELAYED_FORWARDS: usize = 16;
 //! }
 //! let node = Node::<_, _, _, _, MyConfig>::new(
 //!     MockTransport::new(), FastTestCrypto::new(0), MockRandom::new(), MockClock::new()
@@ -108,6 +109,10 @@ pub trait NodeConfig {
     /// Maximum backup entries stored for any single neighbor.
     /// Limits how much backup storage one neighbor can consume.
     const MAX_BACKUPS_PER_NEIGHBOR: usize;
+
+    /// Maximum delayed forwards for bounce-back dampening.
+    /// Messages that bounce back during tree restructuring are queued here.
+    const MAX_DELAYED_FORWARDS: usize;
 }
 
 /// Default configuration for 256KB+ RAM devices.
@@ -131,6 +136,7 @@ impl NodeConfig for DefaultConfig {
     const MAX_RECENTLY_FORWARDED: usize = 256;
     const MAX_BACKUP_STORE: usize = 512;
     const MAX_BACKUPS_PER_NEIGHBOR: usize = 64;
+    const MAX_DELAYED_FORWARDS: usize = 32;
 }
 
 /// Small configuration for 64KB RAM devices.
@@ -155,6 +161,7 @@ impl NodeConfig for SmallConfig {
     const MAX_RECENTLY_FORWARDED: usize = 32;
     const MAX_BACKUP_STORE: usize = 64;
     const MAX_BACKUPS_PER_NEIGHBOR: usize = 16;
+    const MAX_DELAYED_FORWARDS: usize = 16;
 }
 
 #[cfg(test)]
@@ -177,6 +184,7 @@ mod tests {
         assert_eq!(DefaultConfig::MAX_RECENTLY_FORWARDED, 256);
         assert_eq!(DefaultConfig::MAX_BACKUP_STORE, 512);
         assert_eq!(DefaultConfig::MAX_BACKUPS_PER_NEIGHBOR, 64);
+        assert_eq!(DefaultConfig::MAX_DELAYED_FORWARDS, 32);
     }
 
     #[test]
@@ -195,6 +203,7 @@ mod tests {
         assert_eq!(SmallConfig::MAX_RECENTLY_FORWARDED, 32);
         assert_eq!(SmallConfig::MAX_BACKUP_STORE, 64);
         assert_eq!(SmallConfig::MAX_BACKUPS_PER_NEIGHBOR, 16);
+        assert_eq!(SmallConfig::MAX_DELAYED_FORWARDS, 16);
     }
 
     #[test]
@@ -216,6 +225,7 @@ mod tests {
         assert!(SmallConfig::MAX_RECENTLY_FORWARDED < DefaultConfig::MAX_RECENTLY_FORWARDED);
         assert!(SmallConfig::MAX_BACKUP_STORE < DefaultConfig::MAX_BACKUP_STORE);
         assert!(SmallConfig::MAX_BACKUPS_PER_NEIGHBOR < DefaultConfig::MAX_BACKUPS_PER_NEIGHBOR);
+        assert!(SmallConfig::MAX_DELAYED_FORWARDS < DefaultConfig::MAX_DELAYED_FORWARDS);
     }
 
     #[test]
@@ -236,6 +246,7 @@ mod tests {
         assert!(DefaultConfig::MAX_RECENTLY_FORWARDED > 0);
         assert!(DefaultConfig::MAX_BACKUP_STORE > 0);
         assert!(DefaultConfig::MAX_BACKUPS_PER_NEIGHBOR > 0);
+        assert!(DefaultConfig::MAX_DELAYED_FORWARDS > 0);
 
         // SmallConfig
         assert!(SmallConfig::MAX_NEIGHBORS > 0);
@@ -252,5 +263,6 @@ mod tests {
         assert!(SmallConfig::MAX_RECENTLY_FORWARDED > 0);
         assert!(SmallConfig::MAX_BACKUP_STORE > 0);
         assert!(SmallConfig::MAX_BACKUPS_PER_NEIGHBOR > 0);
+        assert!(SmallConfig::MAX_DELAYED_FORWARDS > 0);
     }
 }

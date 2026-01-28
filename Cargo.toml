@@ -6,3 +6,16 @@ members = ["darktree", "darksim"]
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
+
+# Optimize release builds for speed
+[profile.release]
+codegen-units = 1    # Better optimization, slower compile
+lto = "fat"          # Link-time optimization across all crates
+panic = "abort"      # Smaller binaries, no unwinding overhead
+
+# Optimize test builds for faster test runs
+[profile.test]
+#opt-level = 3        # Full optimization like release
+#codegen-units = 1    # Better optimization, slower compile
+#lto = "fat"          # Link-time optimization across all crates
+#debug = "line-tables-only"  # Minimal debug info for backtraces
