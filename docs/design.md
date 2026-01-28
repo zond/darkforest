@@ -839,17 +839,14 @@ impl Node {
         // Process pulse...
     }
 
-    fn expected_interval(&self, neighbor: &NodeId) -> Duration {
-        match self.neighbor_times.get(neighbor) {
-            Some((last, Some(prev))) => *last - *prev,
-            _ => self.tau() * 5,  // conservative default (~5τ ≈ Pulse interval + margin)
-        }
-    }
-
     fn is_timed_out(&self, neighbor: &NodeId) -> bool {
+        // Timeout uses fixed 3τ interval, not observed pulse rate.
+        // This prevents spurious timeouts when neighbors pulse faster than normal
+        // (e.g., due to proactive pulses during tree changes).
+        let expected_interval = self.tau() * 3;
         match self.neighbor_times.get(neighbor) {
             Some((last_seen, _)) => {
-                now() > *last_seen + MISSED_PULSES_TIMEOUT * self.expected_interval(neighbor)
+                now() > *last_seen + MISSED_PULSES_TIMEOUT * expected_interval
             }
             None => false,
         }
