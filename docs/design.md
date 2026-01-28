@@ -825,18 +825,21 @@ impl Node {
     fn on_pulse_received(&mut self, pulse: &Pulse) {
         let neighbor = &pulse.node_id;
 
-        // Rate limiting: ignore Pulses that arrive too fast
-        if let Some((last_seen, _)) = self.neighbor_times.get(neighbor) {
-            if now() - *last_seen < MIN_PULSE_INTERVAL {
-                return;  // Too soon, ignore (possible replay or attack)
-            }
-        }
+        // After signature verification...
 
-        // Update timestamps
+        // ALWAYS update timestamps first (prevents spurious timeouts)
         let prev = self.neighbor_times.get(neighbor).map(|(last, _)| *last);
         self.neighbor_times.insert(*neighbor, (now(), prev));
 
-        // Process pulse...
+        // Rate limiting: skip tree operations if Pulses arrive too fast.
+        // Timing is already updated, so this only affects tree processing.
+        if let Some(prev_seen) = prev {
+            if now() - prev_seen < MIN_PULSE_INTERVAL {
+                return;  // Too soon for tree ops, but timing is updated
+            }
+        }
+
+        // Process tree state...
     }
 
     fn is_timed_out(&self, neighbor: &NodeId) -> bool {
