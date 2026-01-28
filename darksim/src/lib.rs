@@ -980,7 +980,7 @@ mod tests {
         let all_nodes: Vec<_> = group_a.iter().chain(group_b.iter()).copied().collect();
         let globally_lowest_hash = all_nodes
             .iter()
-            .map(|h| sim.node(h).unwrap().root_hash().clone())
+            .map(|h| sim.node(h).unwrap().root_hash())
             .min()
             .unwrap();
 
@@ -2823,8 +2823,8 @@ mod tests {
         let n2 = sim.add_node(102);
 
         // Find which node has lowest root_hash - that will be the root
-        let mut nodes = vec![n0, n1, n2];
-        nodes.sort_by_key(|&h| sim.node(&h).unwrap().root_hash().clone());
+        let mut nodes = [n0, n1, n2];
+        nodes.sort_by_key(|&h| sim.node(&h).unwrap().root_hash());
         let p = nodes[0]; // Will be root (lowest hash)
         let c1 = nodes[1];
         let c2 = nodes[2];
@@ -3032,7 +3032,7 @@ mod tests {
         let mut all_nodes: Vec<_> = std::iter::once(central)
             .chain(leaves.iter().copied())
             .collect();
-        all_nodes.sort_by_key(|&handle| sim.node(&handle).unwrap().root_hash().clone());
+        all_nodes.sort_by_key(|&handle| sim.node(&handle).unwrap().root_hash());
         let expected_root = all_nodes[0];
         let expected_root_id = sim.node(&expected_root).unwrap().node_id();
 
@@ -3095,7 +3095,7 @@ mod tests {
         }
 
         // Find which node has lowest root_hash - that will be the parent (root)
-        all_nodes.sort_by_key(|&h| sim.node(&h).unwrap().root_hash().clone());
+        all_nodes.sort_by_key(|&h| sim.node(&h).unwrap().root_hash());
         let parent = all_nodes[0];
         let parent_node_id = sim.node(&parent).unwrap().node_id();
         let existing_children: Vec<_> = all_nodes[1..].to_vec();
@@ -3286,8 +3286,8 @@ mod tests {
         let n2 = sim.add_node(102);
 
         // Find which node has lowest root_hash - that will be X (root of this tree)
-        let mut x_nodes = vec![n0, n1, n2];
-        x_nodes.sort_by_key(|&h| sim.node(&h).unwrap().root_hash().clone());
+        let mut x_nodes = [n0, n1, n2];
+        x_nodes.sort_by_key(|&h| sim.node(&h).unwrap().root_hash());
         let x = x_nodes[0]; // Root of X's tree (lowest hash)
         let x_node_id = sim.node(&x).unwrap().node_id();
         let x_child1 = x_nodes[1];

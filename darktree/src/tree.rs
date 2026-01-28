@@ -1542,8 +1542,8 @@ mod tests {
             fn hash(&self, data: &[u8]) -> [u8; 32] {
                 // Hash = first 4 bytes repeated, so same prefix = same hash
                 let mut h = [0u8; 32];
-                for i in 0..32 {
-                    h[i] = data.get(i % 4).copied().unwrap_or(0);
+                for (i, item) in h.iter_mut().enumerate() {
+                    *item = data.get(i % 4).copied().unwrap_or(0);
                 }
                 h
             }

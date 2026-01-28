@@ -542,7 +542,7 @@ mod tests {
 
         // Should have reasonable connectivity (not too sparse, not fully connected)
         assert!(
-            avg_neighbors >= 3.0 && avg_neighbors <= 15.0,
+            (3.0..=15.0).contains(&avg_neighbors),
             "Average neighbors ({}) should be reasonable",
             avg_neighbors
         );
@@ -555,11 +555,11 @@ mod tests {
 
         // Small network: within valid range
         let r5 = compute_adaptive_radius(5);
-        assert!(r5 >= 0.15 && r5 <= 0.70, "r5 = {}", r5);
+        assert!((0.15..=0.70).contains(&r5), "r5 = {}", r5);
 
         // Large network: radius should be smaller but above lower bound
         let r100 = compute_adaptive_radius(100);
-        assert!(r100 >= 0.15 && r100 <= 0.70, "r100 = {}", r100);
+        assert!((0.15..=0.70).contains(&r100), "r100 = {}", r100);
         assert!(r100 < r5, "Larger network should have smaller radius");
 
         // Very large network: should hit lower bound

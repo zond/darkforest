@@ -155,7 +155,10 @@ where
         // Update recently_forwarded entry: increment seen_count and refresh expiration
         let seen_count = if let Some(entry) = self.recently_forwarded_mut().get_mut(&ack_hash) {
             entry.0 = now; // Refresh timestamp
-            entry.1 = original_ttl; // Update TTL
+                           // Update stored TTL to current value. This ensures future arrivals with this
+                           // same TTL are recognized as retransmissions (not new bounces), while arrivals
+                           // with yet-lower TTL trigger another bounce-back handling.
+            entry.1 = original_ttl;
             entry.2 = entry.2.saturating_add(1); // Increment seen_count
             entry.2
         } else {
@@ -1372,15 +1375,15 @@ mod tests {
 
         // Verify dest is in both ranges
         assert!(
-            dest >= 0x13333332 && dest < 0xbffffffe,
+            (0x13333332..0xbffffffe).contains(&dest),
             "dest should be in Node 15's range"
         );
         assert!(
-            dest >= 0x1ffffffe && dest < 0x3ffffffd,
+            (0x1ffffffe..0x3ffffffd).contains(&dest),
             "dest should be in Node 33's range"
         );
         assert!(
-            !(dest >= 0x3ffffffd && dest < 0x46666664),
+            !(0x3ffffffd..0x46666664).contains(&dest),
             "dest should NOT be in Node 38's range"
         );
 
@@ -1390,6 +1393,167 @@ mod tests {
             next_hop,
             Some(node_33),
             "Should route to Node 33 (child with tighter range), not Node 15 (shortcut with wider range)"
+        );
+    }
+
+    /// Test TTL=2 edge case: message has TTL=2, gets decremented to TTL=1 on receive,
+    /// then when delayed forward fires, TTL=1 means it can still be forwarded (becomes TTL=0
+    /// at next hop). But TTL=1 on bounce-back should be dropped immediately.
+    #[test]
+    fn test_bounce_back_ttl_2_edge_case() {
+        let mut node = make_node();
+        let now = Timestamp::from_secs(100);
+
+        // Create a message with TTL=2 (will be decremented to TTL=1 on receive)
+        let msg = Routed {
+            flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            next_hop: [0u8; 4],
+            dest_addr: 0x1234_5678,
+            dest_hash: None,
+            src_addr: Some(0x8765_4321),
+            src_node_id: [7u8; 16],
+            src_pubkey: None,
+            ttl: 1, // Already decremented from 2 to 1
+            payload: b"test".to_vec(),
+            signature: Signature::default(),
+        };
+
+        let hash = msg.ack_hash(node.crypto());
+
+        // Simulate: we forwarded this message before with TTL=2 (original)
+        node.insert_recently_forwarded(hash, 2, now);
+
+        // Now it bounces back with TTL=1 (original_ttl=2, but msg.ttl=1 after their decrement)
+        // The bounce-back handler checks original_ttl (the TTL before our decrement)
+        // Since we stored TTL=2, and now see TTL=1, this is a bounce-back
+
+        // For TTL=1 case (original_ttl <= 1), we should drop after ACK, not schedule
+        // But here original_ttl=2, so we should schedule
+
+        // Manually call handle_bounce_back with original_ttl=2
+        node.handle_bounce_back(msg.clone(), hash, 2, now);
+
+        // Should have scheduled a delayed forward
+        assert_eq!(
+            node.delayed_forwards().len(),
+            1,
+            "Should schedule delayed forward for TTL=2"
+        );
+
+        // Now test TTL=1 case - should NOT schedule
+        let mut node2 = make_node();
+        let msg_ttl1 = Routed {
+            flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            next_hop: [0u8; 4],
+            dest_addr: 0x1234_5678,
+            dest_hash: None,
+            src_addr: Some(0x8765_4321),
+            src_node_id: [8u8; 16], // Different node_id for different hash
+            src_pubkey: None,
+            ttl: 0, // Already decremented from 1 to 0
+            payload: b"test".to_vec(),
+            signature: Signature::default(),
+        };
+        let hash2 = msg_ttl1.ack_hash(node2.crypto());
+        node2.insert_recently_forwarded(hash2, 1, now);
+
+        // original_ttl=1 should cause immediate drop
+        node2.handle_bounce_back(msg_ttl1, hash2, 1, now);
+
+        assert_eq!(
+            node2.delayed_forwards().len(),
+            0,
+            "Should NOT schedule delayed forward for TTL=1 (would expire immediately)"
+        );
+    }
+
+    /// Test delayed forward queue at capacity with varying delay lengths.
+    /// Verifies eviction policy: longest delay is evicted when full.
+    #[test]
+    fn test_delayed_forward_queue_at_capacity() {
+        let mut node = make_small_node();
+        let now = Timestamp::from_secs(100);
+        let tau = node.tau();
+
+        // SmallConfig has MAX_DELAYED_FORWARDS = 16
+        // Fill the queue with entries having increasing delays
+        for i in 0..SmallConfig::MAX_DELAYED_FORWARDS {
+            let msg = Routed {
+                flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+                next_hop: [0u8; 4],
+                dest_addr: 0x1234_5678,
+                dest_hash: None,
+                src_addr: Some(0x8765_4321),
+                src_node_id: [i as u8; 16], // Unique node_id per message
+                src_pubkey: None,
+                ttl: 10,
+                payload: b"test".to_vec(),
+                signature: Signature::default(),
+            };
+            let hash = msg.ack_hash(node.crypto());
+
+            // Schedule with increasing delays: 1τ, 2τ, 3τ, ...
+            let scheduled_time = now + tau * (i as u64 + 1);
+            node.schedule_delayed_forward(msg, hash, 1, scheduled_time);
+        }
+
+        assert_eq!(
+            node.delayed_forwards().len(),
+            SmallConfig::MAX_DELAYED_FORWARDS,
+            "Queue should be at capacity"
+        );
+
+        // Now try to add one with a SHORT delay (should evict the longest)
+        let new_msg = Routed {
+            flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            next_hop: [0u8; 4],
+            dest_addr: 0x1234_5678,
+            dest_hash: None,
+            src_addr: Some(0x8765_4321),
+            src_node_id: [99u8; 16], // New unique node_id
+            src_pubkey: None,
+            ttl: 10,
+            payload: b"new".to_vec(),
+            signature: Signature::default(),
+        };
+        let new_hash = new_msg.ack_hash(node.crypto());
+
+        // Schedule with very short delay (50ms, less than tau) - should evict longest
+        let short_scheduled = now + Duration::from_millis(50);
+        node.schedule_delayed_forward(new_msg, new_hash, 1, short_scheduled);
+
+        assert_eq!(
+            node.delayed_forwards().len(),
+            SmallConfig::MAX_DELAYED_FORWARDS,
+            "Queue should still be at capacity after eviction"
+        );
+        assert!(
+            node.delayed_forwards().contains_key(&new_hash),
+            "New entry with short delay should be present"
+        );
+
+        // Try to add one with a LONG delay (should be rejected)
+        let long_msg = Routed {
+            flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
+            next_hop: [0u8; 4],
+            dest_addr: 0x1234_5678,
+            dest_hash: None,
+            src_addr: Some(0x8765_4321),
+            src_node_id: [100u8; 16], // Another unique node_id
+            src_pubkey: None,
+            ttl: 10,
+            payload: b"long".to_vec(),
+            signature: Signature::default(),
+        };
+        let long_hash = long_msg.ack_hash(node.crypto());
+
+        // Schedule with very long delay (100τ) - should be rejected
+        let long_scheduled = now + tau * 100;
+        node.schedule_delayed_forward(long_msg, long_hash, 1, long_scheduled);
+
+        assert!(
+            !node.delayed_forwards().contains_key(&long_hash),
+            "New entry with longest delay should be rejected"
         );
     }
 }
