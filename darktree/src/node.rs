@@ -50,16 +50,11 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 use hashbrown::HashMap;
 
-use embassy_sync::channel::Channel;
-
 use crate::children::ChildrenStore;
 use crate::config::{DefaultConfig, NodeConfig};
 use crate::fraud::{FraudDetection, HllSecretKey};
 use crate::time::{Duration, Timestamp};
-use crate::traits::{
-    AppInChannel, AppOutChannel, Clock, Crypto, EventChannel, IncomingData, OutgoingData, Random,
-    Transport,
-};
+use crate::traits::{Clock, Crypto, DynamicChannel, IncomingData, OutgoingData, Random, Transport};
 use crate::tree::FastDivisor;
 use crate::types::{
     ChildHash, Event, LocationEntry, NodeId, PublicKey, Routed, SecretKey, TransportMetrics,
@@ -217,10 +212,10 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     // Config phantom
     _config: PhantomData<Cfg>,
 
-    // Application-level channels
-    app_incoming: AppInChannel,
-    app_outgoing: AppOutChannel,
-    events: EventChannel,
+    // Application-level channels (sizes from Cfg at construction time)
+    app_incoming: DynamicChannel<IncomingData>,
+    app_outgoing: DynamicChannel<OutgoingData>,
+    events: DynamicChannel<Event>,
 
     // Identity
     node_id: NodeId,
@@ -275,6 +270,7 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     last_pulse: Option<Timestamp>,
     last_pulse_size: usize,
     next_publish: Option<Timestamp>,
+    next_rebalance: Option<Timestamp>,
     location_seq: u32,
     proactive_pulse_pending: Option<Timestamp>,
     shopping_deadline: Option<Timestamp>,
@@ -293,6 +289,15 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     // Debug emitter callback (only with "debug" feature)
     #[cfg(feature = "debug")]
     debug_emitter: core::cell::RefCell<Option<alloc::boxed::Box<dyn crate::debug::DebugEmitter>>>,
+}
+
+#[cfg(feature = "debug")]
+impl<T, Cr, R, Clk, Cfg: NodeConfig> crate::debug::HasDebugEmitter for Node<T, Cr, R, Clk, Cfg> {
+    fn debug_emitter(
+        &self,
+    ) -> &core::cell::RefCell<Option<alloc::boxed::Box<dyn crate::debug::DebugEmitter>>> {
+        &self.debug_emitter
+    }
 }
 
 impl<T, Cr, R, Clk, Cfg> Node<T, Cr, R, Clk, Cfg>
@@ -358,9 +363,9 @@ where
 
             _config: PhantomData,
 
-            app_incoming: Channel::new(),
-            app_outgoing: Channel::new(),
-            events: Channel::new(),
+            app_incoming: DynamicChannel::new(Cfg::APP_QUEUE_SIZE),
+            app_outgoing: DynamicChannel::new(Cfg::APP_QUEUE_SIZE),
+            events: DynamicChannel::new(Cfg::EVENT_QUEUE_SIZE),
 
             node_id,
             pubkey,
@@ -404,6 +409,7 @@ where
             last_pulse: None,
             last_pulse_size: 0,
             next_publish: None,
+            next_rebalance: None,
             location_seq: 0,
             proactive_pulse_pending: None,
             shopping_deadline: None,
@@ -513,7 +519,7 @@ where
     /// Channel for receiving data from other nodes.
     ///
     /// Application reads DATA messages from here.
-    pub fn incoming(&self) -> &AppInChannel {
+    pub fn incoming(&self) -> &DynamicChannel<IncomingData> {
         &self.app_incoming
     }
 
@@ -521,14 +527,14 @@ where
     ///
     /// Application sends DATA messages here. The node handles
     /// routing/lookup automatically.
-    pub fn outgoing(&self) -> &AppOutChannel {
+    pub fn outgoing(&self) -> &DynamicChannel<OutgoingData> {
         &self.app_outgoing
     }
 
     /// Channel for protocol events.
     ///
     /// Application receives events like TreeChanged, LookupComplete, etc.
-    pub fn events(&self) -> &EventChannel {
+    pub fn events(&self) -> &DynamicChannel<Event> {
         &self.events
     }
 
@@ -537,19 +543,6 @@ where
     pub fn set_debug_emitter(&self, emitter: alloc::boxed::Box<dyn crate::debug::DebugEmitter>) {
         *self.debug_emitter.borrow_mut() = Some(emitter);
     }
-
-    /// Emit a debug event (only with "debug" feature).
-    #[cfg(feature = "debug")]
-    pub(crate) fn emit_debug(&self, event: crate::debug::DebugEvent) {
-        if let Some(emitter) = self.debug_emitter.borrow_mut().as_mut() {
-            emitter.emit(event);
-        }
-    }
-
-    /// No-op emit_debug when "debug" feature is disabled.
-    #[cfg(not(feature = "debug"))]
-    #[inline(always)]
-    pub(crate) fn emit_debug(&self, _event: crate::debug::DebugEvent) {}
 
     /// Get the transport reference.
     pub fn transport(&self) -> &T {
@@ -739,18 +732,35 @@ where
     /// Call this to process a message received from the transport layer.
     /// For simulation, call this directly instead of using `run()`.
     pub fn handle_transport_rx(&mut self, data: &[u8], rssi: Option<i16>, now: Timestamp) {
+        use crate::traits::Ackable;
         use crate::types::MSG_DATA;
         use crate::wire::{Decode, Message};
 
         let msg = match Message::decode_from_slice(data) {
             Ok(m) => m,
             Err(_e) => {
-                self.emit_debug(crate::debug::DebugEvent::MessageDecodeFailed {
-                    data_len: data.len(),
-                });
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::MessageDecodeFailed {
+                        data_len: data.len(),
+                    }
+                );
                 return;
             }
         };
+
+        // Emit TransportReceived with payload_hash if it's a Routed or Broadcast message
+        emit_debug!(self, {
+            let payload_hash = match &msg {
+                Message::Routed(r) => Some(r.payload_hash(self.crypto())),
+                Message::Broadcast(b) => Some(b.payload_hash(self.crypto())),
+                _ => None,
+            };
+            crate::debug::DebugEvent::TransportReceived {
+                data_len: data.len(),
+                payload_hash,
+            }
+        });
 
         match msg {
             Message::Pulse(pulse) => {
@@ -767,7 +777,6 @@ where
                 // Implicit ACK: overhearing a Routed message clears pending ACK
                 // Only clear if TTL matches what we expect (sent_ttl - 1).
                 // This prevents false positives from messages arriving via alternate paths.
-                use crate::traits::Ackable;
                 let received_hash = routed.ack_hash(self.crypto());
                 let received_ttl = routed.ttl;
                 if let Some(pending) = self.pending_acks.get(&received_hash) {
@@ -966,10 +975,13 @@ where
             if now >= deadline {
                 self.shopping_deadline = None;
 
-                self.emit_debug(crate::debug::DebugEvent::ShoppingEnded {
-                    timestamp: now,
-                    neighbor_count: self.neighbor_times.len(),
-                });
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::ShoppingEnded {
+                        timestamp: now,
+                        neighbor_count: self.neighbor_times.len(),
+                    }
+                );
 
                 self.select_best_parent(now);
             }
@@ -986,6 +998,17 @@ where
         if let Some(next_publish) = self.next_publish {
             if now >= next_publish {
                 self.publish_location(now);
+            }
+        }
+
+        // Check if rebalance is due (incremental, one entry at a time)
+        if let Some(next_rebalance) = self.next_rebalance {
+            if now >= next_rebalance {
+                self.next_rebalance = None;
+                if self.rebalance_one(now) {
+                    // More work to do, schedule next rebalance in 2τ
+                    self.next_rebalance = Some(now + self.tau() * 2);
+                }
             }
         }
 
@@ -1177,7 +1200,14 @@ where
 
     /// Push incoming data to the app_incoming channel.
     pub(crate) fn push_incoming_data(&mut self, from: NodeId, payload: Vec<u8>) {
-        let _ = self.app_incoming.try_send(IncomingData { from, payload });
+        #[cfg(feature = "debug")]
+        let payload_len = payload.len();
+        if !self.app_incoming.try_send(IncomingData { from, payload }) {
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::AppIncomingFull { from, payload_len }
+            );
+        }
     }
 
     // --- Internal accessors for other modules ---
@@ -1430,6 +1460,14 @@ where
         self.next_publish = time;
     }
 
+    /// Trigger incremental rebalance. Runs one entry now, schedules more if needed.
+    pub(crate) fn trigger_rebalance(&mut self, now: Timestamp) {
+        if self.rebalance_one(now) {
+            // More work to do, schedule next rebalance in 2τ
+            self.next_rebalance = Some(now + self.tau() * 2);
+        }
+    }
+
     pub(crate) fn set_last_pulse(&mut self, time: Option<Timestamp>) {
         self.last_pulse = time;
     }
@@ -1466,10 +1504,13 @@ where
         let deadline = now + shopping_duration;
         self.shopping_deadline = Some(deadline);
 
-        self.emit_debug(crate::debug::DebugEvent::ShoppingStarted {
-            timestamp: now,
-            deadline,
-        });
+        emit_debug!(
+            self,
+            crate::debug::DebugEvent::ShoppingStarted {
+                timestamp: now,
+                deadline,
+            }
+        );
     }
 
     pub(crate) fn secret(&self) -> &SecretKey {
@@ -1514,22 +1555,17 @@ where
     // because eviction only occurs when the cache is full, which is infrequent in practice.
 
     /// Evict the oldest entry from a map based on a timestamp extraction function.
-    /// Returns true if an entry was evicted.
-    fn evict_oldest_by<K, V, F>(map: &mut HashMap<K, V>, get_timestamp: F) -> bool
+    /// Returns the evicted key-value pair, or None if the map was empty.
+    fn evict_oldest_by<K, V, F>(map: &mut HashMap<K, V>, get_timestamp: F) -> Option<(K, V)>
     where
         K: Eq + core::hash::Hash + Copy,
         F: Fn(&V) -> Timestamp,
     {
-        if let Some(oldest_key) = map
+        let oldest_key = map
             .iter()
             .min_by_key(|(_, v)| get_timestamp(v))
-            .map(|(k, _)| *k)
-        {
-            map.remove(&oldest_key);
-            true
-        } else {
-            false
-        }
+            .map(|(k, _)| *k)?;
+        map.remove(&oldest_key).map(|v| (oldest_key, v))
     }
 
     pub(crate) fn insert_pubkey_cache(
@@ -1556,7 +1592,18 @@ where
         if self.location_store.len() >= Cfg::MAX_LOCATION_STORE
             && !self.location_store.contains_key(&key)
         {
-            Self::evict_oldest_by(&mut self.location_store, |e: &LocationEntry| e.received_at);
+            // Evict oldest entry and emit debug event
+            let _evicted =
+                Self::evict_oldest_by(&mut self.location_store, |e: &LocationEntry| e.received_at);
+            emit_debug!(self, {
+                let (evicted_key, _) =
+                    _evicted.expect("eviction should succeed when over capacity");
+                crate::debug::DebugEvent::LocationRemoved {
+                    owner: evicted_key.0,
+                    replica_index: evicted_key.1,
+                    reason: "capacity",
+                }
+            });
         }
         self.location_store.insert(key, entry);
     }
@@ -1689,7 +1736,7 @@ where
 
     /// Access the app incoming channel for testing data delivery.
     #[cfg(feature = "test-support")]
-    pub fn test_app_incoming(&self) -> &AppInChannel {
+    pub fn test_app_incoming(&self) -> &DynamicChannel<IncomingData> {
         &self.app_incoming
     }
 

@@ -9,6 +9,17 @@ A spanning tree protocol for decentralized mesh networks, designed for bandwidth
 - **darktree** - Core protocol implementation (no_std compatible)
 - **darksim** - Discrete event simulator for testing and validation
 
+## Hardware Requirements
+
+The protocol is designed for embedded devices with limited resources:
+
+| Configuration | Target RAM | Node State Memory |
+|--------------|------------|-------------------|
+| DefaultConfig | 256KB+ | ~130 KB |
+| SmallConfig | 64KB+ | ~24 KB |
+
+See the Memory Analysis section in the [Design Document](docs/design.md) for detailed breakdown.
+
 ## Building
 
 ```bash

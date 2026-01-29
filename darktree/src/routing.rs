@@ -39,14 +39,19 @@ where
 
         let dest = msg.dest_addr;
         let msg_type = msg.msg_type();
+        let ack_hash = msg.ack_hash(self.crypto());
 
         // Do I own this keyspace location?
         if self.owns_key(dest) {
-            self.emit_debug(crate::debug::DebugEvent::RoutedDelivered {
-                msg_type,
-                dest_addr: dest,
-                from: msg.src_node_id,
-            });
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::RoutedDelivered {
+                    payload_hash: msg.payload_hash(self.crypto()),
+                    msg_type,
+                    dest_addr: dest,
+                    from: msg.src_node_id,
+                }
+            );
             // Handle locally based on message type
             match msg_type {
                 MSG_PUBLISH => self.handle_publish(msg, now),
@@ -72,38 +77,44 @@ where
         }
 
         // Duplicate detection: check if we've recently forwarded this message
-        // Note: hash excludes TTL so it's the same at any hop
-        let msg_hash = msg.ack_hash(self.crypto());
-
-        if let Some(&(_stored_time, stored_ttl, _)) = self.recently_forwarded().get(&msg_hash) {
+        // Note: ack_hash excludes TTL so it's the same at any hop
+        if let Some(&(_stored_time, stored_ttl, _)) = self.recently_forwarded().get(&ack_hash) {
             if stored_ttl == original_ttl {
                 // Same TTL = retransmission from sender who didn't hear our forward
                 // Send explicit ACK to confirm we received and forwarded it
-                self.emit_debug(crate::debug::DebugEvent::RoutedDuplicate {
-                    msg_type,
-                    dest_addr: dest,
-                    original_ttl,
-                    stored_ttl,
-                    action: "ack_retransmit",
-                });
-                self.send_explicit_ack(msg_hash);
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::RoutedDuplicate {
+                        payload_hash: msg.payload_hash(self.crypto()),
+                        msg_type,
+                        dest_addr: dest,
+                        original_ttl,
+                        stored_ttl,
+                        action: "ack_retransmit",
+                    }
+                );
+                self.send_explicit_ack(ack_hash);
                 return;
             }
             // Different TTL = message looped back to us, schedule delayed retry
             // with exponential backoff to let tree routing stabilize
-            self.emit_debug(crate::debug::DebugEvent::RoutedDuplicate {
-                msg_type,
-                dest_addr: dest,
-                original_ttl,
-                stored_ttl,
-                action: "bounce_back",
-            });
-            self.handle_bounce_back(msg, msg_hash, original_ttl, now);
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::RoutedDuplicate {
+                    payload_hash: msg.payload_hash(self.crypto()),
+                    msg_type,
+                    dest_addr: dest,
+                    original_ttl,
+                    stored_ttl,
+                    action: "bounce_back",
+                }
+            );
+            self.handle_bounce_back(msg, ack_hash, original_ttl, now);
             return;
         }
 
         // Not a duplicate - forward and track with TTL
-        self.insert_recently_forwarded(msg_hash, original_ttl, now);
+        self.insert_recently_forwarded(ack_hash, original_ttl, now);
         self.forward_routed(msg, now);
     }
 
@@ -130,15 +141,16 @@ where
     /// Handle a bounce-back: message returned with different TTL during tree restructuring.
     ///
     /// Instead of dropping, we delay and retry with exponential backoff, giving the tree
-    /// time to stabilize.
+    /// time to stabilize. Uses the same timing as ACK retransmits (1τ, 2τ, ..., 128τ) and
+    /// gives up after MAX_RETRIES attempts.
     fn handle_bounce_back(
         &mut self,
-        msg: Routed,
+        mut msg: Routed,
         ack_hash: AckHash,
         original_ttl: u8,
         now: Timestamp,
     ) {
-        use crate::types::RECENTLY_FORWARDED_TTL_MULTIPLIER;
+        use crate::types::{MAX_RETRIES, RECENTLY_FORWARDED_TTL_MULTIPLIER};
 
         // Always ACK upstream so they don't retry while we delay (or drop)
         self.send_explicit_ack(ack_hash);
@@ -152,23 +164,32 @@ where
         // Clear our own pending_ack if present (bounce proves downstream heard us)
         self.pending_acks_mut().remove(&ack_hash);
 
-        // Update recently_forwarded entry: increment seen_count and refresh expiration
-        let seen_count = if let Some(entry) = self.recently_forwarded_mut().get_mut(&ack_hash) {
-            entry.0 = now; // Refresh timestamp
-                           // Update stored TTL to current value. This ensures future arrivals with this
-                           // same TTL are recognized as retransmissions (not new bounces), while arrivals
-                           // with yet-lower TTL trigger another bounce-back handling.
-            entry.1 = original_ttl;
-            entry.2 = entry.2.saturating_add(1); // Increment seen_count
-            entry.2
-        } else {
-            // Entry was evicted - recreate it
-            self.insert_recently_forwarded(ack_hash, original_ttl, now);
-            1
-        };
+        // Update recently_forwarded entry: increment seen_count and refresh expiration.
+        // Keep the original stored TTL (first-forward TTL) for restoration - don't update it.
+        let (seen_count, first_forward_ttl) =
+            if let Some(entry) = self.recently_forwarded_mut().get_mut(&ack_hash) {
+                entry.0 = now; // Refresh timestamp
+                let stored_ttl = entry.1; // Keep original TTL for restoration
+                entry.2 = entry.2.saturating_add(1); // Increment seen_count
+                (entry.2, stored_ttl)
+            } else {
+                // Entry was evicted - recreate it with current TTL as best guess
+                self.insert_recently_forwarded(ack_hash, original_ttl, now);
+                (1, original_ttl)
+            };
+
+        // Give up after MAX_RETRIES, same as ACK timeout behavior
+        if seen_count > MAX_RETRIES {
+            return;
+        }
+
+        // Restore to the TTL when we first forwarded this message.
+        // Bounce-back retries are like retransmits, not new hops.
+        // TTL should only decrement for actual forward progress, not for bounce retries.
+        msg.ttl = first_forward_ttl;
 
         // Schedule delayed forward with exponential backoff
-        // Backoff: 1τ, 2τ, 4τ, 8τ, ..., capped at 128τ
+        // Backoff: 1τ, 2τ, 4τ, 8τ, ..., capped at 128τ (same as ACK retransmit timing)
         // Note: Duration * u64 uses saturating_mul internally, so this is overflow-safe.
         let tau = self.tau();
         let multiplier = 1u64 << (seen_count.saturating_sub(1)).min(7);
@@ -183,12 +204,16 @@ where
             entry.0 = now + extended_expiry - (tau * RECENTLY_FORWARDED_TTL_MULTIPLIER);
         }
 
-        self.emit_debug(crate::debug::DebugEvent::BounceBackScheduled {
-            msg_type: msg.msg_type(),
-            dest_addr: msg.dest_addr,
-            seen_count,
-            delay_ms: delay.as_millis(),
-        });
+        emit_debug!(
+            self,
+            crate::debug::DebugEvent::BounceBackScheduled {
+                payload_hash: msg.payload_hash(self.crypto()),
+                msg_type: msg.msg_type(),
+                dest_addr: msg.dest_addr,
+                seen_count,
+                delay_ms: delay.as_millis(),
+            }
+        );
 
         self.schedule_delayed_forward(msg, ack_hash, seen_count, scheduled_time);
     }
@@ -278,12 +303,16 @@ where
             let dest = msg.dest_addr;
             let next_hop_id = self.best_next_hop(dest).or_else(|| self.parent());
 
-            self.emit_debug(crate::debug::DebugEvent::DelayedForwardExecuted {
-                msg_type: msg.msg_type(),
-                dest_addr: dest,
-                ttl: msg.ttl,
-                has_route: next_hop_id.is_some(),
-            });
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::DelayedForwardExecuted {
+                    payload_hash: msg.payload_hash(self.crypto()),
+                    msg_type: msg.msg_type(),
+                    dest_addr: dest,
+                    ttl: msg.ttl,
+                    has_route: next_hop_id.is_some(),
+                }
+            );
 
             if let Some(hop_id) = next_hop_id {
                 msg.next_hop = self.compute_node_hash(&hop_id);
@@ -355,40 +384,49 @@ where
     /// Forward a routed message toward its destination.
     fn forward_routed(&mut self, mut msg: Routed, now: Timestamp) {
         let dest = msg.dest_addr;
-        let msg_type = msg.msg_type();
-        let ttl = msg.ttl;
-        let (my_lo, my_hi) = self.keyspace_range();
 
         // Try to find best next hop
         if let Some(next_hop_id) = self.best_next_hop(dest) {
-            self.emit_debug(crate::debug::DebugEvent::RoutedForwardedDown {
-                msg_type,
-                dest_addr: dest,
-                next_hop: next_hop_id,
-                ttl,
-                my_keyspace: (my_lo, my_hi),
-            });
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::RoutedForwardedDown {
+                    payload_hash: msg.payload_hash(self.crypto()),
+                    msg_type: msg.msg_type(),
+                    dest_addr: dest,
+                    next_hop: next_hop_id,
+                    ttl: msg.ttl,
+                    my_keyspace: self.keyspace_range(),
+                }
+            );
             // Set next_hop to the intended forwarder's hash
             msg.next_hop = self.compute_node_hash(&next_hop_id);
             self.send_to_neighbor(next_hop_id, msg, now);
         } else if let Some(parent_id) = self.parent() {
-            self.emit_debug(crate::debug::DebugEvent::RoutedForwardedUp {
-                msg_type,
-                dest_addr: dest,
-                next_hop: parent_id,
-                ttl,
-                my_keyspace: (my_lo, my_hi),
-            });
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::RoutedForwardedUp {
+                    payload_hash: msg.payload_hash(self.crypto()),
+                    msg_type: msg.msg_type(),
+                    dest_addr: dest,
+                    next_hop: parent_id,
+                    ttl: msg.ttl,
+                    my_keyspace: self.keyspace_range(),
+                }
+            );
             // Forward upward to parent as fallback
             msg.next_hop = self.compute_node_hash(&parent_id);
             self.send_to_neighbor(parent_id, msg, now);
         } else {
             // No route - drop the message
-            self.emit_debug(crate::debug::DebugEvent::RoutedDropped {
-                msg_type,
-                dest_addr: dest,
-                reason: "no route (no next_hop or parent)",
-            });
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::RoutedDropped {
+                    payload_hash: msg.payload_hash(self.crypto()),
+                    msg_type: msg.msg_type(),
+                    dest_addr: dest,
+                    reason: "no route (no next_hop or parent)",
+                }
+            );
         }
     }
 
@@ -584,13 +622,22 @@ where
     pub(crate) fn send_routed(&mut self, msg: Routed) -> Result<(), Error> {
         let dest = msg.dest_addr;
         let msg_type = msg.msg_type();
-        let ttl = msg.ttl;
+        #[cfg(feature = "debug")]
+        let payload_hash = if crate::debug::HasDebugEmitter::has_emitter(self) {
+            msg.payload_hash(self.crypto())
+        } else {
+            [0; 4] // Placeholder, never used since emit_debug! also checks emitter
+        };
 
-        self.emit_debug(crate::debug::DebugEvent::RoutedSent {
-            msg_type,
-            dest_addr: dest,
-            ttl,
-        });
+        emit_debug!(
+            self,
+            crate::debug::DebugEvent::RoutedSent {
+                payload_hash,
+                msg_type,
+                dest_addr: dest,
+                ttl: msg.ttl,
+            }
+        );
 
         // If we own the destination, handle locally
         if self.owns_key(dest) {
@@ -626,6 +673,14 @@ where
             }
             Ok(())
         } else {
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::OutgoingQueueFull {
+                    payload_hash,
+                    msg_type,
+                    dest_addr: dest,
+                }
+            );
             if msg_type == MSG_DATA {
                 self.record_app_dropped();
             } else {

@@ -55,6 +55,10 @@
 //!     const MAX_BACKUP_STORE: usize = 64;
 //!     const MAX_BACKUPS_PER_NEIGHBOR: usize = 16;
 //!     const MAX_DELAYED_FORWARDS: usize = 16;
+//!     const OUTGOING_QUEUE_SIZE: usize = 16;
+//!     const INCOMING_QUEUE_SIZE: usize = 8;
+//!     const APP_QUEUE_SIZE: usize = 8;
+//!     const EVENT_QUEUE_SIZE: usize = 16;
 //! }
 //! let node = Node::<_, _, _, _, MyConfig>::new(
 //!     MockTransport::new(), FastTestCrypto::new(0), MockRandom::new(), MockClock::new()
@@ -113,17 +117,36 @@ pub trait NodeConfig {
     /// Maximum delayed forwards for bounce-back dampening.
     /// Messages that bounce back during tree restructuring are queued here.
     const MAX_DELAYED_FORWARDS: usize;
+
+    // --- Queue sizes (used by Transport implementations) ---
+
+    /// Transport outgoing queue size.
+    /// Should handle: K_REPLICAS publish burst, pending ACK retransmits,
+    /// delayed forwards, and backup restoration bursts.
+    const OUTGOING_QUEUE_SIZE: usize;
+
+    /// Transport incoming queue size.
+    /// Should handle bursts from radio while main loop processes messages.
+    const INCOMING_QUEUE_SIZE: usize;
+
+    /// Application data channel size (incoming and outgoing).
+    /// Should handle bursts of DATA messages.
+    const APP_QUEUE_SIZE: usize;
+
+    /// Event channel size.
+    /// Events are informational; larger buffer prevents drops under load.
+    const EVENT_QUEUE_SIZE: usize;
 }
 
 /// Default configuration for 256KB+ RAM devices.
 ///
-/// Memory footprint: ~50-60KB for all bounded collections.
+/// Memory footprint: ~40-50KB for all bounded collections.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DefaultConfig;
 
 impl NodeConfig for DefaultConfig {
     const MAX_NEIGHBORS: usize = 128;
-    const MAX_PUBKEY_CACHE: usize = 128;
+    const MAX_PUBKEY_CACHE: usize = 64;
     const MAX_LOCATION_STORE: usize = 256;
     const MAX_LOCATION_CACHE: usize = 64;
     const MAX_PENDING_LOOKUPS: usize = 16;
@@ -133,10 +156,15 @@ impl NodeConfig for DefaultConfig {
     const MAX_MSGS_PER_PENDING_PUBKEY: usize = 8;
     const MAX_PENDING_PUBKEY_NODES: usize = 16;
     const MAX_PENDING_ACKS: usize = 32;
-    const MAX_RECENTLY_FORWARDED: usize = 256;
-    const MAX_BACKUP_STORE: usize = 512;
+    const MAX_RECENTLY_FORWARDED: usize = 128;
+    const MAX_BACKUP_STORE: usize = 256;
     const MAX_BACKUPS_PER_NEIGHBOR: usize = 64;
-    const MAX_DELAYED_FORWARDS: usize = 32;
+    const MAX_DELAYED_FORWARDS: usize = 64;
+
+    const OUTGOING_QUEUE_SIZE: usize = 32;
+    const INCOMING_QUEUE_SIZE: usize = 16;
+    const APP_QUEUE_SIZE: usize = 16;
+    const EVENT_QUEUE_SIZE: usize = 32;
 }
 
 /// Small configuration for 64KB RAM devices.
@@ -162,7 +190,17 @@ impl NodeConfig for SmallConfig {
     const MAX_BACKUP_STORE: usize = 64;
     const MAX_BACKUPS_PER_NEIGHBOR: usize = 16;
     const MAX_DELAYED_FORWARDS: usize = 16;
+
+    const OUTGOING_QUEUE_SIZE: usize = 8;
+    const INCOMING_QUEUE_SIZE: usize = 8;
+    const APP_QUEUE_SIZE: usize = 8;
+    const EVENT_QUEUE_SIZE: usize = 16;
 }
+
+// Compile-time assertions to catch invalid configurations.
+// MAX_LOCATION_STORE must be > 0 for the DHT replication logic to work correctly.
+const _: () = assert!(DefaultConfig::MAX_LOCATION_STORE > 0);
+const _: () = assert!(SmallConfig::MAX_LOCATION_STORE > 0);
 
 #[cfg(test)]
 mod tests {
@@ -171,7 +209,7 @@ mod tests {
     #[test]
     fn test_default_config_values() {
         assert_eq!(DefaultConfig::MAX_NEIGHBORS, 128);
-        assert_eq!(DefaultConfig::MAX_PUBKEY_CACHE, 128);
+        assert_eq!(DefaultConfig::MAX_PUBKEY_CACHE, 64);
         assert_eq!(DefaultConfig::MAX_LOCATION_STORE, 256);
         assert_eq!(DefaultConfig::MAX_LOCATION_CACHE, 64);
         assert_eq!(DefaultConfig::MAX_PENDING_LOOKUPS, 16);
@@ -181,10 +219,10 @@ mod tests {
         assert_eq!(DefaultConfig::MAX_MSGS_PER_PENDING_PUBKEY, 8);
         assert_eq!(DefaultConfig::MAX_PENDING_PUBKEY_NODES, 16);
         assert_eq!(DefaultConfig::MAX_PENDING_ACKS, 32);
-        assert_eq!(DefaultConfig::MAX_RECENTLY_FORWARDED, 256);
-        assert_eq!(DefaultConfig::MAX_BACKUP_STORE, 512);
+        assert_eq!(DefaultConfig::MAX_RECENTLY_FORWARDED, 128);
+        assert_eq!(DefaultConfig::MAX_BACKUP_STORE, 256);
         assert_eq!(DefaultConfig::MAX_BACKUPS_PER_NEIGHBOR, 64);
-        assert_eq!(DefaultConfig::MAX_DELAYED_FORWARDS, 32);
+        assert_eq!(DefaultConfig::MAX_DELAYED_FORWARDS, 64);
     }
 
     #[test]

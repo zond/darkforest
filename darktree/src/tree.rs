@@ -165,9 +165,12 @@ where
             .crypto()
             .verify(&pubkey, sign_data.as_slice(), &pulse.signature)
         {
-            self.emit_debug(crate::debug::DebugEvent::SignatureVerifyFailed {
-                node_id: pulse.node_id,
-            });
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::SignatureVerifyFailed {
+                    node_id: pulse.node_id,
+                }
+            );
             return; // Invalid signature
         }
 
@@ -196,24 +199,30 @@ where
         let min_interval = self.tau() * 2;
         if let Some(prev_seen) = prev {
             if now < prev_seen + min_interval {
-                self.emit_debug(crate::debug::DebugEvent::PulseRateLimited {
-                    from: pulse.node_id,
-                    now,
-                    last_seen: prev_seen,
-                    min_interval_ms: min_interval.as_millis(),
-                });
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::PulseRateLimited {
+                        from: pulse.node_id,
+                        now,
+                        last_seen: prev_seen,
+                        min_interval_ms: min_interval.as_millis(),
+                    }
+                );
                 return; // Too soon for tree operations, but timing is updated
             }
         }
 
-        self.emit_debug(crate::debug::DebugEvent::PulseReceived {
-            timestamp: now,
-            from: pulse.node_id,
-            tree_size: pulse.tree_size,
-            root_hash: pulse.root_hash,
-            has_pubkey: pulse.has_pubkey(),
-            need_pubkey: pulse.need_pubkey(),
-        });
+        emit_debug!(
+            self,
+            crate::debug::DebugEvent::PulseReceived {
+                timestamp: now,
+                from: pulse.node_id,
+                tree_size: pulse.tree_size,
+                root_hash: pulse.root_hash,
+                has_pubkey: pulse.has_pubkey(),
+                need_pubkey: pulse.need_pubkey(),
+            }
+        );
 
         // If new neighbor, schedule proactive pulse to introduce ourselves
         if is_new_neighbor {
@@ -321,7 +330,7 @@ where
                 let jitter_ms = self.random_mut().gen_range(0, tau_ms);
                 self.set_next_publish(Some(now + Duration::from_millis(jitter_ms)));
                 // Move DHT entries that we no longer own to their new owners
-                self.rebalance_keyspace(now);
+                self.trigger_rebalance(now);
                 // Notify children of our new keyspace/depth
                 self.schedule_proactive_pulse(now);
             }
@@ -429,11 +438,14 @@ where
         }
 
         if is_new {
-            self.emit_debug(crate::debug::DebugEvent::ChildAdded {
-                timestamp: now,
-                child_id: pulse.node_id,
-                subtree_size: pulse.subtree_size,
-            });
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::ChildAdded {
+                    timestamp: now,
+                    child_id: pulse.node_id,
+                    subtree_size: pulse.subtree_size,
+                }
+            );
         }
 
         // Accept the child (hash already computed as sender_hash)
@@ -460,7 +472,7 @@ where
         self.recompute_child_ranges();
 
         // Rebalance keyspace after subtree size changed (owned slice may have shrunk)
-        self.rebalance_keyspace(now);
+        self.trigger_rebalance(now);
 
         // If new child, schedule proactive pulse to acknowledge them
         if is_new {
@@ -506,7 +518,7 @@ where
             self.schedule_location_publish(now);
 
             // Rebalance keyspace after joining new tree
-            self.rebalance_keyspace(now);
+            self.trigger_rebalance(now);
         } else {
             // Not acknowledged yet, increment counter
             let new_count = current_count + 1;
@@ -527,41 +539,53 @@ where
     fn consider_merge(&mut self, pulse: &Pulse, _sender_hash: &ChildHash, now: Timestamp) {
         // Don't start merge if already shopping - wait for select_best_parent
         if self.is_shopping() {
-            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
-                from: pulse.node_id,
-                dominated: false,
-                reason: "shopping",
-            });
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::ConsiderMerge {
+                    from: pulse.node_id,
+                    dominated: false,
+                    reason: "shopping",
+                }
+            );
             return;
         }
 
         // Don't merge if already switching parents
         if self.pending_parent().is_some() {
-            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
-                from: pulse.node_id,
-                dominated: false,
-                reason: "pending_parent",
-            });
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::ConsiderMerge {
+                    from: pulse.node_id,
+                    dominated: false,
+                    reason: "pending_parent",
+                }
+            );
             return;
         }
 
         // Ignore merge offers from distrusted nodes
         if self.is_distrusted(&pulse.node_id, now) {
-            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
-                from: pulse.node_id,
-                dominated: false,
-                reason: "distrusted",
-            });
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::ConsiderMerge {
+                    from: pulse.node_id,
+                    dominated: false,
+                    reason: "distrusted",
+                }
+            );
             return;
         }
 
         // Same tree? No merge needed.
         if pulse.root_hash == *self.root_hash() {
-            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
-                from: pulse.node_id,
-                dominated: false,
-                reason: "same_root",
-            });
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::ConsiderMerge {
+                    from: pulse.node_id,
+                    dominated: false,
+                    reason: "same_root",
+                }
+            );
             return;
         }
 
@@ -569,19 +593,25 @@ where
         let dominated = (pulse.tree_size, self.root_hash()) > (self.tree_size(), &pulse.root_hash);
 
         if !dominated {
-            self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
-                from: pulse.node_id,
-                dominated: false,
-                reason: "not_dominated",
-            });
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::ConsiderMerge {
+                    from: pulse.node_id,
+                    dominated: false,
+                    reason: "not_dominated",
+                }
+            );
             return;
         }
 
-        self.emit_debug(crate::debug::DebugEvent::ConsiderMerge {
-            from: pulse.node_id,
-            dominated: true,
-            reason: "start_shopping",
-        });
+        emit_debug!(
+            self,
+            crate::debug::DebugEvent::ConsiderMerge {
+                from: pulse.node_id,
+                dominated: true,
+                reason: "start_shopping",
+            }
+        );
 
         // TREE INVERSION: Leave our current tree position
         // When joining a bigger tree, we first become root of our own subtree.
@@ -591,7 +621,7 @@ where
         self.become_root();
 
         // Rebalance keyspace after position change
-        self.rebalance_keyspace(now);
+        self.trigger_rebalance(now);
 
         // Start shopping phase (3τ) to collect candidates from dominating tree
         // When shopping ends, select_best_parent picks the shallowest position
@@ -653,12 +683,15 @@ where
         // Check if the best tree dominates us
         let dominated = (best_tree.0, self.root_hash()) > (self.tree_size(), &best_tree.1);
 
-        self.emit_debug(crate::debug::DebugEvent::SelectBestParent {
-            candidate_count: candidates.len(),
-            best_tree_size: best_tree.0,
-            best_root_hash: best_tree.1,
-            dominated,
-        });
+        emit_debug!(
+            self,
+            crate::debug::DebugEvent::SelectBestParent {
+                candidate_count: candidates.len(),
+                best_tree_size: best_tree.0,
+                best_root_hash: best_tree.1,
+                dominated,
+            }
+        );
 
         // 5a. Dominating tree candidates - pick shallowest by depth
         if dominated {
@@ -884,13 +917,17 @@ where
     pub(crate) fn send_pulse(&mut self, now: Timestamp) {
         let pulse = self.build_pulse();
 
-        // Extract info for debug event before encoding consumes the pulse
-        let debug_info = (
-            pulse.tree_size,
-            pulse.root_hash,
-            pulse.child_count(),
-            pulse.has_pubkey(),
-            pulse.need_pubkey(),
+        // Emit debug event while we still have access to pulse fields
+        emit_debug!(
+            self,
+            crate::debug::DebugEvent::PulseSent {
+                timestamp: now,
+                tree_size: pulse.tree_size,
+                root_hash: pulse.root_hash,
+                child_count: pulse.child_count(),
+                has_pubkey: pulse.has_pubkey(),
+                need_pubkey: pulse.need_pubkey(),
+            }
         );
 
         // Encode with message type
@@ -909,15 +946,6 @@ where
         // Send via priority queue (BroadcastProtocol priority)
         if self.transport().outgoing().try_send(msg) {
             self.record_protocol_sent();
-
-            self.emit_debug(crate::debug::DebugEvent::PulseSent {
-                timestamp: now,
-                tree_size: debug_info.0,
-                root_hash: debug_info.1,
-                child_count: debug_info.2,
-                has_pubkey: debug_info.3,
-                need_pubkey: debug_info.4,
-            });
         } else {
             self.record_protocol_dropped();
         }
@@ -1072,6 +1100,11 @@ where
             // Remove from pubkey cache and need set
             self.pubkey_cache_mut().remove(&id);
             self.need_pubkey_mut().remove(&id);
+
+            // Remove backups we were holding for this neighbor
+            let neighbor_hash = self.compute_node_hash(&id);
+            self.backup_store_mut()
+                .retain(|_, entry| entry.backed_up_for != neighbor_hash);
         }
 
         next_timeout
@@ -1092,11 +1125,14 @@ where
 
         // Remove expired
         for key in expired {
-            self.emit_debug(crate::debug::DebugEvent::LocationRemoved {
-                owner: key.0,
-                replica_index: key.1,
-                reason: "expiry",
-            });
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::LocationRemoved {
+                    owner: key.0,
+                    replica_index: key.1,
+                    reason: "expiry",
+                }
+            );
             self.location_store_mut().remove(&key);
         }
     }

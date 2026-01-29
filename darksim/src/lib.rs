@@ -4288,6 +4288,49 @@ mod tests {
             } else if replica_count > 0 {
                 nodes_with_partial += 1;
                 println!("Node {:2}: {}/{} replicas", i, replica_count, K_REPLICAS);
+                // Debug: which replicas are missing and who should have them?
+                for replica in 0..K_REPLICAS as u8 {
+                    let mut found_at = None;
+                    for (storage_idx, storage_node_id) in nodes.iter().enumerate() {
+                        let store = sim
+                            .node(storage_node_id)
+                            .unwrap()
+                            .inner()
+                            .test_location_store();
+                        if store.contains_key(&(inner_node_id, replica)) {
+                            found_at = Some(storage_idx);
+                            break;
+                        }
+                    }
+                    if found_at.is_none() {
+                        let dest_addr = sim
+                            .node(node_id)
+                            .unwrap()
+                            .inner()
+                            .test_replica_addr(&inner_node_id, replica);
+                        println!(
+                            "  MISSING replica {} (dest_addr={}=0x{:x})",
+                            replica, dest_addr, dest_addr
+                        );
+                        // Find who should own it
+                        for (storage_idx, storage_node_id) in nodes.iter().enumerate() {
+                            let storage_node = sim.node(storage_node_id).unwrap();
+                            let (lo, hi) = storage_node.keyspace_range();
+                            let own_hi = {
+                                let (ks_lo, ks_hi) = storage_node.keyspace_range();
+                                let subtree = storage_node.subtree_size() as u64;
+                                let range = ks_hi as u64 - ks_lo as u64;
+                                ks_lo as u64 + range / subtree
+                            };
+                            if dest_addr >= lo && (dest_addr as u64) < own_hi {
+                                println!(
+                                    "    -> Node {} should own it: ks=[{},{}), own_hi={}",
+                                    storage_idx, lo, hi, own_hi
+                                );
+                            }
+                        }
+                    }
+                }
             } else {
                 nodes_with_none += 1;
                 println!(
@@ -4369,7 +4412,7 @@ mod tests {
 
             let received = incoming.try_receive();
             assert!(
-                received.is_ok(),
+                received.is_some(),
                 "Receiver should have received data from sender"
             );
             let data = received.unwrap();

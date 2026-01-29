@@ -851,6 +851,32 @@ impl crate::traits::Ackable for Broadcast {
     }
 }
 
+#[cfg(feature = "debug")]
+impl Routed {
+    /// Compute a 4-byte hash of just the payload.
+    /// Unlike ack_hash, this is invariant across rebalances since it
+    /// doesn't include src_node_id - the same content always has the same hash.
+    pub fn payload_hash<C: crate::traits::Crypto>(&self, crypto: &C) -> [u8; 4] {
+        let full_hash = crypto.hash(&self.payload);
+        let mut hash = [0u8; 4];
+        hash.copy_from_slice(&full_hash[..4]);
+        hash
+    }
+}
+
+#[cfg(feature = "debug")]
+impl Broadcast {
+    /// Compute a 4-byte hash of just the payload.
+    /// Unlike ack_hash, this is invariant across rebalances since it
+    /// doesn't include src_node_id - the same content always has the same hash.
+    pub fn payload_hash<C: crate::traits::Crypto>(&self, crypto: &C) -> [u8; 4] {
+        let full_hash = crypto.hash(&self.payload);
+        let mut hash = [0u8; 4];
+        hash.copy_from_slice(&full_hash[..4]);
+        hash
+    }
+}
+
 impl Encode for LocationEntry {
     fn encode(&self, w: &mut Writer) {
         w.write_node_id(&self.node_id);

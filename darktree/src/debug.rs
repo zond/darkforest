@@ -6,6 +6,45 @@
 use crate::time::Timestamp;
 use crate::types::NodeId;
 
+/// Trait for types that can emit debug events.
+/// Implement this to make a type usable with the `emit_debug!` macro.
+#[cfg(feature = "debug")]
+pub trait HasDebugEmitter {
+    /// Returns a reference to the debug emitter cell.
+    fn debug_emitter(&self) -> &core::cell::RefCell<Option<alloc::boxed::Box<dyn DebugEmitter>>>;
+
+    /// Check if a debug emitter is set.
+    /// Use this to guard expensive computations (like hashing) that are only
+    /// needed for debug events.
+    fn has_emitter(&self) -> bool {
+        self.debug_emitter().borrow().is_some()
+    }
+}
+
+/// Emit a debug event. When the "debug" feature is disabled, this expands to nothing,
+/// so the event expression is never evaluated (zero overhead).
+///
+/// If no debug emitter is set, silently does nothing.
+///
+/// Usage: `emit_debug!(node, DebugEvent::Variant { ... })`
+#[cfg(feature = "debug")]
+macro_rules! emit_debug {
+    ($node:expr, $event:expr) => {
+        if let Some(emitter) = crate::debug::HasDebugEmitter::debug_emitter($node)
+            .borrow_mut()
+            .as_mut()
+        {
+            emitter.emit($event);
+        }
+    };
+}
+
+/// No-op version when debug feature is disabled.
+#[cfg(not(feature = "debug"))]
+macro_rules! emit_debug {
+    ($node:expr, $event:expr) => {};
+}
+
 /// Trait for receiving debug events from a node.
 /// Implemented by test harnesses to collect/print events.
 pub trait DebugEmitter: Send {
@@ -93,13 +132,16 @@ pub enum DebugEvent {
     /// Message decode failed.
     MessageDecodeFailed { data_len: usize },
     /// Routed message sent (PUBLISH, LOOKUP, etc.)
+    /// payload_hash identifies the content for tracing across rebalances.
     RoutedSent {
+        payload_hash: [u8; 4],
         msg_type: u8,
         dest_addr: u32,
         ttl: u8,
     },
     /// Routed message forwarded DOWN to a child/shortcut.
     RoutedForwardedDown {
+        payload_hash: [u8; 4],
         msg_type: u8,
         dest_addr: u32,
         next_hop: NodeId,
@@ -108,6 +150,7 @@ pub enum DebugEvent {
     },
     /// Routed message forwarded UP to parent (no child owns dest).
     RoutedForwardedUp {
+        payload_hash: [u8; 4],
         msg_type: u8,
         dest_addr: u32,
         next_hop: NodeId,
@@ -116,18 +159,21 @@ pub enum DebugEvent {
     },
     /// Routed message delivered locally (we own the keyspace).
     RoutedDelivered {
+        payload_hash: [u8; 4],
         msg_type: u8,
         dest_addr: u32,
         from: NodeId,
     },
     /// Routed message dropped (no route found).
     RoutedDropped {
+        payload_hash: [u8; 4],
         msg_type: u8,
         dest_addr: u32,
         reason: &'static str,
     },
     /// PUBLISH stored in location_store.
     PublishStored {
+        payload_hash: [u8; 4],
         owner: NodeId,
         replica_index: u8,
         dest_addr: u32,
@@ -145,6 +191,7 @@ pub enum DebugEvent {
     },
     /// Duplicate routed message detected (already in recently_forwarded).
     RoutedDuplicate {
+        payload_hash: [u8; 4],
         msg_type: u8,
         dest_addr: u32,
         original_ttl: u8,
@@ -153,6 +200,7 @@ pub enum DebugEvent {
     },
     /// Bounce-back scheduled for delayed forward.
     BounceBackScheduled {
+        payload_hash: [u8; 4],
         msg_type: u8,
         dest_addr: u32,
         seen_count: u8,
@@ -160,9 +208,24 @@ pub enum DebugEvent {
     },
     /// Delayed forward executed after bounce-back.
     DelayedForwardExecuted {
+        payload_hash: [u8; 4],
         msg_type: u8,
         dest_addr: u32,
         ttl: u8,
         has_route: bool,
     },
+    /// Outgoing queue rejected a routed message (queue full).
+    OutgoingQueueFull {
+        payload_hash: [u8; 4],
+        msg_type: u8,
+        dest_addr: u32,
+    },
+    /// Message received from transport.
+    /// payload_hash is Some if the message is a Routed message.
+    TransportReceived {
+        data_len: usize,
+        payload_hash: Option<[u8; 4]>,
+    },
+    /// App incoming channel full, DATA message dropped.
+    AppIncomingFull { from: NodeId, payload_len: usize },
 }

@@ -102,6 +102,7 @@ extern crate alloc;
 
 pub mod children;
 pub mod config;
+#[macro_use]
 pub mod debug;
 pub mod dht;
 pub mod fraud;

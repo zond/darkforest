@@ -6,6 +6,7 @@
 //! - Time sources (real hardware time, simulated time)
 //! - Random number generators
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::future::Future;
 
@@ -14,20 +15,18 @@ use embassy_sync::channel::Channel;
 
 use crate::time::Timestamp;
 use crate::types::{
-    Event, Incoming, NodeId, Payload, PreEncoded, Priority, PublicKey, SecretKey, Signature,
+    Incoming, NodeId, Payload, PreEncoded, Priority, PublicKey, SecretKey, Signature,
 };
 
-/// Queue size for transport channels.
-pub(crate) const TRANSPORT_QUEUE_SIZE: usize = 8;
+// Queue sizes for Node's channels come from NodeConfig (Cfg::APP_QUEUE_SIZE, etc.)
+// The Transport incoming channel uses DefaultConfig since Transport is not generic over Cfg.
+use crate::config::{DefaultConfig, NodeConfig};
 
-/// Queue size for application-level channels.
-pub(crate) const APP_QUEUE_SIZE: usize = 8;
-
-/// Queue size for event channel.
-pub(crate) const EVENT_QUEUE_SIZE: usize = 16;
+/// Queue size for transport incoming channel (uses DefaultConfig).
+pub(crate) const TRANSPORT_QUEUE_SIZE: usize = DefaultConfig::INCOMING_QUEUE_SIZE;
 
 /// Mutex type used for channels.
-pub(crate) type ChannelMutex = CriticalSectionRawMutex;
+pub type ChannelMutex = CriticalSectionRawMutex;
 
 /// Incoming transport message channel type.
 pub type TransportInChannel = Channel<ChannelMutex, Incoming, TRANSPORT_QUEUE_SIZE>;
@@ -50,14 +49,74 @@ pub struct OutgoingData {
     pub payload: Payload,
 }
 
-/// Application-level incoming data channel.
-pub type AppInChannel = Channel<ChannelMutex, IncomingData, APP_QUEUE_SIZE>;
+/// Dynamic-sized channel using VecDeque.
+///
+/// Unlike Embassy's Channel which requires const generic size, this channel
+/// takes max_size at runtime, allowing NodeConfig to control queue sizes.
+pub struct DynamicChannel<T> {
+    inner: embassy_sync::blocking_mutex::Mutex<
+        ChannelMutex,
+        core::cell::RefCell<DynamicChannelInner<T>>,
+    >,
+    signal: embassy_sync::signal::Signal<ChannelMutex, ()>,
+}
 
-/// Application-level outgoing data channel.
-pub type AppOutChannel = Channel<ChannelMutex, OutgoingData, APP_QUEUE_SIZE>;
+struct DynamicChannelInner<T> {
+    items: VecDeque<T>,
+    max_size: usize,
+}
 
-/// Protocol event channel.
-pub type EventChannel = Channel<ChannelMutex, Event, EVENT_QUEUE_SIZE>;
+impl<T> DynamicChannel<T> {
+    /// Create a new dynamic channel with the specified maximum size.
+    pub const fn new(max_size: usize) -> Self {
+        Self {
+            inner: embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(
+                DynamicChannelInner {
+                    items: VecDeque::new(),
+                    max_size,
+                },
+            )),
+            signal: embassy_sync::signal::Signal::new(),
+        }
+    }
+
+    /// Try to send an item. Returns true if queued, false if full.
+    pub fn try_send(&self, item: T) -> bool {
+        let sent = self.inner.lock(|inner| {
+            let mut inner = inner.borrow_mut();
+            if inner.items.len() >= inner.max_size {
+                return false;
+            }
+            inner.items.push_back(item);
+            true
+        });
+        if sent {
+            self.signal.signal(());
+        }
+        sent
+    }
+
+    /// Receive an item, waiting asynchronously if empty.
+    pub async fn receive(&self) -> T {
+        loop {
+            // Try to get an item
+            let item = self
+                .inner
+                .lock(|inner| inner.borrow_mut().items.pop_front());
+            if let Some(item) = item {
+                return item;
+            }
+            // Wait for signal that an item was added
+            self.signal.wait().await;
+        }
+    }
+
+    /// Try to receive without blocking. Returns None if empty.
+    pub fn try_receive(&self) -> Option<T> {
+        self.inner
+            .lock(|inner| inner.borrow_mut().items.pop_front())
+    }
+}
 
 /// Trait for messages that can be sent via the priority queue.
 pub trait Outgoing {
@@ -522,9 +581,6 @@ pub mod test_impls {
 
     use super::*;
 
-    /// Default queue size for MockTransport.
-    pub const MOCK_QUEUE_SIZE: usize = 16;
-
     /// Mock transport for testing using priority queue.
     pub struct MockTransport {
         mtu: usize,
@@ -538,7 +594,7 @@ pub mod test_impls {
             Self {
                 mtu: 255,
                 bw: None,
-                outgoing: PriorityQueue::new(MOCK_QUEUE_SIZE),
+                outgoing: PriorityQueue::new(DefaultConfig::OUTGOING_QUEUE_SIZE),
                 incoming: Channel::new(),
             }
         }
@@ -563,7 +619,7 @@ pub mod test_impls {
             Self {
                 mtu,
                 bw,
-                outgoing: PriorityQueue::new(MOCK_QUEUE_SIZE),
+                outgoing: PriorityQueue::new(DefaultConfig::OUTGOING_QUEUE_SIZE),
                 incoming: Channel::new(),
             }
         }

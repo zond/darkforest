@@ -73,17 +73,21 @@ These constants define protocol limits and memory bounds. Implementations MUST r
 
 | Constant | DefaultConfig | SmallConfig | Purpose |
 |----------|---------------|-------------|---------|
-| MAX_NEIGHBORS | 128 | 32 | Neighbor tracking |
-| MAX_PUBKEY_CACHE | 128 | 32 | LRU pubkey cache |
+| MAX_NEIGHBORS | 128 | 16 | Neighbor tracking |
+| MAX_PUBKEY_CACHE | 64 | 16 | LRU pubkey cache |
 | MAX_LOCATION_STORE | 256 | 32 | Primary DHT entries |
-| MAX_BACKUP_STORE | 512 | 64 | Backup DHT entries |
+| MAX_BACKUP_STORE | 256 | 64 | Backup DHT entries |
 | MAX_BACKUPS_PER_NEIGHBOR | 64 | 16 | Per-neighbor backup limit |
-| MAX_PENDING_ACKS | 32 | 16 | Messages awaiting ACK |
-| MAX_RECENTLY_FORWARDED | 256 | 64 | Duplicate detection |
-| MAX_DELAYED_FORWARDS | 32 | 16 | Bounce-back dampening queue |
-| MAX_PENDING_LOOKUPS | 16 | 8 | Concurrent DHT lookups |
-| MAX_DISTRUSTED | 64 | 16 | Fraud detection blacklist |
-| HLL_REGISTERS | 256 | 64 | HyperLogLog registers |
+| MAX_PENDING_ACKS | 32 | 8 | Messages awaiting ACK |
+| MAX_RECENTLY_FORWARDED | 128 | 32 | Duplicate detection |
+| MAX_DELAYED_FORWARDS | 64 | 16 | Bounce-back dampening queue |
+| MAX_PENDING_LOOKUPS | 16 | 4 | Concurrent DHT lookups |
+| MAX_DISTRUSTED | 64 | 8 | Fraud detection blacklist |
+| HLL_REGISTERS | 256 | 256 | HyperLogLog registers (hardcoded) |
+| OUTGOING_QUEUE_SIZE | 32 | 8 | Transport outgoing queue |
+| INCOMING_QUEUE_SIZE | 16 | 8 | Transport incoming queue |
+| APP_QUEUE_SIZE | 16 | 8 | Application data queues |
+| EVENT_QUEUE_SIZE | 32 | 16 | Node event queue |
 
 ---
 
@@ -1734,19 +1738,19 @@ fn recently_forwarded_ttl(&self) -> Duration {
 }
 ```
 
-**Memory usage:**
+**Memory usage (DefaultConfig):**
 - `pending_acks`: 32 entries × ~16 bytes (hash + metadata) = ~512 bytes
   - Plus original messages for retransmission (bounded by MTU × 32 ≈ 8KB worst case)
-- `recently_forwarded`: 256 entries × ~17 bytes (hash + timestamp + seen_count) = ~4.3KB
-- `delayed_forwards`: 32 entries × ~13 bytes (hash + seen_count + timestamp) = ~416 bytes
-  - Plus messages awaiting forward (bounded by MTU × 32 ≈ 8KB worst case)
-- Total: ~5.2KB metadata + up to 16KB message storage
+- `recently_forwarded`: 128 entries × ~17 bytes (hash + timestamp + seen_count) = ~2.2KB
+- `delayed_forwards`: 64 entries × ~13 bytes (hash + seen_count + timestamp) = ~832 bytes
+  - Plus messages awaiting forward (bounded by MTU × 64 ≈ 16KB worst case)
+- Total: ~3.5KB metadata + up to 24KB message storage
 
 **Why these values:**
 - `RECENTLY_FORWARDED_TTL = 320τ`: Must exceed worst-case retry sequence (~280τ with jitter). Provides ~14% margin.
-- `MAX_RECENTLY_FORWARDED = 256`: Forwarding rate scales inversely with τ (slow links forward slowly), so the product (TTL × rate) stays roughly constant. For LoRa at 33 min TTL but ~0.05 msg/s: ~99 entries needed. For UDP at 30s TTL but ~0.5 msg/s: ~15 entries needed. 256 provides headroom for both.
+- `MAX_RECENTLY_FORWARDED = 128` (DefaultConfig) / `32` (SmallConfig): Forwarding rate scales inversely with τ (slow links forward slowly), so the product (TTL × rate) stays roughly constant. For LoRa at 33 min TTL but ~0.05 msg/s: ~99 entries needed. For UDP at 30s TTL but ~0.5 msg/s: ~15 entries needed. 128 provides headroom for both.
 - `MAX_PENDING_ACKS = 32`: Limits concurrent outbound messages awaiting ACK. With worst-case ~280τ per message, throughput floor is ~32/280τ messages per τ under heavy loss.
-- `MAX_DELAYED_FORWARDS = 32`: Limits queued bounce-back messages during tree churn. Matches pending_acks since both hold messages awaiting transmission.
+- `MAX_DELAYED_FORWARDS = 64` (DefaultConfig) / `16` (SmallConfig): Sized to handle burst bounce-backs during tree restructuring. When multiple messages encounter an unstable routing path simultaneously (e.g., during a merge), they may all bounce back within a short window. The queue must be large enough to absorb these bursts without dropping protocol-critical messages. Set to 2× MAX_PENDING_ACKS to provide headroom.
 
 When collections are full, entries are evicted:
 - Evicted pending_ack (LRU): give up on that message (application can retry)
@@ -1839,17 +1843,19 @@ fn handle_bounce_back(&mut self, msg: Routed, ack_hash: [u8; 4]) {
 - Message eventually delivers once tree settles
 - Graceful degradation: worst case is 128τ delay per bounce, not message loss
 
-**TTL handling:** The delayed forward uses `msg.ttl - 1`, same as any forward. TTL decrement provides natural termination — a message can only bounce as many times as it has TTL remaining.
+**TTL handling:** The delayed forward restores `msg.ttl` to the value when first forwarded, rather than decrementing. Bounce-back retries represent retransmission attempts, not forward progress—TTL should only decrement for actual routing advancement. This prevents TTL exhaustion during tree churn where a message might bounce several times before finding a stable route.
 
 **Entry refresh:** The `recently_forwarded` entry's expiration is reset to `now() + 320τ` on each bounce. This ensures the entry (and its `seen_count`) survives until the delayed forward fires, even for long delays like 128τ.
 
+**Retry limit:** Bounce-back handling gives up after `MAX_RETRIES` (same constant as ACK retransmission, currently 8). This prevents infinite bounce loops if a message is undeliverable. After MAX_RETRIES bounces, the message is dropped silently—the sender will retry via normal ACK timeout if needed.
+
 **Delayed forward queue:**
-- Bounded by `MAX_DELAYED_FORWARDS` (32 entries)
+- Bounded by `MAX_DELAYED_FORWARDS` (64 entries in DefaultConfig, 16 in SmallConfig)
 - Each entry stores: message, ack_hash, seen_count, scheduled time
 - **seen_count storage:** The entry stores its own `seen_count` so backoff state survives even if the `recently_forwarded` entry is evicted under LRU pressure
 - **Deduplication:** At most one delayed forward per `ack_hash`. If a new bounce arrives for a hash already in the queue, double the remaining delay (exponential backoff continues — the first delay wasn't enough)
 - **Eviction:** When full, drop the entry with the longest remaining delay (most likely to exceed TTL anyway)
-- When the delay fires, forward with `msg.ttl - 1` and recompute `next_hop` based on current routing table
+- When the delay fires, forward with restored TTL and recompute `next_hop` based on current routing table
 
 **Interaction with duplicate detection:** Duplicate detection (same hash AND same TTL) triggers an explicit ACK without forwarding. Bounce-back (same hash, different TTL) triggers delayed forwarding. The TTL comparison distinguishes these cases.
 
@@ -2038,6 +2044,24 @@ impl Node {
 Typical size: 119-123 bytes. The payload is self-contained—storage nodes can verify and forward it without accessing the Routed header.
 
 **Rebalancing:** When keyspace ownership changes (e.g., a new child joins), the storage node forwards stored entries to new owners. The location signature remains valid because it doesn't depend on routing path.
+
+##### Incremental Rebalancing
+
+When keyspace ownership changes (e.g., a child joins/leaves), the storage node must forward entries it no longer owns to their new owners. To avoid overwhelming the outgoing queue during large keyspace shifts, rebalancing is performed incrementally:
+
+**Algorithm:**
+1. Find ONE entry where `!owns_key(replica_addr(entry))`
+2. Remove it from local storage
+3. Re-publish to the correct owner via normal PUBLISH routing
+4. If more unowned entries exist, schedule next rebalance after 2τ
+5. Repeat until no unowned entries remain
+
+**Rationale:**
+- **Bounded work per tick:** Processing one entry at a time keeps CPU and queue usage predictable
+- **Traffic spreading:** The 2τ delay between entries reduces collision probability on shared radio channels
+- **Graceful degradation:** If the node is busy, rebalancing naturally yields to higher-priority work
+
+**Memory:** No additional allocation—uses the existing location_store iteration.
 
 #### Storing Published Data
 
@@ -2969,14 +2993,14 @@ Total hops ≈ 3 × depth
 
 | Component | DefaultConfig | SmallConfig |
 |-----------|---------------|-------------|
-| Neighbor tracking | ~5 KB | ~2 KB |
-| Pubkey cache | ~4 KB | ~2 KB |
+| Neighbor tracking | ~10 KB | ~1.3 KB |
+| Pubkey cache | ~3 KB | ~0.8 KB |
 | Location store | ~36 KB | ~4.5 KB |
-| Backup store | ~72 KB | ~9 KB |
-| Pending ACKs | ~8.5 KB | ~4 KB |
-| Recently forwarded | ~4 KB | ~2 KB |
-| Fraud detection | 256 B | 64 B |
-| **Total** | **~130 KB** | **~24 KB** |
+| Backup store | ~36 KB | ~9 KB |
+| Pending ACKs | ~8.5 KB | ~2 KB |
+| Recently forwarded | ~2 KB | ~0.5 KB |
+| Fraud detection | 256 B | 256 B |
+| **Total** | **~96 KB** | **~18 KB** |
 
 ### Traffic Overhead (10k network)
 
