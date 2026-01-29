@@ -135,10 +135,11 @@ where
         }
 
         // Check if this is a newer entry for this specific replica
+        // Reject if seq <= existing (design doc: "Verify seq > existing_seq")
         let store_key = (owner_node_id, replica_index);
         if let Some(existing) = self.location_store().get(&store_key) {
-            if seq < existing.seq {
-                return; // Old entry
+            if seq <= existing.seq {
+                return; // Replay or old entry
             }
         }
 
