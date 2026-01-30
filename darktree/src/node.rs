@@ -277,7 +277,7 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     delayed_forwards: DelayedForwardMap,
 
     // Pending routed messages (root nodes only)
-    pending_routed: Vec<PendingRouted>,
+    pending_routed: VecDeque<PendingRouted>,
 
     // Scheduling
     last_pulse: Option<Timestamp>,
@@ -418,7 +418,7 @@ where
             recently_forwarded: HashMap::new(),
             delayed_forwards: HashMap::new(),
 
-            pending_routed: Vec::new(),
+            pending_routed: VecDeque::new(),
 
             last_pulse: None,
             last_pulse_size: 0,
@@ -1357,11 +1357,11 @@ where
         &mut self.delayed_forwards
     }
 
-    pub(crate) fn pending_routed(&self) -> &[PendingRouted] {
+    pub(crate) fn pending_routed(&self) -> &VecDeque<PendingRouted> {
         &self.pending_routed
     }
 
-    pub(crate) fn pending_routed_mut(&mut self) -> &mut Vec<PendingRouted> {
+    pub(crate) fn pending_routed_mut(&mut self) -> &mut VecDeque<PendingRouted> {
         &mut self.pending_routed
     }
 

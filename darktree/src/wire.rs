@@ -46,7 +46,7 @@ use alloc::vec::Vec;
 use crate::traits::Outgoing;
 use crate::types::{
     Broadcast, ChildrenList, IdHash, LocationEntry, Priority, Pulse, Routed, Signature,
-    BCAST_PAYLOAD_BACKUP, MAX_BROADCAST_DESTINATIONS, MSG_DATA, PULSE_CHILD_COUNT_SHIFT,
+    BCAST_PAYLOAD_BACKUP, MAX_BROADCAST_DESTINATIONS, PULSE_CHILD_COUNT_SHIFT,
     PULSE_FLAG_HAS_PARENT, PULSE_FLAG_HAS_PUBKEY, ROUTED_FLAG_HAS_DEST_HASH,
     ROUTED_FLAG_HAS_SRC_ADDR, ROUTED_FLAG_HAS_SRC_PUBKEY,
 };
@@ -80,6 +80,13 @@ pub enum DecodeError {
     InvalidKeyspace,
     /// Children not sorted
     ChildrenNotSorted,
+}
+
+/// Encoding error types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeError {
+    /// Routed message has no next_hop set.
+    MissingNextHop,
 }
 
 /// Zero-copy reader over a byte slice.
@@ -382,13 +389,17 @@ impl Writer {
 /// Trait for types that can be encoded to wire format.
 pub trait Encode {
     /// Encode this value to the writer.
-    fn encode(&self, w: &mut Writer);
+    ///
+    /// Returns an error if the value cannot be encoded (e.g., Routed with no next_hop).
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError>;
 
     /// Encode and return the bytes.
-    fn encode_to_vec(&self) -> Vec<u8> {
+    ///
+    /// Returns an error if the value cannot be encoded.
+    fn encode_to_vec(&self) -> Result<Vec<u8>, EncodeError> {
         let mut w = Writer::new();
-        self.encode(&mut w);
-        w.finish()
+        self.encode(&mut w)?;
+        Ok(w.finish())
     }
 }
 
@@ -445,7 +456,10 @@ pub struct Ack {
     pub sender_hash: [u8; ACK_HASH_SIZE],
 }
 
-/// Wrapper enum for encoding/decoding top-level messages.
+/// Wire protocol message types.
+///
+/// All variants implement `Encode` and can be sent via `Outgoing::encode(&Message::...)`.
+/// `Routed::encode` returns `EncodeError::MissingNextHop` if `next_hop` is not set.
 #[derive(Clone, Debug)]
 pub enum Message {
     Pulse(Pulse),
@@ -455,7 +469,7 @@ pub enum Message {
 }
 
 impl Encode for Pulse {
-    fn encode(&self, w: &mut Writer) {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.write_node_id(&self.node_id);
         w.write_u8(self.flags);
 
@@ -495,6 +509,7 @@ impl Encode for Pulse {
         }
 
         w.write_signature(&self.signature);
+        Ok(())
     }
 }
 
@@ -580,10 +595,11 @@ impl Decode for Pulse {
 }
 
 impl Encode for Routed {
-    fn encode(&self, w: &mut Writer) {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        // next_hop MUST be set before encoding
+        let next_hop = self.next_hop.ok_or(EncodeError::MissingNextHop)?;
+
         w.write_u8(self.flags_and_type);
-        // next_hop must be set before encoding - it's computed by route_message()
-        let next_hop = self.next_hop.expect("next_hop must be set before encoding");
         w.write_id_hash(&next_hop);
         w.write_u32_be(self.dest_addr);
 
@@ -621,6 +637,7 @@ impl Encode for Routed {
         // Payload length is implicit (remaining bytes before signature)
         w.write_bytes(&self.payload);
         w.write_signature(&self.signature);
+        Ok(())
     }
 }
 
@@ -696,9 +713,10 @@ impl Decode for Routed {
 }
 
 impl Encode for Ack {
-    fn encode(&self, w: &mut Writer) {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.write_bytes(&self.hash);
         w.write_bytes(&self.sender_hash);
+        Ok(())
     }
 }
 
@@ -717,7 +735,7 @@ impl Decode for Ack {
 }
 
 impl Encode for Broadcast {
-    fn encode(&self, w: &mut Writer) {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.write_node_id(&self.src_node_id);
         w.write_u8(self.destinations.len() as u8);
         for dest in &self.destinations {
@@ -726,6 +744,7 @@ impl Encode for Broadcast {
         // Payload length is implicit (remaining bytes before signature)
         w.write_bytes(&self.payload);
         w.write_signature(&self.signature);
+        Ok(())
     }
 }
 
@@ -768,29 +787,6 @@ fn encode_version_type(version: u8, msg_type: u8) -> u8 {
     (version << WIRE_VERSION_SHIFT) | (msg_type & WIRE_TYPE_MASK)
 }
 
-impl Encode for Message {
-    fn encode(&self, w: &mut Writer) {
-        match self {
-            Message::Pulse(p) => {
-                w.write_u8(encode_version_type(WIRE_VERSION, WIRE_TYPE_PULSE));
-                p.encode(w);
-            }
-            Message::Routed(r) => {
-                w.write_u8(encode_version_type(WIRE_VERSION, WIRE_TYPE_ROUTED));
-                r.encode(w);
-            }
-            Message::Ack(a) => {
-                w.write_u8(encode_version_type(WIRE_VERSION, WIRE_TYPE_ACK));
-                a.encode(w);
-            }
-            Message::Broadcast(b) => {
-                w.write_u8(encode_version_type(WIRE_VERSION, WIRE_TYPE_BROADCAST));
-                b.encode(w);
-            }
-        }
-    }
-}
-
 impl Decode for Message {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let version_type = r.read_u8()?;
@@ -812,32 +808,52 @@ impl Decode for Message {
     }
 }
 
+impl Encode for Message {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        match self {
+            Message::Pulse(p) => p.encode(w),
+            Message::Routed(r) => r.encode(w),
+            Message::Ack(a) => a.encode(w),
+            Message::Broadcast(b) => b.encode(w),
+        }
+    }
+}
+
 impl Outgoing for Message {
     fn priority(&self) -> Priority {
         use crate::types::{MSG_FOUND, MSG_LOOKUP, MSG_PUBLISH};
         match self {
-            Message::Ack(_) => Priority::Ack,
             Message::Pulse(_) => Priority::BroadcastProtocol,
+            Message::Routed(r) => match r.msg_type() {
+                MSG_PUBLISH => Priority::RoutedPublish,
+                MSG_FOUND => Priority::RoutedFound,
+                MSG_LOOKUP => Priority::RoutedLookup,
+                _ => Priority::RoutedData,
+            },
+            Message::Ack(_) => Priority::Ack,
             Message::Broadcast(b) => {
-                // Check first byte of payload for backup vs data
                 if b.payload.first().copied() == Some(BCAST_PAYLOAD_BACKUP) {
                     Priority::BroadcastProtocol
                 } else {
                     Priority::BroadcastData
                 }
             }
-            Message::Routed(r) => match r.msg_type() {
-                MSG_PUBLISH => Priority::RoutedPublish,
-                MSG_FOUND => Priority::RoutedFound,
-                MSG_LOOKUP => Priority::RoutedLookup,
-                MSG_DATA => Priority::RoutedData,
-                _ => Priority::RoutedData, // Unknown types get lowest routed priority
-            },
         }
     }
 
     fn encode(&self) -> Vec<u8> {
-        self.encode_to_vec()
+        let mut w = Writer::new();
+        let wire_type = match self {
+            Message::Pulse(_) => WIRE_TYPE_PULSE,
+            Message::Routed(_) => WIRE_TYPE_ROUTED,
+            Message::Ack(_) => WIRE_TYPE_ACK,
+            Message::Broadcast(_) => WIRE_TYPE_BROADCAST,
+        };
+        w.write_u8(encode_version_type(WIRE_VERSION, wire_type));
+        // Routed without next_hop should have been caught before reaching here.
+        // If it happens, this will panic - which is appropriate since it's a programming error.
+        Encode::encode(self, &mut w).expect("Message encoding should not fail");
+        w.finish()
     }
 }
 
@@ -888,13 +904,14 @@ impl Broadcast {
 }
 
 impl Encode for LocationEntry {
-    fn encode(&self, w: &mut Writer) {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.write_node_id(&self.node_id);
         w.write_pubkey(&self.pubkey);
         w.write_u32_be(self.keyspace_addr);
         w.write_varint(self.seq);
         w.write_u8(self.replica_index);
         w.write_signature(&self.signature);
+        Ok(())
     }
 }
 
@@ -1062,7 +1079,7 @@ mod tests {
             },
         };
 
-        let encoded = pulse.encode_to_vec();
+        let encoded = pulse.encode_to_vec().unwrap();
         let decoded = Pulse::decode_from_slice(&encoded).unwrap();
 
         assert_eq!(pulse.node_id, decoded.node_id);
@@ -1098,7 +1115,7 @@ mod tests {
             signature: Signature::default(),
         };
 
-        let encoded = pulse.encode_to_vec();
+        let encoded = pulse.encode_to_vec().unwrap();
         let decoded = Pulse::decode_from_slice(&encoded).unwrap();
 
         assert_eq!(pulse.node_id, decoded.node_id);
@@ -1111,9 +1128,10 @@ mod tests {
 
     #[test]
     fn test_routed_roundtrip() {
+        let next_hop = [0x11, 0x22, 0x33, 0x44];
         let routed = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, true, true, false),
-            next_hop: Some([0x11, 0x22, 0x33, 0x44]),
+            next_hop: Some(next_hop),
             dest_addr: 0x1234_5678,
             dest_hash: Some([0xAB, 0xCD, 0xEF, 0x01]),
             src_addr: Some(0x8765_4321),
@@ -1128,11 +1146,11 @@ mod tests {
             },
         };
 
-        let encoded = routed.encode_to_vec();
+        let encoded = routed.encode_to_vec().unwrap();
         let decoded = Routed::decode_from_slice(&encoded).unwrap();
 
         assert_eq!(routed.flags_and_type, decoded.flags_and_type);
-        assert_eq!(routed.next_hop, decoded.next_hop);
+        assert_eq!(Some(next_hop), decoded.next_hop);
         assert_eq!(routed.dest_addr, decoded.dest_addr);
         assert_eq!(routed.dest_hash, decoded.dest_hash);
         assert_eq!(routed.src_addr, decoded.src_addr);
@@ -1146,9 +1164,10 @@ mod tests {
 
     #[test]
     fn test_routed_minimal() {
+        let next_hop = [0u8; 4];
         let routed = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_PUBLISH, false, false, false),
-            next_hop: Some([0u8; 4]),
+            next_hop: Some(next_hop),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: None,
@@ -1160,7 +1179,7 @@ mod tests {
             signature: Signature::default(),
         };
 
-        let encoded = routed.encode_to_vec();
+        let encoded = routed.encode_to_vec().unwrap();
         let decoded = Routed::decode_from_slice(&encoded).unwrap();
 
         assert_eq!(decoded.msg_type(), MSG_PUBLISH);
@@ -1172,9 +1191,10 @@ mod tests {
 
     #[test]
     fn test_routed_with_src_pubkey() {
+        let next_hop = [0u8; 4];
         let routed = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, true),
-            next_hop: Some([0u8; 4]),
+            next_hop: Some(next_hop),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
@@ -1186,7 +1206,7 @@ mod tests {
             signature: Signature::default(),
         };
 
-        let encoded = routed.encode_to_vec();
+        let encoded = routed.encode_to_vec().unwrap();
         let decoded = Routed::decode_from_slice(&encoded).unwrap();
 
         assert!(decoded.has_src_pubkey());
@@ -1195,9 +1215,9 @@ mod tests {
 
     #[test]
     fn test_message_roundtrip() {
+        // Test Pulse roundtrip (use Outgoing::encode for wire format with version byte)
         let pulse = Pulse::default();
-        let msg = Message::Pulse(pulse.clone());
-        let encoded = msg.encode_to_vec();
+        let encoded = Outgoing::encode(&Message::Pulse(pulse.clone()));
         let decoded = Message::decode_from_slice(&encoded).unwrap();
 
         match decoded {
@@ -1207,12 +1227,13 @@ mod tests {
             _ => panic!("expected Pulse"),
         }
 
+        // Test Routed roundtrip
+        let next_hop = [0u8; 4];
         let routed = Routed {
-            next_hop: Some([0u8; 4]), // Must be Some for encoding
-            ..Routed::default()
+            next_hop: Some(next_hop),
+            ..Default::default()
         };
-        let msg = Message::Routed(routed.clone());
-        let encoded = msg.encode_to_vec();
+        let encoded = Outgoing::encode(&Message::Routed(routed.clone()));
         let decoded = Message::decode_from_slice(&encoded).unwrap();
 
         match decoded {
@@ -1227,8 +1248,7 @@ mod tests {
             hash: [0x01, 0x02, 0x03, 0x04],
             sender_hash: [0x05, 0x06, 0x07, 0x08],
         };
-        let msg = Message::Ack(ack.clone());
-        let encoded = msg.encode_to_vec();
+        let encoded = Outgoing::encode(&Message::Ack(ack.clone()));
         assert_eq!(encoded.len(), 9); // 1 byte type + 4 bytes hash + 4 bytes sender_hash
         let decoded = Message::decode_from_slice(&encoded).unwrap();
 
@@ -1250,8 +1270,7 @@ mod tests {
                 sig: [0x12; 64],
             },
         };
-        let msg = Message::Broadcast(broadcast.clone());
-        let encoded = msg.encode_to_vec();
+        let encoded = Outgoing::encode(&Message::Broadcast(broadcast.clone()));
         let decoded = Message::decode_from_slice(&encoded).unwrap();
 
         match decoded {
@@ -1281,7 +1300,7 @@ mod tests {
             hops: 0,
         };
 
-        let encoded = entry.encode_to_vec();
+        let encoded = entry.encode_to_vec().unwrap();
         let decoded = LocationEntry::decode_from_slice(&encoded).unwrap();
 
         assert_eq!(entry.node_id, decoded.node_id);
@@ -1494,7 +1513,7 @@ mod tests {
                 },
             };
 
-            let encoded = pulse.encode_to_vec();
+            let encoded = pulse.encode_to_vec().expect("Pulse encode never fails");
             let decoded = Pulse::decode_from_slice(&encoded).expect("valid pulse should decode");
             assert_eq!(pulse.node_id, decoded.node_id);
             assert_eq!(pulse.flags, decoded.flags);
@@ -1512,7 +1531,7 @@ mod tests {
             let has_src_addr: bool = u.arbitrary()?;
             let has_src_pubkey: bool = u.arbitrary()?;
 
-            let next_hop: Option<[u8; 4]> = Some(u.arbitrary()?);
+            let next_hop: [u8; 4] = u.arbitrary()?;
             let dest_addr: u32 = u.arbitrary()?;
             let dest_hash: Option<[u8; 4]> = if has_dest_hash {
                 Some(u.arbitrary()?)
@@ -1547,7 +1566,7 @@ mod tests {
                     has_src_addr,
                     has_src_pubkey,
                 ),
-                next_hop,
+                next_hop: Some(next_hop),
                 dest_addr,
                 dest_hash,
                 src_addr,
@@ -1562,9 +1581,9 @@ mod tests {
                 },
             };
 
-            let encoded = routed.encode_to_vec();
+            let encoded = routed.encode_to_vec().expect("valid routed should encode");
             let decoded = Routed::decode_from_slice(&encoded).expect("valid routed should decode");
-            assert_eq!(routed.next_hop, decoded.next_hop);
+            assert_eq!(Some(next_hop), decoded.next_hop);
             assert_eq!(routed.dest_addr, decoded.dest_addr);
             assert_eq!(routed.src_node_id, decoded.src_node_id);
             assert_eq!(routed.ttl, decoded.ttl);
@@ -1611,7 +1630,7 @@ mod tests {
             hash: [1, 2, 3, 4],
             sender_hash: [5, 6, 7, 8],
         };
-        let mut encoded = Message::Ack(ack).encode_to_vec();
+        let mut encoded = Outgoing::encode(&Message::Ack(ack));
         encoded.push(0xFF); // Add trailing byte
 
         let result = Message::decode_from_slice(&encoded);

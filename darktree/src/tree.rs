@@ -13,11 +13,11 @@ use alloc::vec::Vec;
 use crate::config::NodeConfig;
 use crate::node::{JoinContext, NeighborTiming, Node};
 use crate::time::{Duration, Timestamp};
-use crate::traits::{Clock, Crypto, Random, Transport};
+use crate::traits::{Clock, Crypto, Outgoing, Random, Transport};
 use crate::types::{
     ChildrenList, Event, IdHash, NodeId, Pulse, Signature, DISTRUST_TTL, LOCATION_TTL, MAX_CHILDREN,
 };
-use crate::wire::{pulse_sign_data, Encode, Message};
+use crate::wire::pulse_sign_data;
 
 /// Compare two RSSI values for use with `min_by`, preferring stronger signals.
 ///
@@ -926,11 +926,10 @@ where
             }
         );
 
-        // Encode with message type
-        let msg = Message::Pulse(pulse);
-        let encoded = msg.encode_to_vec();
-
         // Check MTU
+        use crate::wire::Message;
+        let msg = Message::Pulse(pulse);
+        let encoded = Outgoing::encode(&msg);
         if encoded.len() > self.transport().mtu() {
             // Pulse too large - this shouldn't happen if MAX_CHILDREN is respected
             return;

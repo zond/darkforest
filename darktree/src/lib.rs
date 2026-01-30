@@ -195,7 +195,7 @@ mod tests {
             signature: Signature::default(),
         };
 
-        let encoded = pulse.encode_to_vec();
+        let encoded = pulse.encode_to_vec().unwrap();
         let decoded = Pulse::decode_from_slice(&encoded).unwrap();
 
         assert_eq!(pulse.node_id, decoded.node_id);

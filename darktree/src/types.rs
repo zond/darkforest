@@ -413,41 +413,6 @@ impl Default for Routed {
     }
 }
 
-/// A Routed message ready for transmission (next_hop guaranteed set).
-///
-/// This newtype provides compile-time enforcement that `next_hop` is set
-/// before a message is transmitted. Use `ReadyRouted::new()` to create.
-///
-/// # Encode Implementation Note
-///
-/// The `Encode` trait is implemented on `Routed`, not `ReadyRouted`, because:
-/// 1. The encode logic needs access to the full Routed fields
-/// 2. `Routed::encode` panics if `next_hop` is None, providing runtime safety
-/// 3. `ReadyRouted` delegates to `Routed::encode` via `into_inner()`
-///
-/// In practice, `transmit_with_ack` calls `into_inner()` before wrapping in
-/// `Message::Routed`, so the type safety is preserved at the API level.
-#[derive(Clone, Debug)]
-pub struct ReadyRouted(Routed);
-
-impl ReadyRouted {
-    /// Create a ready-to-send message by setting the next_hop.
-    pub fn new(mut msg: Routed, next_hop: IdHash) -> Self {
-        msg.next_hop = Some(next_hop);
-        Self(msg)
-    }
-
-    /// Get a reference to the inner Routed message.
-    pub fn inner(&self) -> &Routed {
-        &self.0
-    }
-
-    /// Consume and return the inner Routed message.
-    pub fn into_inner(self) -> Routed {
-        self.0
-    }
-}
-
 /// Maximum number of destinations in a Broadcast message.
 pub const MAX_BROADCAST_DESTINATIONS: usize = 16;
 

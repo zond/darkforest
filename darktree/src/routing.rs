@@ -13,10 +13,10 @@ use crate::node::{AckHash, Node};
 use crate::time::Timestamp;
 use crate::traits::{Ackable, Clock, Crypto, Outgoing, Random, Transport};
 use crate::types::{
-    Error, IdHash, NodeId, ReadyRouted, Routed, Signature, DEFAULT_TTL, MSG_DATA, MSG_FOUND,
-    MSG_LOOKUP, MSG_PUBLISH,
+    Error, IdHash, NodeId, Routed, Signature, DEFAULT_TTL, MSG_DATA, MSG_FOUND, MSG_LOOKUP,
+    MSG_PUBLISH,
 };
-use crate::wire::{routed_sign_data, Ack, Encode, Message};
+use crate::wire::{routed_sign_data, Ack};
 
 impl<T, Cr, R, Clk, Cfg> Node<T, Cr, R, Clk, Cfg>
 where
@@ -155,12 +155,14 @@ where
     /// Used when we receive a duplicate message - the sender is waiting for confirmation
     /// that we received it, so we send a minimal ACK instead of re-forwarding.
     pub(crate) fn send_explicit_ack(&mut self, hash: AckHash) {
+        use crate::wire::Message;
+
         let sender_hash = self.compute_id_hash(self.node_id());
         let ack = Ack { hash, sender_hash };
         let msg = Message::Ack(ack);
 
         // ACK is small (9 bytes) so MTU check is unlikely to fail, but be safe
-        if msg.encode_to_vec().len() > self.transport().mtu() {
+        if Outgoing::encode(&msg).len() > self.transport().mtu() {
             return;
         }
 
@@ -544,18 +546,20 @@ where
 
     /// Low-level transmission with ACK tracking.
     ///
-    /// Takes ReadyRouted to ensure at compile time that next_hop is set.
+    /// Requires that `msg.next_hop` is set before calling.
     /// Always tracks ACK for retransmission. Derives is_app_data from msg_type.
     /// Returns error if message too large or queue full.
-    fn transmit_with_ack(&mut self, ready: ReadyRouted, now: Timestamp) -> Result<(), Error> {
-        let msg = ready.into_inner();
+    fn transmit_with_ack(&mut self, msg: Routed, now: Timestamp) -> Result<(), Error> {
+        use crate::wire::Message;
+
         let is_app_data = msg.msg_type() == MSG_DATA;
         let ack_hash = msg.ack_hash(self.crypto());
         let sent_ttl = msg.ttl;
 
-        let wire_msg = Message::Routed(msg);
-        let priority = wire_msg.priority();
-        let encoded = wire_msg.encode_to_vec();
+        // Wrap once, reuse for priority, encode, and send
+        let wrapped = Message::Routed(msg);
+        let priority = Outgoing::priority(&wrapped);
+        let encoded = Outgoing::encode(&wrapped);
 
         if encoded.len() > self.transport().mtu() {
             self.record_routed_dropped(is_app_data);
@@ -565,7 +569,7 @@ where
         // Always track ACK for retransmission
         self.insert_pending_ack(ack_hash, encoded, priority, sent_ttl, now);
 
-        if self.transport().outgoing().try_send(wire_msg) {
+        if self.transport().outgoing().try_send(wrapped) {
             self.record_routed_sent(is_app_data);
             Ok(())
         } else {
@@ -629,8 +633,9 @@ where
                 );
             }
 
-            let ready = ReadyRouted::new(msg, next_hop_hash);
-            self.transmit_with_ack(ready, now)
+            let mut msg = msg;
+            msg.next_hop = Some(next_hop_hash);
+            self.transmit_with_ack(msg, now)
         } else {
             emit_debug!(
                 self,
@@ -785,12 +790,12 @@ where
 
         let now = self.now();
 
-        // Evict oldest if at capacity
+        // Evict oldest if at capacity (O(1) with VecDeque)
         if self.pending_routed().len() >= Cfg::MAX_PENDING_ROUTED {
-            self.pending_routed_mut().remove(0);
+            self.pending_routed_mut().pop_front();
         }
 
-        self.pending_routed_mut().push(PendingRouted {
+        self.pending_routed_mut().push_back(PendingRouted {
             msg,
             queued_at: now,
         });
@@ -801,30 +806,43 @@ where
     /// A neighbor's updated keyspace_range might now cover queued destinations.
     /// Called from handle_pulse after updating neighbor_times.
     pub(crate) fn retry_pending_routed(&mut self) {
-        // Take ownership of pending_routed, partition into routable vs not-yet-routable,
-        // then put non-routable ones back. This avoids double iteration.
         let pending = core::mem::take(self.pending_routed_mut());
-
-        let (routable, still_pending): (Vec<_>, Vec<_>) = pending
-            .into_iter()
-            .partition(|p| self.route_to(p.msg.dest_addr).is_some());
-
-        // Put non-routable messages back
-        *self.pending_routed_mut() = still_pending;
-
-        // Re-send each routable message
         let now = self.now();
-        for pending in routable {
-            emit_debug!(
-                self,
-                crate::debug::DebugEvent::RoutedRetried {
-                    payload_hash: pending.msg.payload_hash(self.crypto()),
-                    msg_type: pending.msg.msg_type(),
-                    dest_addr: pending.msg.dest_addr,
-                }
-            );
 
-            let _ = self.route_message(pending.msg, now);
+        for p in pending {
+            let dest = p.msg.dest_addr;
+
+            // Check if we now own the destination (keyspace may have changed)
+            if self.owns_key(dest) {
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::RoutedRetried {
+                        payload_hash: p.msg.payload_hash(self.crypto()),
+                        msg_type: p.msg.msg_type(),
+                        dest_addr: dest,
+                    }
+                );
+                self.dispatch_routed(p.msg, now);
+                continue;
+            }
+
+            // Try to find a route (single call, use result directly)
+            if let Some((_next_hop_id, next_hop_hash)) = self.route_to(dest) {
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::RoutedRetried {
+                        payload_hash: p.msg.payload_hash(self.crypto()),
+                        msg_type: p.msg.msg_type(),
+                        dest_addr: dest,
+                    }
+                );
+                let mut msg = p.msg;
+                msg.next_hop = Some(next_hop_hash);
+                let _ = self.transmit_with_ack(msg, now);
+            } else {
+                // Still no route, put back in pending
+                self.pending_routed_mut().push_back(p);
+            }
         }
     }
 
@@ -833,7 +851,7 @@ where
     /// Called after storing a location entry to ensure backup nodes have a copy.
     pub(crate) fn send_backup_publish(&mut self, entry: &crate::types::LocationEntry) {
         use crate::types::{Broadcast, BCAST_PAYLOAD_BACKUP};
-        use crate::wire::{broadcast_sign_data, Encode, Message};
+        use crate::wire::{broadcast_sign_data, Encode};
 
         // Select 2 random neighbors to send backup to
         let neighbors: Vec<_> = self.neighbor_times().keys().copied().collect();
@@ -862,7 +880,10 @@ where
 
         // Build payload: BCAST_PAYLOAD_BACKUP (1 byte) + encoded LocationEntry
         let mut payload = alloc::vec![BCAST_PAYLOAD_BACKUP];
-        let entry_bytes = entry.encode_to_vec();
+        // LocationEntry encode never fails (no next_hop field to check)
+        let entry_bytes = entry
+            .encode_to_vec()
+            .expect("LocationEntry encode never fails");
         payload.extend(entry_bytes);
 
         // Build the broadcast message (without signature)
@@ -877,16 +898,16 @@ where
         let sign_data = broadcast_sign_data(&broadcast);
         broadcast.signature = self.crypto().sign(self.secret(), sign_data.as_slice());
 
-        // Build wire message
-        let wire_msg = Message::Broadcast(broadcast);
+        use crate::wire::Message;
+        let msg = Message::Broadcast(broadcast);
 
         // Check MTU
-        if wire_msg.encode_to_vec().len() > self.transport().mtu() {
+        if Outgoing::encode(&msg).len() > self.transport().mtu() {
             return; // Message too large
         }
 
         // Send via priority queue (backup is protocol traffic - BroadcastProtocol priority)
-        if self.transport().outgoing().try_send(wire_msg) {
+        if self.transport().outgoing().try_send(msg) {
             self.record_protocol_sent();
         } else {
             self.record_protocol_dropped();
@@ -998,7 +1019,7 @@ mod tests {
     use crate::traits::test_impls::{FastTestCrypto, MockClock, MockRandom, MockTransport};
     use crate::traits::Ackable;
     use crate::types::{Priority, RECENTLY_FORWARDED_TTL_MULTIPLIER};
-    use crate::wire::{Ack, Decode, Encode, Message};
+    use crate::wire::{Ack, Decode, Message};
 
     /// Type alias for test nodes using default config.
     type TestNode = Node<MockTransport, FastTestCrypto, MockRandom, MockClock, DefaultConfig>;
@@ -1247,9 +1268,10 @@ mod tests {
         let now = Timestamp::from_secs(1000);
 
         // Create a message and compute its hash
-        let msg = Routed {
+        let next_hop = [0u8; 4];
+        let routed = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
-            next_hop: Some([0u8; 4]),
+            next_hop: Some(next_hop),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
@@ -1261,7 +1283,7 @@ mod tests {
             signature: Signature::default(),
         };
 
-        let hash = msg.ack_hash(node.crypto());
+        let hash = routed.ack_hash(node.crypto());
 
         // Manually insert a pending ACK (sent_ttl = 255)
         node.insert_pending_ack(
@@ -1273,14 +1295,16 @@ mod tests {
         );
         assert!(node.pending_acks().contains_key(&hash));
 
-        // Simulate receiving the message (which should clear pending ACK via implicit ACK)
-        let encoded = Message::Routed(msg).encode_to_vec();
+        // Simulate receiving the message (encode via Message::Routed, decode via Message)
+        let mut routed_with_hop = routed;
+        routed_with_hop.next_hop = Some(next_hop);
+        let encoded = Outgoing::encode(&Message::Routed(routed_with_hop));
         node.transport().inject_rx(encoded.clone(), None);
 
         // Decode and process - this simulates what handle_transport_rx does
         let decoded = Message::decode_from_slice(&encoded).unwrap();
-        if let Message::Routed(routed) = decoded {
-            let received_hash = routed.ack_hash(node.crypto());
+        if let Message::Routed(r) = decoded {
+            let received_hash = r.ack_hash(node.crypto());
             node.pending_acks_mut().remove(&received_hash);
         }
 
@@ -1363,9 +1387,8 @@ mod tests {
         let hash: AckHash = [0x01, 0x02, 0x03, 0x04];
         let sender_hash: AckHash = [0x05, 0x06, 0x07, 0x08];
         let ack = Ack { hash, sender_hash };
-        let msg = Message::Ack(ack);
 
-        let encoded = msg.encode_to_vec();
+        let encoded = Outgoing::encode(&Message::Ack(ack.clone()));
         assert_eq!(
             encoded.len(),
             9,
