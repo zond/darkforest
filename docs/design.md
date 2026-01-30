@@ -81,6 +81,7 @@ These constants define protocol limits and memory bounds. Implementations MUST r
 | MAX_PENDING_ACKS | 32 | 8 | Messages awaiting ACK |
 | MAX_RECENTLY_FORWARDED | 128 | 32 | Duplicate detection |
 | MAX_DELAYED_FORWARDS | 64 | 16 | Bounce-back dampening queue |
+| MAX_PENDING_ROUTED | 64 | 16 | Messages awaiting route availability |
 | MAX_PENDING_LOOKUPS | 16 | 4 | Concurrent DHT lookups |
 | MAX_DISTRUSTED | 64 | 8 | Fraud detection blacklist |
 | HLL_REGISTERS | 256 | 256 | HyperLogLog registers (hardcoded) |
@@ -140,16 +141,23 @@ Protocol messages are bounded to 1/5 of bandwidth, ensuring infrastructure never
 
 **Priority order (highest to lowest):**
 
-| Priority | Message Type | Rationale |
-|----------|--------------|-----------|
-| 1 | Pulse | Tree maintenance; single-timer, not queued |
-| 2 | ACK | Reliability; enables retransmission |
-| 3 | Broadcast(!DATA) | DHT backup protocol |
-| 4 | Routed(!DATA) | DHT operations (PUBLISH, LOOKUP, FOUND) |
-| 5 | Broadcast(DATA) | Application broadcast |
-| 6 | Routed(DATA) | Application unicast |
+| Priority | Message Type | Budget | Rationale |
+|----------|--------------|--------|-----------|
+| 1 | Pulse | Protocol | Tree maintenance; single-timer, not queued |
+| 2 | ACK | Protocol | Reliability; enables retransmission |
+| 3 | Broadcast(!DATA) | Protocol | DHT backup protocol |
+| 4 | Routed(PUBLISH) | Protocol | Location directory registration |
+| 5 | Routed(FOUND) | Protocol | Location directory response |
+| 6 | Routed(LOOKUP) | Protocol | Location directory query |
+| 7 | Broadcast(DATA) | Application | Application broadcast |
+| 8 | Routed(DATA) | Application | Application unicast |
 
-Within each budget (protocol/application), higher-priority messages are sent first. Pulse is generated on-demand when its timer fires (not queued); other messages are queued and sent in priority order as bandwidth permits.
+**DHT message priority rationale (PUBLISH > FOUND > LOOKUP):**
+- PUBLISH ensures nodes are findable (write operations to location directory)
+- FOUND completes pending lookups (response to earlier query)
+- LOOKUP initiates new queries (can wait longer)
+
+Within each budget (Protocol/Application), higher-priority messages are sent first. The Protocol budget (priorities 1-6) is capped at 1/5 of bandwidth; the Application budget (priorities 7-8) gets the remaining 4/5. Pulse is generated on-demand when its timer fires (not queued); other messages are queued and sent in priority order as bandwidth permits.
 
 **Drop policy:** When queues are full, messages are dropped rather than blocking. This is acceptable because:
 - **Pulse loss is tolerable:** Neighbors timeout after 8 missed Pulses. With 50% packet loss, P(miss 8) = 0.4%.
@@ -407,6 +415,8 @@ For LoRa (τ=6.7s): periodic join takes ~40-60s, proactive takes ~13-27s.
 For UDP (τ=0.1s): periodic join takes ~0.6-0.9s, proactive takes ~0.2-0.4s.
 
 **Why this works:** The single-timer model automatically coalesces all state changes and triggers into the next Pulse. Multiple events (e.g., receiving several unknown Pulses at once) result in one outgoing Pulse, not many. The bandwidth budget prevents runaway sending during network churn.
+
+**During shopping (unstable=true):** Proactive pulses are still sent when shopping. The `unstable` flag warns neighbors that the node may change parent, but state changes (new children, keyspace updates) still need to propagate. Not pulsing during shopping would delay tree convergence.
 
 ### Pubkey Exchange
 
@@ -1328,7 +1338,8 @@ struct Routed {
     src_addr: Option<u32>,          // sender's keyspace address for replies
     src_node_id: NodeId,            // sender identity
     src_pubkey: Option<PublicKey>,  // sender's public key (optional, for signature verification)
-    ttl: u8,                        // hop limit, decremented at each hop
+    ttl: u8,                        // hop limit, reset on bounce-back
+    hops: varint,                   // actual hop count, always increments (for duplicate detection)
     payload: Vec<u8>,               // type-specific content
     signature: Signature,           // Ed25519 signature (see below)
 }
@@ -1361,28 +1372,52 @@ Note: ACK is a separate top-level message type (0x03), not a Routed subtype.
 - PUBLISH/LOOKUP: dest_addr = hash(node_id || replica_index) (the key)
 - DATA/FOUND: dest_addr = target node's published keyspace address
 
-**dest_hash** verifies the intended recipient. Present for LOOKUP/DATA/FOUND, absent for PUBLISH.
-Recipient verifies: `hash(my_node_id)[..4] == dest_hash`
+**dest_hash** verifies the intended recipient or identifies the lookup target:
+- DATA/FOUND: identifies the *recipient* of the message. Recipient verifies: `hash(my_node_id)[..4] == dest_hash`
+- LOOKUP: identifies the *node being looked up* (non-standard usage—see LOOKUP section). Storage node searches for matching entry.
+- PUBLISH: absent (routes to keyspace, any owner handles)
+
 Collision probability ~2.3×10⁻¹⁰ per message (negligible).
 
 **src_addr** is the sender's keyspace address (center of their range) for replies.
 
 **src_pubkey** enables signature verification for messages from far-away nodes whose pubkey isn't cached from Pulses. Receivers MUST verify: `src_node_id == hash(src_pubkey)[..16]`
 
-Include src_pubkey when: first message to a node, PUBLISH, LOOKUP, FOUND.
-Omit src_pubkey when: established DATA exchange (receiver has cached pubkey).
+Include src_pubkey when: LOOKUP (so storage node can verify and respond).
+Omit src_pubkey when: PUBLISH/FOUND (LOC: signature in payload has pubkey), DATA (receiver has cached pubkey).
 If receiver lacks pubkey and message has none, drop message (sender retries with pubkey).
+
+**ttl** is the hop limit, decremented at each forward. Reset to DEFAULT_TTL on bounce-back to prevent TTL exhaustion in routing loops.
+
+**hops** counts actual forwards (see "Duplicate Detection and Bounce-Back" in Message Reliability section):
+- Originator sends with `hops=0`
+- Each forwarder increments hops before transmitting
+- Retransmissions do NOT increment hops (same value as original send)
+- Saturates at maximum varint value (no wrap-around)
+
+**Saturation vs TTL:** Since TTL is a u8 (max 255) and messages expire when TTL reaches 0, hops can never exceed 255 in normal operation—TTL exhaustion occurs first. Varint saturation (at ~2^63) is therefore not a practical concern.
 
 ### Typical Flag Combinations
 
-- PUBLISH: has_dest_hash=0, has_src_addr=1, has_src_pubkey=1 (storage nodes need pubkey)
-- LOOKUP: has_dest_hash=1, has_src_addr=1, has_src_pubkey=1 (FOUND sender needs pubkey)
-- FOUND: has_dest_hash=1, has_src_addr=0, has_src_pubkey=0 (requester has target's pubkey)
-- DATA: has_dest_hash=1, has_src_addr=0/1, has_src_pubkey=0/1 (app decides)
+- PUBLISH: has_dest_hash=0, has_src_addr=0, has_src_pubkey=0
+- LOOKUP: has_dest_hash=1, has_src_addr=1, has_src_pubkey=1
+- FOUND: has_dest_hash=1, has_src_addr=0, has_src_pubkey=0
+- DATA: has_dest_hash=1, has_src_addr=0/1, has_src_pubkey=0/1
+
+**Signature verification by message type:**
+
+| Message | ROUTE: sig verified? | Why |
+|---------|---------------------|-----|
+| PUBLISH | No | LOC: signature in payload authenticates the location claim. Payload contains pubkey. |
+| LOOKUP | Yes | Prevents amplification attacks (attacker spoofing src_addr to flood victim with FOUND). |
+| FOUND | No | LOC: signature in payload authenticates the location entry. Integrity protected by LOC:. |
+| DATA | Yes | Application data requires sender authentication. |
+
+For PUBLISH and FOUND, forwarders MAY skip ROUTE: signature verification since the critical protection is the LOC: signature. Recipients MUST verify the LOC: signature in the payload before processing.
 
 ### Signature
 
-Signature covers all fields EXCEPT ttl and next_hop (forwarders must modify these):
+Signature covers all fields EXCEPT ttl, hops, and next_hop (forwarders must modify these):
 ```
 "ROUTE:" || flags_and_type || dest_addr || dest_hash || src_addr || src_node_id || payload
 ```
@@ -1395,13 +1430,18 @@ fn routed_sign_data(msg: &Routed) -> Vec<u8> {
 }
 ```
 
-The signature covers all fields except `ttl` and `next_hop` to prevent:
+The signature covers all fields except `ttl`, `hops`, and `next_hop` to prevent:
 - Routing manipulation (changing dest_addr)
 - Reply redirection (changing src_addr)
 - Type confusion (changing msg_type)
 - Payload tampering
 
-The `ttl` field is not signed because forwarders must decrement it. An attacker could reset TTL to extend message lifetime, but cannot forge the message itself. TTL exists to prevent routing loops during tree restructuring.
+The `ttl` field is not signed because forwarders decrement it and bounce-back resets it. An attacker could reset TTL to extend message lifetime, but cannot forge the message itself.
+
+The `hops` field is not signed because forwarders increment it. An attacker could manipulate hops to affect duplicate detection:
+- Setting hops artificially high triggers bounce-back handling instead of retransmit handling, causing unnecessary delays (up to 128τ per bounce)
+- Setting hops artificially low could bypass bounce-back dampening, causing extra forwarding attempts
+- Maximum damage is bounded: messages still expire at TTL=0, and bounce-back gives up after MAX_RETRIES (8). The attacker can waste bandwidth and delay delivery, but cannot prevent delivery of messages that would otherwise succeed.
 
 The `next_hop` field is not signed because forwarders must update it at each hop to specify the next forwarder. An attacker could change `next_hop` to route through a different path, but cannot change the destination (`dest_addr` is signed) or impersonate the sender.
 
@@ -1466,7 +1506,7 @@ impl Node {
             msg.next_hop = hash(&parent)[..4];
             self.send_to(parent, msg);
         }
-        // else: we're root and no child contains dest - shouldn't happen
+        // else: see "Queueing When No Route Available" below
     }
 
     fn owns_key(&self, key: u32) -> bool {
@@ -1516,6 +1556,102 @@ All nodes in radio range hear each broadcast, but only the node matching
 next_hop forwards. Others may use the overheard message for implicit ACKs.
 ```
 
+### Opportunistic Receipt (PUBLISH and LOOKUP Only)
+
+For PUBLISH and LOOKUP messages, nodes SHOULD check if they are the intended recipient even when `next_hop` doesn't match. During tree restructuring, routing paths may become stale, but the broadcast nature of radio means the correct recipient may still overhear the message.
+
+```rust
+fn handle_routed(&mut self, msg: Routed, from: NodeId) {
+    let ack_hash = compute_ack_hash(&msg);
+    let my_hash = hash(&self.node_id)[..4];
+    let is_for_me = msg.next_hop == my_hash;
+
+    // For PUBLISH/LOOKUP: check if we're the destination even if not next_hop
+    let msg_type = msg.flags_and_type & 0x0F;
+    let is_keyspace_targeted = msg_type == PUBLISH || msg_type == LOOKUP;
+
+    if is_keyspace_targeted && !is_for_me && self.owns_key(msg.dest_addr) {
+        // Opportunistic: we overheard a message destined for our keyspace
+        // Add to recently_forwarded to prevent duplicate processing when
+        // the message arrives via the designated forwarding path
+        if self.recently_forwarded.contains(&ack_hash) {
+            return;  // Already handled
+        }
+        self.recently_forwarded.insert(ack_hash, msg.hops, 1);
+        self.handle_locally(msg);
+        return;
+    }
+
+    if !is_for_me {
+        return;  // Not for us, don't forward
+    }
+
+    // Normal forwarding logic...
+}
+```
+
+**Why PUBLISH and LOOKUP:** These messages target keyspace locations, not specific nodes. Any node owning the destination keyspace can handle them.
+
+**Why not FOUND or DATA:** These messages have `dest_hash` identifying a specific recipient node. A node owning the keyspace might not be the intended recipient (keyspace may have changed since the address was cached). Only the node matching `dest_hash` should process these.
+
+**Why not forward:** The designated forwarder (`next_hop`) will also receive the broadcast and forward. If we forwarded too, we'd create duplicates. We only *handle* opportunistically, never *forward*.
+
+**Why add to recently_forwarded:** Without this, the same message could be processed twice—once opportunistically and again when it arrives via the designated forwarding path moments later.
+
+**Single-threaded assumption:** The check-then-insert pattern assumes message processing is single-threaded. On systems with interrupt-driven radio reception, ensure messages are queued and processed sequentially from the main loop, not handled directly in interrupt context.
+
+### Queueing When No Route Available
+
+When a parent node cannot route a message because:
+1. `dest_addr` is within the parent's managed keyspace range, AND
+2. No child has pulsed acknowledgement of owning that keyspace portion
+
+The parent SHOULD queue the message rather than bouncing it up (or dropping if root).
+
+**Why this happens:** After a child joins, the parent immediately knows the child's keyspace range (from the join request). However, routing is based on `neighbor_times`, which only updates when the child actually Pulses with its new keyspace. Until that first Pulse, the parent has no routing entry for the child's keyspace.
+
+```rust
+fn route(&mut self, mut msg: Routed) {
+    // ... TTL check, local delivery check (owns_key returned false) ...
+
+    let dest = msg.dest_addr;
+
+    // Find best next hop among children and shortcuts
+    if let Some(next) = self.best_downward_hop(dest) {
+        msg.next_hop = hash(&next)[..4];
+        self.send_to(next, msg);
+    } else if self.is_in_managed_keyspace(dest) {
+        // Dest is within our keyspace but we don't own it (child does)
+        // and no child has pulsed with that range yet → queue
+        self.queue_pending_routed(msg);
+    } else if let Some(parent) = self.parent {
+        // Dest is outside our keyspace → route up
+        msg.next_hop = hash(&parent)[..4];
+        self.send_to(parent, msg);
+    } else {
+        // Root: dest is outside our managed keyspace. This can happen during
+        // tree churn when keyspace assignments are in flux. Queue and retry
+        // when routing options change.
+        self.queue_pending_routed(msg);
+    }
+}
+
+fn is_in_managed_keyspace(&self, dest: u32) -> bool {
+    // We've already checked owns_key (local slice), so if dest is
+    // still within [keyspace_lo, keyspace_hi), it's in a child's portion
+    dest >= self.keyspace_lo && dest < self.keyspace_hi
+}
+```
+
+**Queue processing:** When ANY neighbor Pulses (updating `neighbor_times`), retry queued messages. Routing options may have changed because:
+- A child pulsed with their new keyspace range
+- Our own keyspace changed (parent assigned new range)
+- A non-child neighbor pulsed with a keyspace we can use as shortcut
+
+The retry simply calls `route()` again, which will either find a route or re-queue.
+
+**Bounded memory:** The queue is bounded by `MAX_PENDING_ROUTED` (64 in DefaultConfig, 16 in SmallConfig), separate from the bounce-back dampening queue (`MAX_DELAYED_FORWARDS`). Oldest entries are evicted when full. Entries also expire after 24τ if no route becomes available. Applications relying on delivery must implement end-to-end acknowledgment.
+
 ### Originating a Routed Message
 
 When a node originates a message (rather than forwarding), it must compute the initial `next_hop`:
@@ -1563,18 +1699,18 @@ impl Node {
 - The destination can send an explicit ACK if it detects a duplicate
 - For end-to-end reliability, applications should implement acknowledgment at the DATA message level
 
-### Shortcuts
+### Routing via Neighbor Timing
 
-Shortcuts are non-tree neighbors that enable faster routing by skipping tree hops.
+Routing uses the `neighbor_times` map (which stores pulse-reported keyspace ranges and root hashes for all neighbors) to find the best next hop. This eliminates the need for a separate "shortcuts" data structure.
 
-**Discovery:** Shortcuts are discovered passively:
-1. Pulses are broadcast (heard by all nodes in radio range)
-2. Non-parent/child nodes that hear you add you as a shortcut
-3. Nodes learn shortcut keyspace ranges from overheard Pulses (which contain `keyspace_lo` and `keyspace_hi`)
-4. Shortcuts expire after 8 missed Pulses
-5. No additional bandwidth cost
+**How it works:**
+1. Every neighbor's `NeighborTiming` stores their pulse-reported `keyspace_range` and `root_hash`
+2. When routing, we check all same-tree neighbors (matching `root_hash`) whose range contains the destination
+3. We pick the neighbor with the tightest range (smallest `hi - lo`)
+4. Parent is excluded from this check (it's used as fallback only)
+5. Neighbors expire after 8 missed Pulses (24τ timeout)
 
-**Routing optimization:** When routing, we check children and shortcuts whose range contains the destination, picking the tightest. If none contain it, we route up to parent (who can continue routing upward).
+**Routing optimization:** Non-tree neighbors enable faster routing by skipping tree hops. Since Pulses are broadcast (heard by all nodes in radio range), every node learns about all neighbors' keyspace ranges passively with no additional bandwidth cost.
 
 **Example:**
 ```
@@ -1588,17 +1724,17 @@ Shortcuts are non-tree neighbors that enable faster routing by skipping tree hop
 ```
 (Numbers abbreviated: M=million, B=billion, 4B ≈ 2³²)
 
-A owns range [60M, 1B) and has a shortcut to R (heard R's Pulse).
+A owns range [60M, 1B) and has R in its neighbor_times (heard R's Pulse).
 A sends to dest_addr = 3B (in B's range):
 
 - Normal route: A → L → Root → R → B = **4 hops**
-- Via shortcut to R: A → R → B = **2 hops**
+- Via neighbor R: A → R → B = **2 hops**
 
-R's range [2B, 4B) contains dest=3B, and is tighter than any other candidate, so we use the shortcut.
+R's range [2B, 4B) contains dest=3B, and is tighter than any other candidate, so we route through R.
 
 ---
 
-## Reliability and ACK
+## Message Reliability
 
 This section describes how nodes handle packet loss on half-duplex radio links.
 
@@ -1648,51 +1784,140 @@ Since all transmissions are broadcasts, A can overhear when B forwards A's messa
 
 **Why check TTL on overhear:** If A only checked the hash, a message from further down the chain (e.g., TTL=45) that loops back could be mistaken for B's forward. By verifying `overheard_TTL == sent_TTL - 1`, A confirms this is the immediate next hop's forward.
 
-### Explicit ACK (Duplicate Detection)
+### Duplicate Detection and Bounce-Back
 
-When B receives a duplicate retransmission (same `ack_hash` AND same TTL), B knows A didn't hear B's original forward. Instead of re-forwarding (which would create duplicates), B sends an explicit ACK.
+When a forwarder receives a message it has seen before (same `ack_hash`), it must distinguish between:
+- **Retransmission**: Upstream didn't hear our forward, wants us to ACK
+- **Bounce-back**: Message traveled further, then returned due to tree restructuring
 
-**Forwarder (B) behavior:**
-1. B receives `Routed` with TTL=X, next_hop=hash(B) from A
+The `hops` field enables this distinction.
+
+#### The hops Field
+
+- Originator sends with `hops=0`
+- Each forwarder increments hops before transmitting
+- Retransmissions do NOT increment hops
+- When first forwarding, store `(ack_hash, received_hops)` in `recently_forwarded` (hops value before incrementing)
+
+#### Detection Algorithm
+
+On receiving a message with `ack_hash` already in `recently_forwarded`:
+
+| Condition | Meaning | Action |
+|-----------|---------|--------|
+| `received_hops == stored_hops` | Retransmission (upstream retry) | Send explicit ACK |
+| `received_hops > stored_hops` | Bounce-back (message returned) | Apply dampening |
+| `received_hops < stored_hops` | Anomaly (shouldn't happen) | Treat as retransmission |
+
+**Forwarder (B) full behavior:**
+1. B receives `Routed` with hops=X, next_hop=hash(B) from A
 2. B verifies next_hop matches hash(B.node_id) — if not, ignore (not the intended forwarder)
 3. B computes `ack_hash(msg)` and checks recently_forwarded set:
-   - If hash NOT in set → new message: store (hash, TTL, seen_count=1), forward with TTL-1
-   - If hash in set AND TTL matches stored TTL → retransmission: send ACK(ack_hash)
-   - If hash in set AND TTL differs → bounce-back: apply dampening (see "Bounce-Back Dampening")
+   - If hash NOT in set → new message: store (hash, received_hops=X, seen_count=1), forward with hops=X+1
+   - If hash in set AND hops == stored_hops → retransmission: send ACK(ack_hash)
+   - If hash in set AND hops > stored_hops → bounce-back: apply dampening (see below)
+   - If hash in set AND hops < stored_hops → anomaly: treat as retransmission
 
-**Why store TTL alongside hash:** The hash identifies the "logical message" (excludes TTL). But we need the TTL to distinguish:
-- **Same TTL**: Direct retransmission from the immediate sender who didn't hear our forward → send ACK
-- **Different TTL**: Message bounced back through tree during restructuring → apply bounce-back dampening
+**Why store hops alongside hash:** The hash identifies the "logical message" (excludes hops/TTL). But we need hops to distinguish retransmits from bounce-backs.
 
-**TTL=1 behavior:** When a message arrives with TTL=1, the forwarder cannot continue routing (TTL=0 means expired). If `dest_addr` is within the forwarder's keyspace, the message is delivered locally. Otherwise, the message expires silently — the sender will retry and eventually give up. Senders should use sufficient TTL for the expected hop count (DEFAULT_TTL=255 provides ample headroom).
+#### Handling Retransmissions
 
-**Example flow (success):**
-```
-A sends:     TTL=50, next_hop=hash(B), payload=P
-A stores:    (ack_hash, TTL=50) in pending_acks
+When `received_hops == stored_hops`, the upstream node didn't hear our forward. Instead of re-forwarding (creating duplicates), send an explicit ACK:
 
-B receives:  TTL=50, next_hop=hash(B)
-B stores:    (ack_hash, TTL=50) in recently_forwarded
-B forwards:  TTL=49, next_hop=hash(C)
-
-A hears:     TTL=49, ack_hash matches, 49 == 50-1 → implicit ACK, done!
+```rust
+if received_hops == stored_hops {
+    self.send_ack(ack_hash);
+    return;  // Don't forward again
+}
 ```
 
-**Example flow (loss + explicit ACK):**
+#### Handling Bounce-Backs
+
+When `received_hops > stored_hops`, the message bounced back through the tree (e.g., child's keyspace changed). Apply exponential backoff dampening:
+
+1. **ACK upstream** so they don't waste retries while we delay
+2. **Clear own pending_ack** (the bounce proves downstream heard us)
+3. **Increment seen_count** and refresh the `recently_forwarded` entry
+4. **Schedule delayed forward** with exponential backoff
+
+```rust
+fn handle_bounce_back(&mut self, msg: Routed, ack_hash: [u8; 4]) {
+    // Always ACK upstream so they don't retry while we delay (or drop)
+    self.send_ack(ack_hash);
+
+    // TTL=1 would become TTL=0 (expired) on forward - just drop it
+    if msg.ttl <= 1 {
+        return;
+    }
+
+    // Clear our own pending_ack if present (bounce proves downstream heard us)
+    self.pending_acks.remove(&ack_hash);
+
+    // Update recently_forwarded entry
+    let entry = self.recently_forwarded.get_mut(&ack_hash).unwrap();
+    entry.seen_count += 1;
+    entry.expires_at = now() + self.recently_forwarded_ttl();  // Refresh expiration
+
+    // Schedule delayed forward with exponential backoff
+    // Backoff: 1τ, 2τ, 4τ, 8τ, ..., capped at 128τ
+    let delay = self.tau() * (1 << min(entry.seen_count - 1, 7));
+    self.schedule_delayed_forward(msg, ack_hash, entry.seen_count, delay);
+}
 ```
-A sends:     TTL=50, next_hop=hash(B), payload=P
-A stores:    (ack_hash, TTL=50) in pending_acks
 
-B receives:  TTL=50, next_hop=hash(B)
-B stores:    (ack_hash, TTL=50) in recently_forwarded
-B forwards:  TTL=49, next_hop=hash(C)
+**Why this helps:**
+- ACK prevents upstream retry storms during long delays
+- Gives the tree time to stabilize during churn
+- Prevents bandwidth waste from rapid bouncing
+- Message eventually delivers once tree settles
 
-A misses B's forward, retransmits: TTL=50, next_hop=hash(B)
+**TTL handling:** Delayed forwards restore TTL to the value when first forwarded (stored in the `recently_forwarded` entry alongside the ack_hash and seen_count), rather than decrementing. Bounce-backs are retransmission attempts, not forward progress—TTL only decrements for actual routing advancement. This prevents TTL exhaustion during tree churn.
 
-B receives:  ack_hash matches, TTL=50 matches stored → retransmission
-B sends:     ACK(ack_hash)
+**Entry refresh:** The `recently_forwarded` entry's expiration is reset to `now() + 320τ` on each bounce. This ensures the entry (and its `seen_count`) survives until the delayed forward fires, even for long delays like 128τ.
 
-A receives:  ACK hash matches pending_acks → done!
+**Retry limit:** After `MAX_RETRIES` (8) bounces, drop the message. The sender will retry via normal ACK timeout.
+
+#### Delayed Forward Queue
+
+- Bounded by `MAX_DELAYED_FORWARDS` (64 in DefaultConfig, 16 in SmallConfig)
+- Each entry stores: message, ack_hash, seen_count, scheduled time
+- **seen_count storage:** The entry stores its own `seen_count` so backoff state survives even if the `recently_forwarded` entry is evicted under LRU pressure
+- **Deduplication:** At most one delayed forward per `ack_hash`. If a new bounce arrives for a hash already in the queue, double the remaining delay
+- **Eviction:** When full, drop the entry with the longest remaining delay (most likely to exceed TTL anyway)
+- When the delay fires, forward with restored TTL and recompute `next_hop` based on current routing table
+
+#### TTL=1 Behavior
+
+When a message arrives with TTL=1, the forwarder cannot continue routing (TTL=0 means expired). If `dest_addr` is within the forwarder's keyspace, the message is delivered locally. Otherwise, the message expires silently — the sender will retry and eventually give up. Senders should use sufficient TTL for the expected hop count (DEFAULT_TTL=255 provides ample headroom).
+
+#### Example Flows
+
+**Success (no duplicates):**
+```
+A sends:     hops=0, TTL=255, next_hop=hash(B)
+B receives:  hops=0, stores (ack_hash, hops=0)
+B forwards:  hops=1, TTL=254, next_hop=hash(C)
+A hears:     hops=1 == 0+1 → implicit ACK
+```
+
+**Loss + explicit ACK:**
+```
+A sends:     hops=0, TTL=255
+B receives:  stores (ack_hash, hops=0), forwards hops=1
+A misses B's forward, retransmits: hops=0
+B receives:  hops=0 == stored_hops → retransmission, sends ACK
+A receives:  ACK matches → done
+```
+
+**Bounce-back:**
+```
+A sends:     hops=0 to B
+B forwards:  hops=1 to C
+C forwards:  hops=2 to D
+D's keyspace changed, routes back up
+...bounces back to B...
+B receives:  hops=5 > stored_hops=0 → bounce-back
+B: ACKs upstream, schedules delayed forward with 1τ delay
 ```
 
 ### Retransmission Strategy
@@ -1727,7 +1952,7 @@ fn retry_backoff(&self, retries: u8) -> Duration {
 
 ```rust
 const MAX_PENDING_ACKS: usize = 32;          // messages awaiting ACK
-const MAX_RECENTLY_FORWARDED: usize = 256;   // for duplicate detection
+const MAX_RECENTLY_FORWARDED: usize = 128;   // for duplicate detection (DefaultConfig)
 const ACK_HASH_SIZE: usize = 4;              // truncated hash bytes
 
 // RECENTLY_FORWARDED_TTL = 320τ (must exceed worst-case retry sequence of ~280τ with jitter)
@@ -1741,7 +1966,7 @@ fn recently_forwarded_ttl(&self) -> Duration {
 **Memory usage (DefaultConfig):**
 - `pending_acks`: 32 entries × ~16 bytes (hash + metadata) = ~512 bytes
   - Plus original messages for retransmission (bounded by MTU × 32 ≈ 8KB worst case)
-- `recently_forwarded`: 128 entries × ~17 bytes (hash + timestamp + seen_count) = ~2.2KB
+- `recently_forwarded`: 128 entries × ~14 bytes (hash + timestamp + ttl + seen_count) = ~1.8KB
 - `delayed_forwards`: 64 entries × ~13 bytes (hash + seen_count + timestamp) = ~832 bytes
   - Plus messages awaiting forward (bounded by MTU × 64 ≈ 16KB worst case)
 - Total: ~3.5KB metadata + up to 24KB message storage
@@ -1795,69 +2020,6 @@ When retransmissions fail repeatedly (e.g., MAX_RETRIES reached), the sender sho
 2. **Parent used:** This indicates potential partition. The node should start monitoring parent liveness more aggressively.
 
 After invalidation, the next send attempt will recompute the route using remaining valid neighbors.
-
-### Bounce-Back Dampening
-
-During tree restructuring (nodes joining, leaving, or rebalancing keyspace), messages may bounce between nodes. For example: A forwards to B, but B's keyspace changed, so B routes back up, and the message eventually returns to A. Without intervention, the message bounces until TTL expires, wasting bandwidth.
-
-**Detection:** When a node receives a message with `next_hop` matching itself and `ack_hash` already in `recently_forwarded` but with a **different TTL**, the message has bounced back through the tree.
-
-**TTL=1 special case:** If the bounced message has TTL=1, drop it immediately after sending ACK. Forwarding would produce TTL=0 (expired), so there's no point scheduling a delayed forward.
-
-**Response:** When bounce-back is detected (and TTL > 1):
-
-1. **ACK upstream:** Send explicit ACK so they don't waste retries while we delay
-2. **Clear own pending_ack:** If we have a pending_ack entry for this hash, remove it (the bounce proves downstream heard us)
-3. **Increment seen_count and refresh entry:** Update the recently_forwarded entry and reset its expiration
-4. **Schedule delayed forward:** Queue the message with exponential backoff
-
-```rust
-fn handle_bounce_back(&mut self, msg: Routed, ack_hash: [u8; 4]) {
-    // Always ACK upstream so they don't retry while we delay (or drop)
-    self.send_ack(ack_hash);
-
-    // TTL=1 would become TTL=0 (expired) on forward - just drop it
-    if msg.ttl <= 1 {
-        return;
-    }
-
-    // Clear our own pending_ack if present (bounce proves downstream heard us)
-    self.pending_acks.remove(&ack_hash);
-
-    // Update recently_forwarded entry
-    let entry = self.recently_forwarded.get_mut(&ack_hash).unwrap();
-    entry.seen_count += 1;
-    entry.expires_at = now() + self.recently_forwarded_ttl();  // Refresh expiration
-
-    // Schedule delayed forward with exponential backoff
-    // Backoff: 1τ, 2τ, 4τ, 8τ, ..., capped at 128τ
-    let delay = self.tau() * (1 << min(entry.seen_count - 1, 7));
-    self.schedule_delayed_forward(msg, ack_hash, entry.seen_count, delay);
-}
-```
-
-**Why this helps:**
-- ACK prevents upstream retry storms during long delays
-- Gives the tree time to stabilize during churn
-- Prevents bandwidth waste from rapid bouncing
-- Message eventually delivers once tree settles
-- Graceful degradation: worst case is 128τ delay per bounce, not message loss
-
-**TTL handling:** The delayed forward restores `msg.ttl` to the value when first forwarded, rather than decrementing. Bounce-back retries represent retransmission attempts, not forward progress—TTL should only decrement for actual routing advancement. This prevents TTL exhaustion during tree churn where a message might bounce several times before finding a stable route.
-
-**Entry refresh:** The `recently_forwarded` entry's expiration is reset to `now() + 320τ` on each bounce. This ensures the entry (and its `seen_count`) survives until the delayed forward fires, even for long delays like 128τ.
-
-**Retry limit:** Bounce-back handling gives up after `MAX_RETRIES` (same constant as ACK retransmission, currently 8). This prevents infinite bounce loops if a message is undeliverable. After MAX_RETRIES bounces, the message is dropped silently—the sender will retry via normal ACK timeout if needed.
-
-**Delayed forward queue:**
-- Bounded by `MAX_DELAYED_FORWARDS` (64 entries in DefaultConfig, 16 in SmallConfig)
-- Each entry stores: message, ack_hash, seen_count, scheduled time
-- **seen_count storage:** The entry stores its own `seen_count` so backoff state survives even if the `recently_forwarded` entry is evicted under LRU pressure
-- **Deduplication:** At most one delayed forward per `ack_hash`. If a new bounce arrives for a hash already in the queue, double the remaining delay (exponential backoff continues — the first delay wasn't enough)
-- **Eviction:** When full, drop the entry with the longest remaining delay (most likely to exceed TTL anyway)
-- When the delay fires, forward with restored TTL and recompute `next_hop` based on current routing table
-
-**Interaction with duplicate detection:** Duplicate detection (same hash AND same TTL) triggers an explicit ACK without forwarding. Bounce-back (same hash, different TTL) triggers delayed forwarding. The TTL comparison distinguishes these cases.
 
 ### What This Doesn't Provide
 
@@ -1984,7 +2146,7 @@ The location signature uses a separate "LOC:" domain prefix, allowing storage no
 
 **Varint encoding:** All varint fields (seq, subtree_size, tree_size) use LEB128 encoding. Implementations MUST use canonical (minimal) encoding: the shortest byte sequence that represents the value. Non-minimal encodings (e.g., `0x80 0x00` for 0 instead of `0x00`) MUST be rejected during decoding to prevent signature ambiguity attacks. Standard libraries like `integer-encoding` or `postcard` handle this correctly.
 
-The Routed signature authenticates the entire PUBLISH message (including `src_addr` which carries the keyspace address). Storage nodes reject entries with `seq <= current_seq` for the same node_id. The `"ROUTE:"` prefix provides domain separation from Pulse signatures.
+The LOC: signature in the PUBLISH payload authenticates the location claim. The ROUTE: signature on the outer Routed message is defense-in-depth (PUBLISH omits src_pubkey since the payload already contains the pubkey). Storage nodes reject entries with `seq <= current_seq` for the same node_id.
 
 **Sequence number recovery after reboot:**
 
@@ -2388,7 +2550,7 @@ impl Node {
 
 **LOOKUP payload:** `replica_index (1)` = 1 byte
 
-The target is identified by `dest_hash`. The storage node finds an entry matching that hash and verifies the key.
+**Non-standard dest_hash usage:** Unlike DATA and FOUND where `dest_hash` identifies the *recipient* of the message, in LOOKUP `dest_hash` identifies the *node being looked up* (the subject of the query). The storage node receiving the LOOKUP is determined by `dest_addr` (the replica key), not `dest_hash`. This allows the storage node to find the correct location entry by matching `dest_hash` against stored entries, and verify the key matches the expected replica address.
 
 **Lookup process:**
 1. Send LOOKUP for replica 0
@@ -2607,7 +2769,7 @@ Pulses with `max_depth < depth` MUST be rejected during parsing (invalid by cons
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                   src_pubkey (0 or 32 bytes)                  |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|      ttl      |             payload (variable)                |
+|      ttl      | hops (varint) |      payload (variable)       |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 | alg=1 |                  signature (64 bytes)                 |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -2619,6 +2781,8 @@ Pulses with `max_depth < depth` MUST be rejected during parsing (invalid by cons
 - bit 5: has_src_addr
 - bit 6: has_src_pubkey
 - bit 7: reserved (must be 0)
+
+**hops** is a varint (typically 1 byte) that counts actual forwards. Unlike ttl which resets on bounce-back, hops always increments.
 
 ### ACK Layout
 
