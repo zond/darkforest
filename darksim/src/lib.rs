@@ -2743,7 +2743,7 @@ mod tests {
         w.write_u8(flags);
 
         // root_hash (4 bytes)
-        w.write_child_hash(&[0xAA; 4]);
+        w.write_id_hash(&[0xAA; 4]);
 
         // depth, max_depth (both u8)
         w.write_u8(0); // depth
@@ -2758,9 +2758,9 @@ mod tests {
         w.write_u32_be(u32::MAX);
 
         // Children in WRONG order (0xBB > 0xAA, so should be AA first)
-        w.write_child_hash(&[0xBB; 4]); // First child hash (WRONG - should be after 0xAA)
+        w.write_id_hash(&[0xBB; 4]); // First child hash (WRONG - should be after 0xAA)
         w.write_varint(1); // subtree_size
-        w.write_child_hash(&[0xAA; 4]); // Second child hash
+        w.write_id_hash(&[0xAA; 4]); // Second child hash
         w.write_varint(1); // subtree_size
 
         // Signature (1 + 64 bytes)

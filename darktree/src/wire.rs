@@ -25,7 +25,7 @@
 //!
 //! ```text
 //! flags_and_type (1) || next_hop (4) || dest_addr (4) || [dest_hash (4)] || [src_addr (4)]
-//! || src_node_id (16) || [src_pubkey (32)] || ttl (1) || payload || signature (65)
+//! || src_node_id (16) || [src_pubkey (32)] || ttl (1) || hops (varint) || payload || signature (65)
 //!
 //! flags_and_type byte:
 //! - bits 0-3: msg_type
@@ -35,14 +35,17 @@
 //! - bit 7: reserved
 //!
 //! next_hop: 4-byte truncated hash of intended forwarder (prevents amplification)
+//! hops: actual hop count (increments at each hop), used for duplicate detection
 //! payload_length: implicit (message_length - fixed_fields - optional_fields - 65)
+//!
+//! Note: hops is NOT signed (like TTL) - it changes at each hop.
 //! ```
 
 use alloc::vec::Vec;
 
 use crate::traits::Outgoing;
 use crate::types::{
-    Broadcast, ChildHash, ChildrenList, LocationEntry, Priority, Pulse, Routed, Signature,
+    Broadcast, ChildrenList, IdHash, LocationEntry, Priority, Pulse, Routed, Signature,
     BCAST_PAYLOAD_BACKUP, MAX_BROADCAST_DESTINATIONS, MSG_DATA, PULSE_CHILD_COUNT_SHIFT,
     PULSE_FLAG_HAS_PARENT, PULSE_FLAG_HAS_PUBKEY, ROUTED_FLAG_HAS_DEST_HASH,
     ROUTED_FLAG_HAS_SRC_ADDR, ROUTED_FLAG_HAS_SRC_PUBKEY,
@@ -209,8 +212,8 @@ impl<'a> Reader<'a> {
         Ok(id)
     }
 
-    /// Read a 4-byte hash (ChildHash).
-    pub fn read_child_hash(&mut self) -> Result<ChildHash, DecodeError> {
+    /// Read a 4-byte hash (IdHash).
+    pub fn read_id_hash(&mut self) -> Result<IdHash, DecodeError> {
         let bytes = self.read_bytes(4)?;
         let mut hash = [0u8; 4];
         hash.copy_from_slice(bytes);
@@ -327,8 +330,8 @@ impl Writer {
         self.write_bytes(id);
     }
 
-    /// Write a 4-byte hash (ChildHash).
-    pub fn write_child_hash(&mut self, hash: &ChildHash) {
+    /// Write a 4-byte hash (IdHash).
+    pub fn write_id_hash(&mut self, hash: &IdHash) {
         self.write_bytes(hash);
     }
 
@@ -459,14 +462,14 @@ impl Encode for Pulse {
         // parent_hash (conditional on has_parent flag)
         if self.flags & PULSE_FLAG_HAS_PARENT != 0 {
             if let Some(ref hash) = self.parent_hash {
-                w.write_child_hash(hash);
+                w.write_id_hash(hash);
             } else {
                 // Flag says has_parent but no hash - write zeros (shouldn't happen)
-                w.write_child_hash(&[0u8; 4]);
+                w.write_id_hash(&[0u8; 4]);
             }
         }
 
-        w.write_child_hash(&self.root_hash);
+        w.write_id_hash(&self.root_hash);
         w.write_u8(self.depth);
         w.write_u8(self.max_depth);
         w.write_varint(self.subtree_size);
@@ -487,7 +490,7 @@ impl Encode for Pulse {
         // Children: count is in flags, then N × (hash(4) + subtree_size(varint))
         // Note: children must be sorted by hash
         for (hash, size) in &self.children {
-            w.write_child_hash(hash);
+            w.write_id_hash(hash);
             w.write_varint(*size);
         }
 
@@ -502,12 +505,12 @@ impl Decode for Pulse {
 
         // parent_hash (conditional on has_parent flag)
         let parent_hash = if flags & PULSE_FLAG_HAS_PARENT != 0 {
-            Some(r.read_child_hash()?)
+            Some(r.read_id_hash()?)
         } else {
             None
         };
 
-        let root_hash = r.read_child_hash()?;
+        let root_hash = r.read_id_hash()?;
         let depth = r.read_u8()?;
         let max_depth = r.read_u8()?;
         let subtree_size = r.read_varint()?;
@@ -544,7 +547,7 @@ impl Decode for Pulse {
 
         let mut children = ChildrenList::with_capacity(child_count);
         for _ in 0..child_count {
-            let hash = r.read_child_hash()?;
+            let hash = r.read_id_hash()?;
             let size = r.read_varint()?;
             children.push((hash, size));
         }
@@ -579,15 +582,17 @@ impl Decode for Pulse {
 impl Encode for Routed {
     fn encode(&self, w: &mut Writer) {
         w.write_u8(self.flags_and_type);
-        w.write_child_hash(&self.next_hop);
+        // next_hop must be set before encoding - it's computed by route_message()
+        let next_hop = self.next_hop.expect("next_hop must be set before encoding");
+        w.write_id_hash(&next_hop);
         w.write_u32_be(self.dest_addr);
 
         // dest_hash (conditional on flag)
         if self.flags_and_type & ROUTED_FLAG_HAS_DEST_HASH != 0 {
             if let Some(ref hash) = self.dest_hash {
-                w.write_child_hash(hash);
+                w.write_id_hash(hash);
             } else {
-                w.write_child_hash(&[0u8; 4]);
+                w.write_id_hash(&[0u8; 4]);
             }
         }
 
@@ -612,6 +617,7 @@ impl Encode for Routed {
         }
 
         w.write_u8(self.ttl);
+        w.write_varint(self.hops);
         // Payload length is implicit (remaining bytes before signature)
         w.write_bytes(&self.payload);
         w.write_signature(&self.signature);
@@ -634,12 +640,13 @@ impl Decode for Routed {
             return Err(DecodeError::InvalidMessageType);
         }
 
-        let next_hop = r.read_child_hash()?;
+        // Wire format always has next_hop (4 bytes), wrap in Some
+        let next_hop = Some(r.read_id_hash()?);
         let dest_addr = r.read_u32_be()?;
 
         // dest_hash (conditional on flag)
         let dest_hash = if flags_and_type & ROUTED_FLAG_HAS_DEST_HASH != 0 {
-            Some(r.read_child_hash()?)
+            Some(r.read_id_hash()?)
         } else {
             None
         };
@@ -661,6 +668,7 @@ impl Decode for Routed {
         };
 
         let ttl = r.read_u8()?;
+        let hops = r.read_varint()?;
 
         // Payload length is implicit: remaining bytes minus signature (65 bytes)
         let payload_len = r
@@ -680,6 +688,7 @@ impl Decode for Routed {
             src_node_id,
             src_pubkey,
             ttl,
+            hops,
             payload,
             signature,
         })
@@ -712,7 +721,7 @@ impl Encode for Broadcast {
         w.write_node_id(&self.src_node_id);
         w.write_u8(self.destinations.len() as u8);
         for dest in &self.destinations {
-            w.write_child_hash(dest);
+            w.write_id_hash(dest);
         }
         // Payload length is implicit (remaining bytes before signature)
         w.write_bytes(&self.payload);
@@ -732,7 +741,7 @@ impl Decode for Broadcast {
 
         let mut destinations = Vec::with_capacity(dest_count);
         for _ in 0..dest_count {
-            destinations.push(r.read_child_hash()?);
+            destinations.push(r.read_id_hash()?);
         }
 
         // Payload length is implicit: remaining bytes minus signature (65 bytes)
@@ -805,6 +814,7 @@ impl Decode for Message {
 
 impl Outgoing for Message {
     fn priority(&self) -> Priority {
+        use crate::types::{MSG_FOUND, MSG_LOOKUP, MSG_PUBLISH};
         match self {
             Message::Ack(_) => Priority::Ack,
             Message::Pulse(_) => Priority::BroadcastProtocol,
@@ -816,13 +826,13 @@ impl Outgoing for Message {
                     Priority::BroadcastData
                 }
             }
-            Message::Routed(r) => {
-                if r.msg_type() == MSG_DATA {
-                    Priority::RoutedData
-                } else {
-                    Priority::RoutedProtocol
-                }
-            }
+            Message::Routed(r) => match r.msg_type() {
+                MSG_PUBLISH => Priority::RoutedPublish,
+                MSG_FOUND => Priority::RoutedFound,
+                MSG_LOOKUP => Priority::RoutedLookup,
+                MSG_DATA => Priority::RoutedData,
+                _ => Priority::RoutedData, // Unknown types get lowest routed priority
+            },
         }
     }
 
@@ -911,6 +921,7 @@ impl Decode for LocationEntry {
             replica_index,
             signature,
             received_at: crate::time::Timestamp::ZERO,
+            hops: 0, // Default, will be set from msg.hops on receive
         })
     }
 }
@@ -924,11 +935,11 @@ pub(crate) fn pulse_sign_data(pulse: &Pulse) -> Writer {
 
     if pulse.flags & PULSE_FLAG_HAS_PARENT != 0 {
         if let Some(ref hash) = pulse.parent_hash {
-            w.write_child_hash(hash);
+            w.write_id_hash(hash);
         }
     }
 
-    w.write_child_hash(&pulse.root_hash);
+    w.write_id_hash(&pulse.root_hash);
     w.write_u8(pulse.depth);
     w.write_u8(pulse.max_depth);
     w.write_varint(pulse.subtree_size);
@@ -943,7 +954,7 @@ pub(crate) fn pulse_sign_data(pulse: &Pulse) -> Writer {
     }
 
     for (hash, size) in &pulse.children {
-        w.write_child_hash(hash);
+        w.write_id_hash(hash);
         w.write_varint(*size);
     }
 
@@ -962,7 +973,7 @@ pub(crate) fn routed_sign_data(routed: &Routed) -> Writer {
 
     if routed.flags_and_type & ROUTED_FLAG_HAS_DEST_HASH != 0 {
         if let Some(ref hash) = routed.dest_hash {
-            w.write_child_hash(hash);
+            w.write_id_hash(hash);
         }
     }
 
@@ -1001,7 +1012,7 @@ pub(crate) fn broadcast_sign_data(broadcast: &Broadcast) -> Writer {
     w.write_node_id(&broadcast.src_node_id);
     w.write_u8(broadcast.destinations.len() as u8);
     for dest in &broadcast.destinations {
-        w.write_child_hash(dest);
+        w.write_id_hash(dest);
     }
     w.write_len_prefixed(&broadcast.payload);
     w
@@ -1102,13 +1113,14 @@ mod tests {
     fn test_routed_roundtrip() {
         let routed = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, true, true, false),
-            next_hop: [0x11, 0x22, 0x33, 0x44],
+            next_hop: Some([0x11, 0x22, 0x33, 0x44]),
             dest_addr: 0x1234_5678,
             dest_hash: Some([0xAB, 0xCD, 0xEF, 0x01]),
             src_addr: Some(0x8765_4321),
             src_node_id: [7u8; 16],
             src_pubkey: None,
             ttl: 32,
+            hops: 5,
             payload: b"hello world".to_vec(),
             signature: Signature {
                 algorithm: ALGORITHM_ED25519,
@@ -1127,6 +1139,7 @@ mod tests {
         assert_eq!(routed.src_node_id, decoded.src_node_id);
         assert_eq!(routed.src_pubkey, decoded.src_pubkey);
         assert_eq!(routed.ttl, decoded.ttl);
+        assert_eq!(routed.hops, decoded.hops);
         assert_eq!(routed.payload, decoded.payload);
         assert_eq!(routed.signature, decoded.signature);
     }
@@ -1135,13 +1148,14 @@ mod tests {
     fn test_routed_minimal() {
         let routed = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_PUBLISH, false, false, false),
-            next_hop: [0u8; 4],
+            next_hop: Some([0u8; 4]),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: None,
             src_node_id: [7u8; 16],
             src_pubkey: None,
             ttl: 255,
+            hops: 0,
             payload: vec![],
             signature: Signature::default(),
         };
@@ -1160,13 +1174,14 @@ mod tests {
     fn test_routed_with_src_pubkey() {
         let routed = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, true),
-            next_hop: [0u8; 4],
+            next_hop: Some([0u8; 4]),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
             src_node_id: [7u8; 16],
             src_pubkey: Some([9u8; 32]),
             ttl: 32,
+            hops: 0,
             payload: b"data".to_vec(),
             signature: Signature::default(),
         };
@@ -1192,7 +1207,10 @@ mod tests {
             _ => panic!("expected Pulse"),
         }
 
-        let routed = Routed::default();
+        let routed = Routed {
+            next_hop: Some([0u8; 4]), // Must be Some for encoding
+            ..Routed::default()
+        };
         let msg = Message::Routed(routed.clone());
         let encoded = msg.encode_to_vec();
         let decoded = Message::decode_from_slice(&encoded).unwrap();
@@ -1260,6 +1278,7 @@ mod tests {
                 sig: [11u8; 64],
             },
             received_at: crate::time::Timestamp::ZERO,
+            hops: 0,
         };
 
         let encoded = entry.encode_to_vec();
@@ -1321,13 +1340,13 @@ mod tests {
 
     #[test]
     fn test_child_hash_roundtrip() {
-        let hash: ChildHash = [0xAB, 0xCD, 0xEF, 0x01];
+        let hash: IdHash = [0xAB, 0xCD, 0xEF, 0x01];
         let mut w = Writer::new();
-        w.write_child_hash(&hash);
+        w.write_id_hash(&hash);
         let encoded = w.finish();
 
         let mut r = Reader::new(&encoded);
-        let decoded = r.read_child_hash().unwrap();
+        let decoded = r.read_id_hash().unwrap();
         assert_eq!(hash, decoded);
     }
 
@@ -1493,7 +1512,7 @@ mod tests {
             let has_src_addr: bool = u.arbitrary()?;
             let has_src_pubkey: bool = u.arbitrary()?;
 
-            let next_hop: [u8; 4] = u.arbitrary()?;
+            let next_hop: Option<[u8; 4]> = Some(u.arbitrary()?);
             let dest_addr: u32 = u.arbitrary()?;
             let dest_hash: Option<[u8; 4]> = if has_dest_hash {
                 Some(u.arbitrary()?)
@@ -1519,6 +1538,7 @@ mod tests {
                 .map(|_| u.arbitrary())
                 .collect::<Result<_, _>>()?;
 
+            let hops: u32 = u.arbitrary()?;
             let sig: [u8; 64] = u.arbitrary()?;
             let routed = Routed {
                 flags_and_type: Routed::build_flags_and_type(
@@ -1534,6 +1554,7 @@ mod tests {
                 src_node_id,
                 src_pubkey,
                 ttl,
+                hops,
                 payload,
                 signature: Signature {
                     algorithm: ALGORITHM_ED25519,
@@ -1547,6 +1568,7 @@ mod tests {
             assert_eq!(routed.dest_addr, decoded.dest_addr);
             assert_eq!(routed.src_node_id, decoded.src_node_id);
             assert_eq!(routed.ttl, decoded.ttl);
+            assert_eq!(routed.hops, decoded.hops);
             assert_eq!(routed.payload, decoded.payload);
             Ok(())
         });
@@ -1615,7 +1637,7 @@ mod tests {
         w.write_u8(flags);
 
         // root_hash
-        w.write_child_hash(&[0xAA; 4]);
+        w.write_id_hash(&[0xAA; 4]);
 
         // depth, max_depth
         w.write_u8(0);
@@ -1630,9 +1652,9 @@ mod tests {
         w.write_u32_be(u32::MAX);
 
         // Children in WRONG order (0xBB > 0xAA, so should be AA first)
-        w.write_child_hash(&[0xBB; 4]);
+        w.write_id_hash(&[0xBB; 4]);
         w.write_varint(1);
-        w.write_child_hash(&[0xAA; 4]);
+        w.write_id_hash(&[0xAA; 4]);
         w.write_varint(1);
 
         // signature

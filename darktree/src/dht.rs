@@ -67,7 +67,7 @@ where
             payload.write_signature(&signature);
             let payload_bytes = payload.finish();
 
-            let msg = self.build_routed_no_reply(dest_addr, MSG_PUBLISH, payload_bytes);
+            let msg = self.build_routed_no_reply(dest_addr, None, MSG_PUBLISH, payload_bytes, true);
             let _ = self.send_routed(msg);
         }
 
@@ -152,6 +152,7 @@ where
             replica_index,
             signature,
             received_at: now,
+            hops: msg.hops,
         };
 
         self.insert_location_store(owner_node_id, replica_index, entry.clone());
@@ -185,7 +186,7 @@ where
         let dest_addr = self.replica_addr(&target, replica as u8);
 
         // dest_hash identifies the target (4-byte truncated hash of target node_id)
-        let dest_hash = self.compute_node_hash(&target);
+        let dest_hash = self.compute_id_hash(&target);
 
         // Payload is just the replica_index (1 byte) per design doc
         let msg = self.build_routed(
@@ -220,7 +221,7 @@ where
         let entry = match self
             .location_store()
             .iter()
-            .find(|((node_id, _replica), _)| self.compute_node_hash(node_id) == dest_hash)
+            .find(|((node_id, _replica), _)| self.compute_id_hash(node_id) == dest_hash)
         {
             Some((_, entry)) => entry.clone(),
             None => return, // No matching entry
@@ -244,10 +245,15 @@ where
         let payload_bytes = payload.finish();
 
         // Compute dest_hash for the requester
-        let response_dest_hash = self.compute_node_hash(&msg.src_node_id);
+        let response_dest_hash = self.compute_id_hash(&msg.src_node_id);
 
-        let response =
-            self.build_routed(src_addr, Some(response_dest_hash), MSG_FOUND, payload_bytes);
+        let response = self.build_routed_no_reply(
+            src_addr,
+            Some(response_dest_hash),
+            MSG_FOUND,
+            payload_bytes,
+            false,
+        );
         let _ = self.send_routed(response);
     }
 
@@ -380,7 +386,9 @@ where
         let payload_bytes = payload.finish();
 
         let dest_addr = self.replica_addr(&entry.node_id, entry.replica_index);
-        let msg = self.build_routed_no_reply(dest_addr, MSG_PUBLISH, payload_bytes);
+        let mut msg = self.build_routed_no_reply(dest_addr, None, MSG_PUBLISH, payload_bytes, true);
+        // Preserve hops for duplicate detection: hops is not signed, safe to modify after build
+        msg.hops = entry.hops.saturating_add(1);
         let _ = self.send_routed(msg);
 
         has_more

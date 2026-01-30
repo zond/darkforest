@@ -15,8 +15,7 @@ use crate::node::{JoinContext, NeighborTiming, Node};
 use crate::time::{Duration, Timestamp};
 use crate::traits::{Clock, Crypto, Random, Transport};
 use crate::types::{
-    ChildHash, ChildrenList, Event, NodeId, Pulse, Signature, DISTRUST_TTL, LOCATION_TTL,
-    MAX_CHILDREN,
+    ChildrenList, Event, IdHash, NodeId, Pulse, Signature, DISTRUST_TTL, LOCATION_TTL, MAX_CHILDREN,
 };
 use crate::wire::{pulse_sign_data, Encode, Message};
 
@@ -194,6 +193,10 @@ where
         };
         self.insert_neighbor_time(pulse.node_id, timing);
 
+        // Retry pending routed messages that might now have a route.
+        // A neighbor's updated keyspace_range might cover queued destinations.
+        self.retry_pending_routed();
+
         // Rate limiting: skip tree operations if pulses arrive too fast.
         // Timing is already updated above, so this only affects tree processing.
         let min_interval = self.tau() * 2;
@@ -219,6 +222,8 @@ where
                 from: pulse.node_id,
                 tree_size: pulse.tree_size,
                 root_hash: pulse.root_hash,
+                keyspace_lo: pulse.keyspace_lo,
+                keyspace_hi: pulse.keyspace_hi,
                 has_pubkey: pulse.has_pubkey(),
                 need_pubkey: pulse.need_pubkey(),
             }
@@ -230,11 +235,11 @@ where
         }
 
         // Compute the sender's hash
-        let sender_hash = self.compute_node_hash(&pulse.node_id);
+        let sender_hash = self.compute_id_hash(&pulse.node_id);
 
         // Check if this pulse is from our parent (by hash)
         if let Some(parent_id) = self.parent() {
-            let parent_hash = self.compute_node_hash(&parent_id);
+            let parent_hash = self.compute_id_hash(&parent_id);
             if pulse.node_id == parent_id {
                 self.handle_parent_pulse(&pulse, now);
                 return;
@@ -250,7 +255,7 @@ where
         }
 
         // Check if this pulse claims us as parent (by checking if our hash is in their parent_hash)
-        let my_hash = self.compute_node_hash(self.node_id());
+        let my_hash = self.compute_id_hash(self.node_id());
         if pulse.parent_hash == Some(my_hash) {
             self.handle_child_pulse(&pulse, &sender_hash, now);
         } else {
@@ -269,11 +274,6 @@ where
 
         // Tree merge decision (includes inversion handling)
         self.consider_merge(&pulse, &sender_hash, now);
-
-        // Track as shortcut if not parent/child
-        if self.parent() != Some(pulse.node_id) && !self.children().contains_key(&pulse.node_id) {
-            self.insert_shortcut(pulse.node_id, (pulse.keyspace_lo, pulse.keyspace_hi));
-        }
     }
 
     /// Handle pubkey exchange from a pulse.
@@ -297,7 +297,7 @@ where
     /// Handle a pulse from our current parent.
     fn handle_parent_pulse(&mut self, pulse: &Pulse, now: Timestamp) {
         // Find ourselves in parent's children list (by hash)
-        let my_hash = self.compute_node_hash(self.node_id());
+        let my_hash = self.compute_id_hash(self.node_id());
         if let Some(my_idx) = self.find_child_index(pulse, &my_hash) {
             // Compute our keyspace range from parent's pulse
             let (new_lo, new_hi) = self.compute_child_keyspace(pulse, my_idx);
@@ -349,7 +349,7 @@ where
     }
 
     /// Find the index of a child in the children list by hash.
-    fn find_child_index(&self, pulse: &Pulse, child_hash: &ChildHash) -> Option<usize> {
+    fn find_child_index(&self, pulse: &Pulse, child_hash: &IdHash) -> Option<usize> {
         pulse
             .children
             .iter()
@@ -411,7 +411,7 @@ where
     }
 
     /// Handle a pulse from a node claiming us as parent.
-    fn handle_child_pulse(&mut self, pulse: &Pulse, sender_hash: &ChildHash, now: Timestamp) {
+    fn handle_child_pulse(&mut self, pulse: &Pulse, sender_hash: &IdHash, now: Timestamp) {
         let is_new = !self.children().contains_key(&pulse.node_id);
 
         // Only check capacity for NEW children - existing children must be able to update
@@ -456,9 +456,6 @@ where
         self.children_mut()
             .set_range(&pulse.node_id, pulse.keyspace_lo, pulse.keyspace_hi);
 
-        // Remove from shortcuts if present
-        self.shortcuts_mut().remove(&pulse.node_id);
-
         // Update subtree size and max_depth
         self.recalculate_subtree_size();
         self.recalculate_max_depth();
@@ -483,16 +480,15 @@ where
     /// Handle a pulse from our pending parent candidate.
     fn handle_pending_parent_pulse(&mut self, pulse: &Pulse, current_count: u8, now: Timestamp) {
         // Check if we're in the children list (by our hash)
-        let my_hash = self.compute_node_hash(self.node_id());
+        let my_hash = self.compute_id_hash(self.node_id());
         if let Some(my_idx) = self.find_child_index(pulse, &my_hash) {
             // We're acknowledged! Complete the parent switch
             let parent_id = pulse.node_id;
             self.set_parent(Some(parent_id));
             self.set_pending_parent(None);
 
-            // Remove new parent from our children/shortcuts (prevents cycles and stale routing)
+            // Remove new parent from our children (prevents cycles)
             self.remove_child(&parent_id);
-            self.shortcuts_mut().remove(&parent_id);
 
             // Compute our keyspace range
             let (new_lo, new_hi) = self.compute_child_keyspace(pulse, my_idx);
@@ -536,7 +532,7 @@ where
     /// When a dominating tree is detected, starts a shopping phase (3τ) to
     /// collect candidates before selecting the best parent. This is the same
     /// mechanism used at first boot, providing unified parent selection.
-    fn consider_merge(&mut self, pulse: &Pulse, _sender_hash: &ChildHash, now: Timestamp) {
+    fn consider_merge(&mut self, pulse: &Pulse, _sender_hash: &IdHash, now: Timestamp) {
         // Don't start merge if already shopping - wait for select_best_parent
         if self.is_shopping() {
             emit_debug!(
@@ -761,7 +757,7 @@ where
     fn become_root(&mut self) {
         self.set_parent(None);
         self.set_parent_rejection_count(0);
-        let my_hash = self.compute_node_hash(self.node_id());
+        let my_hash = self.compute_id_hash(self.node_id());
         self.set_root_hash(my_hash);
         self.set_keyspace_range(0, u32::MAX);
         self.set_depth(0); // Root is at depth 0
@@ -1004,7 +1000,7 @@ where
         );
 
         // Parent hash - include pending_parent so prospective parent can adopt us
-        let parent_hash = effective_parent.map(|pid| self.compute_node_hash(&pid));
+        let parent_hash = effective_parent.map(|pid| self.compute_id_hash(&pid));
 
         let mut pulse = Pulse {
             node_id: *self.node_id(),
@@ -1094,18 +1090,20 @@ where
             // If child, remove
             self.remove_child(&id);
 
-            // Remove from shortcuts
-            self.shortcuts_mut().remove(&id);
-
             // Remove from pubkey cache and need set
             self.pubkey_cache_mut().remove(&id);
             self.need_pubkey_mut().remove(&id);
 
             // Remove backups we were holding for this neighbor
-            let neighbor_hash = self.compute_node_hash(&id);
+            let neighbor_hash = self.compute_id_hash(&id);
             self.backup_store_mut()
                 .retain(|_, entry| entry.backed_up_for != neighbor_hash);
         }
+
+        // Expire old pending routed messages (24τ = 8 pulse periods)
+        let pending_routed_expiry = self.tau() * 24;
+        self.pending_routed_mut()
+            .retain(|p| now.saturating_sub(p.queued_at) < pending_routed_expiry);
 
         next_timeout
     }
@@ -1209,7 +1207,7 @@ mod tests {
 
         // Add a child
         let child_id: NodeId = [2u8; 16];
-        let child_hash = node.compute_node_hash(&child_id);
+        let child_hash = node.compute_id_hash(&child_id);
         node.children_mut().insert(child_hash, child_id, 5); // subtree_size = 5
 
         // Add neighbor timing for child (last seen long ago)
@@ -1261,6 +1259,7 @@ mod tests {
                 sig: [0u8; 64],
             },
             received_at: old_time, // Old, should expire
+            hops: 0,
         };
 
         let entry2 = LocationEntry {
@@ -1274,6 +1273,7 @@ mod tests {
                 sig: [0u8; 64],
             },
             received_at: recent_time, // Recent, should stay
+            hops: 0,
         };
 
         node.insert_location_store(node_id1, 0, entry1);
@@ -1347,7 +1347,7 @@ mod tests {
 
         // Receive pulse from larger tree (size 10)
         let other_id: NodeId = [1u8; 16];
-        let other_hash = node.compute_node_hash(&other_id);
+        let other_hash = node.compute_id_hash(&other_id);
 
         let pulse = Pulse {
             node_id: other_id,
@@ -1421,7 +1421,7 @@ mod tests {
 
         // Create another node with same size but different root
         let other_id: NodeId = [0xFF; 16]; // High bytes to likely have higher hash
-        let other_hash = node.compute_node_hash(&other_id);
+        let other_hash = node.compute_id_hash(&other_id);
 
         let pulse = Pulse {
             node_id: other_id,
@@ -1598,8 +1598,8 @@ mod tests {
         let child2: NodeId = [1, 2, 3, 4, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // Same prefix, different node
 
         // Verify they have the same hash
-        let hash1 = node.compute_node_hash(&child1);
-        let hash2 = node.compute_node_hash(&child2);
+        let hash1 = node.compute_id_hash(&child1);
+        let hash2 = node.compute_id_hash(&child2);
         assert_eq!(
             hash1, hash2,
             "Test setup: NodeIds should have same child hash"
@@ -1616,7 +1616,7 @@ mod tests {
         node.insert_pubkey_cache(child2, fake_pubkey, now);
 
         // Create a pulse from the second child claiming us as parent
-        let my_hash = node.compute_node_hash(node.node_id());
+        let my_hash = node.compute_id_hash(node.node_id());
         let pulse = Pulse {
             node_id: child2,
             flags: Pulse::build_flags(false, false, false, false, 0),
@@ -1676,7 +1676,7 @@ mod tests {
         let mut node = make_node();
 
         let child_id: NodeId = [2u8; 16];
-        let child_hash = node.compute_node_hash(&child_id);
+        let child_hash = node.compute_id_hash(&child_id);
 
         // Insert initial child
         node.children_mut().insert(child_hash, child_id, 5);
@@ -1700,7 +1700,7 @@ mod tests {
 
         // Add a child
         let child_id: NodeId = [2u8; 16];
-        let child_hash = node.compute_node_hash(&child_id);
+        let child_hash = node.compute_id_hash(&child_id);
         node.children_mut().insert(child_hash, child_id, 5); // Initial subtree_size = 5
         assert_eq!(node.children().len(), 1);
         assert_eq!(node.children().get(&child_id).unwrap().subtree_size, 5);
@@ -1735,7 +1735,7 @@ mod tests {
         };
 
         // Create a pulse from the same child with updated subtree_size
-        let my_hash = node.compute_node_hash(node.node_id());
+        let my_hash = node.compute_id_hash(node.node_id());
         let pulse = Pulse {
             node_id: child_id,
             flags: Pulse::build_flags(true, false, false, false, 0), // has_parent = true
@@ -1752,8 +1752,8 @@ mod tests {
             signature: valid_sig,
         };
 
-        // Verify hashes match (same compute_node_hash should produce same result)
-        let computed_my_hash = node.compute_node_hash(node.node_id());
+        // Verify hashes match (same compute_id_hash should produce same result)
+        let computed_my_hash = node.compute_id_hash(node.node_id());
         assert_eq!(my_hash, computed_my_hash, "my_hash should be deterministic");
         assert_eq!(
             pulse.parent_hash,

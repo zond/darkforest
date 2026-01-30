@@ -197,6 +197,42 @@ impl ScenarioBuilder {
         self
     }
 
+    /// Print simulation configuration and topology to stderr for debugging.
+    fn print_config(&self, topology_name: &str, node_ids: &[NodeId], topo: &Topology) {
+        eprintln!("\n=== SIMULATION CONFIGURATION ===");
+        eprintln!("Nodes: {}", self.num_nodes);
+        eprintln!("Seed: {}", self.seed);
+        eprintln!("Loss rate: {:.1}%", self.loss_rate * 100.0);
+        eprintln!("Link delay: {}ms", self.delay.as_millis());
+        eprintln!(
+            "Bandwidth: {}",
+            self.bandwidth
+                .map(|b| format!("{} bytes/sec", b))
+                .unwrap_or_else(|| "unlimited".to_string())
+        );
+        eprintln!("Topology: {}", topology_name);
+
+        eprintln!("\n=== TOPOLOGY: NODE NEIGHBORS ===");
+        for (i, &node_id) in node_ids.iter().enumerate() {
+            let neighbors = topo.neighbors(node_id);
+            let neighbor_indices: Vec<usize> = neighbors
+                .iter()
+                .filter_map(|n| node_ids.iter().position(|&id| id == *n))
+                .collect();
+            eprintln!(
+                "Node {:2} [{:3},{:3},{:3},{:3}]: {} neighbors: {:?}",
+                i,
+                node_id[0],
+                node_id[1],
+                node_id[2],
+                node_id[3],
+                neighbors.len(),
+                neighbor_indices
+            );
+        }
+        eprintln!("=== END CONFIGURATION ===\n");
+    }
+
     /// Build the simulator with all nodes and topology.
     pub fn build(self) -> (Simulator, Vec<NodeId>) {
         let mut sim = Simulator::new(self.seed);
@@ -220,6 +256,19 @@ impl ScenarioBuilder {
             .map(|i| predict_node_id(self.seed.wrapping_add(i as u64 * 1000)))
             .collect();
 
+        // Get topology type name for debug output (before consuming self.topology_type)
+        let topology_name = match &self.topology_type {
+            Some(TopologyType::FullyConnected) => "fully_connected".to_string(),
+            Some(TopologyType::Chain) => "chain".to_string(),
+            Some(TopologyType::Star) => "star".to_string(),
+            Some(TopologyType::RandomGeometric { radius }) => {
+                format!("random_geometric(r={})", radius)
+            }
+            Some(TopologyType::RandomGeometricAdaptive) => "random_geometric_adaptive".to_string(),
+            Some(TopologyType::Custom(_)) => "custom".to_string(),
+            None => "none".to_string(),
+        };
+
         // Build topology with predicted node IDs
         let mut topo = match self.topology_type {
             Some(TopologyType::FullyConnected) => Topology::fully_connected(&predicted_node_ids),
@@ -231,7 +280,7 @@ impl ScenarioBuilder {
             Some(TopologyType::RandomGeometricAdaptive) => {
                 Topology::random_geometric_adaptive(&predicted_node_ids, self.seed)
             }
-            Some(TopologyType::Custom(t)) => t,
+            Some(TopologyType::Custom(ref t)) => t.clone(),
             None => panic!(
                 "Topology must be explicitly specified. \
                 Use .fully_connected(), .chain_topology(), .star_topology(), \
@@ -252,6 +301,11 @@ impl ScenarioBuilder {
                     link.delay = self.delay;
                 }
             }
+        }
+
+        // Print configuration and topology BEFORE adding nodes (so it appears first in debug output)
+        if self.debug_print {
+            self.print_config(&topology_name, &predicted_node_ids, &topo);
         }
 
         // Set topology BEFORE adding nodes

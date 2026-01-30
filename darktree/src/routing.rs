@@ -7,12 +7,14 @@
 use alloc::vec::Vec;
 
 use crate::config::NodeConfig;
+#[cfg(feature = "debug")]
+use crate::debug::HasDebugEmitter;
 use crate::node::{AckHash, Node};
 use crate::time::Timestamp;
 use crate::traits::{Ackable, Clock, Crypto, Outgoing, Random, Transport};
 use crate::types::{
-    ChildHash, Error, NodeId, Routed, Signature, DEFAULT_TTL, MSG_DATA, MSG_FOUND, MSG_LOOKUP,
-    MSG_PUBLISH,
+    Error, IdHash, NodeId, ReadyRouted, Routed, Signature, DEFAULT_TTL, MSG_DATA, MSG_FOUND,
+    MSG_LOOKUP, MSG_PUBLISH,
 };
 use crate::wire::{routed_sign_data, Ack, Encode, Message};
 
@@ -31,18 +33,55 @@ where
             return;
         }
 
-        // Store original TTL before decrementing (for duplicate detection)
-        let original_ttl = msg.ttl;
+        // Store original hops before incrementing (for duplicate detection).
+        // "original_hops" = the hops value when we first received this message,
+        // before we increment it for our own processing.
+        let original_hops = msg.hops;
 
-        // Decrement TTL for forwarding
+        // Decrement TTL and increment hops for forwarding
         msg.ttl = msg.ttl.saturating_sub(1);
+        msg.hops = msg.hops.saturating_add(1);
 
         let dest = msg.dest_addr;
         let msg_type = msg.msg_type();
         let ack_hash = msg.ack_hash(self.crypto());
 
-        // Do I own this keyspace location?
-        if self.owns_key(dest) {
+        // Compute addressing info upfront for routing decisions
+        let my_hash = self.compute_id_hash(self.node_id());
+        let is_for_me = msg.next_hop == Some(my_hash);
+        let i_own_dest = self.owns_key(dest);
+
+        // === Opportunistic Receipt ===
+        // For PUBLISH/LOOKUP: if we own the keyspace but weren't the designated forwarder,
+        // handle locally anyway. This improves reliability during tree restructuring.
+        // We check this BEFORE the normal ownership path to handle the case where we
+        // overheard a message not addressed to us but destined for our keyspace.
+        let is_keyspace_targeted = msg_type == MSG_PUBLISH || msg_type == MSG_LOOKUP;
+
+        if is_keyspace_targeted && !is_for_me && i_own_dest {
+            // We overheard a message destined for our keyspace
+            // Add to recently_forwarded to prevent duplicate processing
+            if self.recently_forwarded().contains_key(&ack_hash) {
+                return; // Already handled
+            }
+            self.insert_recently_forwarded(ack_hash, original_hops, now);
+
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::RoutedOpportunistic {
+                    payload_hash: msg.payload_hash(self.crypto()),
+                    msg_type,
+                    dest_addr: dest,
+                }
+            );
+
+            // Handle locally (but don't forward - we weren't designated)
+            self.dispatch_routed(msg, now);
+            return;
+        }
+
+        // Do I own this keyspace location and am I the designated forwarder?
+        if i_own_dest {
             emit_debug!(
                 self,
                 crate::debug::DebugEvent::RoutedDelivered {
@@ -53,20 +92,13 @@ where
                 }
             );
             // Handle locally based on message type
-            match msg_type {
-                MSG_PUBLISH => self.handle_publish(msg, now),
-                MSG_LOOKUP => self.handle_lookup_msg(msg, now),
-                MSG_FOUND => self.handle_found(msg, now),
-                MSG_DATA => self.handle_data(msg, now),
-                _ => {} // Unknown type, drop silently
-            }
+            self.dispatch_routed(msg, now);
             return;
         }
 
         // Am I the intended forwarder? If not, ignore silently.
         // This prevents amplification attacks where multiple nodes forward the same message.
-        let my_hash = self.compute_node_hash(self.node_id());
-        if msg.next_hop != my_hash {
+        if !is_for_me {
             return;
         }
 
@@ -77,10 +109,10 @@ where
         }
 
         // Duplicate detection: check if we've recently forwarded this message
-        // Note: ack_hash excludes TTL so it's the same at any hop
-        if let Some(&(_stored_time, stored_ttl, _)) = self.recently_forwarded().get(&ack_hash) {
-            if stored_ttl == original_ttl {
-                // Same TTL = retransmission from sender who didn't hear our forward
+        // Note: ack_hash excludes TTL/hops so it's the same at any hop
+        if let Some(&(_stored_time, stored_hops, _)) = self.recently_forwarded().get(&ack_hash) {
+            if stored_hops == original_hops {
+                // Same hops = retransmission from sender who didn't hear our forward
                 // Send explicit ACK to confirm we received and forwarded it
                 emit_debug!(
                     self,
@@ -88,15 +120,15 @@ where
                         payload_hash: msg.payload_hash(self.crypto()),
                         msg_type,
                         dest_addr: dest,
-                        original_ttl,
-                        stored_ttl,
+                        original_hops,
+                        stored_hops,
                         action: "ack_retransmit",
                     }
                 );
                 self.send_explicit_ack(ack_hash);
                 return;
             }
-            // Different TTL = message looped back to us, schedule delayed retry
+            // Different hops = message looped back to us, schedule delayed retry
             // with exponential backoff to let tree routing stabilize
             emit_debug!(
                 self,
@@ -104,18 +136,18 @@ where
                     payload_hash: msg.payload_hash(self.crypto()),
                     msg_type,
                     dest_addr: dest,
-                    original_ttl,
-                    stored_ttl,
+                    original_hops,
+                    stored_hops,
                     action: "bounce_back",
                 }
             );
-            self.handle_bounce_back(msg, ack_hash, original_ttl, now);
+            self.handle_bounce_back(msg, ack_hash, original_hops, now);
             return;
         }
 
-        // Not a duplicate - forward and track with TTL
-        self.insert_recently_forwarded(ack_hash, original_ttl, now);
-        self.forward_routed(msg, now);
+        // Not a duplicate - forward and track with hops
+        self.insert_recently_forwarded(ack_hash, original_hops, now);
+        let _ = self.route_message(msg, now);
     }
 
     /// Send an explicit ACK for a message hash.
@@ -123,7 +155,7 @@ where
     /// Used when we receive a duplicate message - the sender is waiting for confirmation
     /// that we received it, so we send a minimal ACK instead of re-forwarding.
     pub(crate) fn send_explicit_ack(&mut self, hash: AckHash) {
-        let sender_hash = self.compute_node_hash(self.node_id());
+        let sender_hash = self.compute_id_hash(self.node_id());
         let ack = Ack { hash, sender_hash };
         let msg = Message::Ack(ack);
 
@@ -138,26 +170,35 @@ where
         // Don't track drops for ACKs - they're best-effort
     }
 
-    /// Handle a bounce-back: message returned with different TTL during tree restructuring.
+    /// Handle a bounce-back: message returned with different hops during tree restructuring.
     ///
     /// Instead of dropping, we delay and retry with exponential backoff, giving the tree
     /// time to stabilize. Uses the same timing as ACK retransmits (1τ, 2τ, ..., 128τ) and
     /// gives up after MAX_RETRIES attempts.
+    ///
+    /// # Hops Terminology
+    ///
+    /// - `incoming_hops`: The hops value on the message we just received (after our increment)
+    /// - `stored_hops`: The hops value we recorded when we first forwarded this message
+    /// - When `incoming_hops != stored_hops`, the message has bounced (routing loop)
+    ///
+    /// We restore `msg.hops` to `stored_hops` before retrying so future duplicate detection
+    /// can distinguish retransmissions from new bounces.
     fn handle_bounce_back(
         &mut self,
         mut msg: Routed,
         ack_hash: AckHash,
-        original_ttl: u8,
+        incoming_hops: u32,
         now: Timestamp,
     ) {
-        use crate::types::{MAX_RETRIES, RECENTLY_FORWARDED_TTL_MULTIPLIER};
+        use crate::types::{DEFAULT_TTL, MAX_RETRIES, RECENTLY_FORWARDED_TTL_MULTIPLIER};
 
         // Always ACK upstream so they don't retry while we delay (or drop)
         self.send_explicit_ack(ack_hash);
 
-        // TTL=1 would become TTL=0 (expired) on forward - just drop it
-        // Note: msg.ttl is already decremented, so check original_ttl
-        if original_ttl <= 1 {
+        // TTL check: if TTL is already 0 after decrement, drop
+        // Note: msg.ttl is already decremented in handle_routed
+        if msg.ttl == 0 {
             return;
         }
 
@@ -165,17 +206,17 @@ where
         self.pending_acks_mut().remove(&ack_hash);
 
         // Update recently_forwarded entry: increment seen_count and refresh expiration.
-        // Keep the original stored TTL (first-forward TTL) for restoration - don't update it.
-        let (seen_count, first_forward_ttl) =
+        // Keep the stored_hops unchanged - it's the value from our first forward.
+        let (seen_count, stored_hops) =
             if let Some(entry) = self.recently_forwarded_mut().get_mut(&ack_hash) {
                 entry.0 = now; // Refresh timestamp
-                let stored_ttl = entry.1; // Keep original TTL for restoration
+                let hops_on_first_forward = entry.1; // Preserve for duplicate detection
                 entry.2 = entry.2.saturating_add(1); // Increment seen_count
-                (entry.2, stored_ttl)
+                (entry.2, hops_on_first_forward)
             } else {
-                // Entry was evicted - recreate it with current TTL as best guess
-                self.insert_recently_forwarded(ack_hash, original_ttl, now);
-                (1, original_ttl)
+                // Entry was evicted - recreate with current hops as best guess
+                self.insert_recently_forwarded(ack_hash, incoming_hops, now);
+                (1, incoming_hops)
             };
 
         // Give up after MAX_RETRIES, same as ACK timeout behavior
@@ -183,10 +224,12 @@ where
             return;
         }
 
-        // Restore to the TTL when we first forwarded this message.
-        // Bounce-back retries are like retransmits, not new hops.
-        // TTL should only decrement for actual forward progress, not for bounce retries.
-        msg.ttl = first_forward_ttl;
+        // Reset TTL to DEFAULT_TTL for bounce-back retry.
+        // With hops-based detection, we can refresh TTL without losing duplicate detection.
+        // This allows the message more hops to find its destination during tree restructuring.
+        msg.ttl = DEFAULT_TTL;
+        // Restore hops to stored value so duplicate detection works correctly on retry
+        msg.hops = stored_hops;
 
         // Schedule delayed forward with exponential backoff
         // Backoff: 1τ, 2τ, 4τ, 8τ, ..., capped at 128τ (same as ACK retransmit timing)
@@ -275,7 +318,8 @@ where
 
     /// Process delayed forwards whose scheduled time has arrived.
     ///
-    /// For each ready entry: recompute next_hop and forward if TTL permits.
+    /// For each ready entry: recompute route and forward if TTL permits.
+    /// Uses `route_message()` which handles routing and queuing.
     pub(crate) fn handle_delayed_forwards(&mut self, now: Timestamp) {
         // Two-phase approach to avoid cloning Routed messages (which contain Vec<u8> payload):
         // 1. Collect just the keys of ready entries (cheap 4-byte AckHash copies)
@@ -292,32 +336,25 @@ where
             let Some(entry) = self.delayed_forwards_mut().remove(&ack_hash) else {
                 continue;
             };
-            let mut msg = entry.msg;
+            let msg = entry.msg;
 
             // TTL was already decremented when message was received
             if msg.ttl == 0 {
                 continue;
             }
 
-            // Recompute route: prefer child/shortcut, fall back to parent
-            let dest = msg.dest_addr;
-            let next_hop_id = self.best_next_hop(dest).or_else(|| self.parent());
-
             emit_debug!(
                 self,
                 crate::debug::DebugEvent::DelayedForwardExecuted {
                     payload_hash: msg.payload_hash(self.crypto()),
                     msg_type: msg.msg_type(),
-                    dest_addr: dest,
+                    dest_addr: msg.dest_addr,
                     ttl: msg.ttl,
-                    has_route: next_hop_id.is_some(),
+                    has_route: self.route_to(msg.dest_addr).is_some(),
                 }
             );
 
-            if let Some(hop_id) = next_hop_id {
-                msg.next_hop = self.compute_node_hash(&hop_id);
-                self.send_to_neighbor(hop_id, msg, now);
-            }
+            let _ = self.route_message(msg, now);
         }
     }
 
@@ -376,90 +413,43 @@ where
     /// Returns false if dest_hash is present but doesn't match.
     pub(crate) fn verify_dest_hash(&self, msg: &Routed) -> bool {
         match msg.dest_hash {
-            Some(dest_hash) => dest_hash == self.compute_node_hash(self.node_id()),
+            Some(dest_hash) => dest_hash == self.compute_id_hash(self.node_id()),
             None => true, // No dest_hash to verify
-        }
-    }
-
-    /// Forward a routed message toward its destination.
-    fn forward_routed(&mut self, mut msg: Routed, now: Timestamp) {
-        let dest = msg.dest_addr;
-
-        // Try to find best next hop
-        if let Some(next_hop_id) = self.best_next_hop(dest) {
-            emit_debug!(
-                self,
-                crate::debug::DebugEvent::RoutedForwardedDown {
-                    payload_hash: msg.payload_hash(self.crypto()),
-                    msg_type: msg.msg_type(),
-                    dest_addr: dest,
-                    next_hop: next_hop_id,
-                    ttl: msg.ttl,
-                    my_keyspace: self.keyspace_range(),
-                }
-            );
-            // Set next_hop to the intended forwarder's hash
-            msg.next_hop = self.compute_node_hash(&next_hop_id);
-            self.send_to_neighbor(next_hop_id, msg, now);
-        } else if let Some(parent_id) = self.parent() {
-            emit_debug!(
-                self,
-                crate::debug::DebugEvent::RoutedForwardedUp {
-                    payload_hash: msg.payload_hash(self.crypto()),
-                    msg_type: msg.msg_type(),
-                    dest_addr: dest,
-                    next_hop: parent_id,
-                    ttl: msg.ttl,
-                    my_keyspace: self.keyspace_range(),
-                }
-            );
-            // Forward upward to parent as fallback
-            msg.next_hop = self.compute_node_hash(&parent_id);
-            self.send_to_neighbor(parent_id, msg, now);
-        } else {
-            // No route - drop the message
-            emit_debug!(
-                self,
-                crate::debug::DebugEvent::RoutedDropped {
-                    payload_hash: msg.payload_hash(self.crypto()),
-                    msg_type: msg.msg_type(),
-                    dest_addr: dest,
-                    reason: "no route (no next_hop or parent)",
-                }
-            );
         }
     }
 
     /// Find the best next hop for a destination keyspace address.
     ///
-    /// Returns the neighbor (child or shortcut) whose keyspace range:
+    /// Returns the same-tree neighbor (from neighbor_times) whose keyspace range:
     /// 1. Contains the destination address
     /// 2. Has the tightest range (smallest hi - lo)
+    ///
+    /// Uses pulse-reported keyspace_range from neighbor_times for all neighbors,
+    /// filtering by same tree (root_hash). Parent is excluded (fallback only).
+    ///
+    /// Note: After a child joins and we assign them a new range, there's a brief
+    /// window (~3τ) until they pulse back with their updated range. During this
+    /// window, routing uses their old range. This is acceptable - messages will
+    /// still route correctly via parent fallback, and the window is short.
     fn best_next_hop(&self, dest: u32) -> Option<NodeId> {
         let mut best: Option<(NodeId, u64)> = None; // (node_id, range_size)
+        let my_root = *self.root_hash();
 
-        // Check children
-        for (_, entry) in self.children().iter_by_hash() {
-            let lo = entry.keyspace_lo;
-            let hi = entry.keyspace_hi;
-            if dest >= lo && dest < hi {
-                let range_size = (hi as u64).saturating_sub(lo as u64);
-                if best.map_or(true, |(_, best_size)| range_size < best_size) {
-                    best = Some((entry.node_id, range_size));
-                    // Early exit: can't find a tighter range than size 1
-                    if range_size == 1 {
-                        return best.map(|(id, _)| id);
-                    }
-                }
+        // Check all same-tree neighbors (ranges from their pulses)
+        for (neighbor_id, timing) in self.neighbor_times() {
+            // Skip parent (fallback only) and different trees
+            if self.parent() == Some(*neighbor_id) {
+                continue;
             }
-        }
+            if timing.root_hash != my_root {
+                continue;
+            }
 
-        // Check shortcuts
-        for (shortcut_id, &(lo, hi)) in self.shortcuts() {
+            let (lo, hi) = timing.keyspace_range;
             if dest >= lo && dest < hi {
                 let range_size = (hi as u64).saturating_sub(lo as u64);
                 if best.map_or(true, |(_, best_size)| range_size < best_size) {
-                    best = Some((*shortcut_id, range_size));
+                    best = Some((*neighbor_id, range_size));
                     // Early exit: can't find a tighter range than size 1
                     if range_size == 1 {
                         return best.map(|(id, _)| id);
@@ -471,39 +461,187 @@ where
         best.map(|(node_id, _)| node_id)
     }
 
-    /// Broadcast a Routed message with ACK tracking.
+    /// Get what we believe a neighbor's keyspace range is (from their last pulse).
+    /// Debug-only helper for routing decision logging.
+    #[cfg(feature = "debug")]
+    fn believed_keyspace(&self, id: &NodeId) -> (u32, u32) {
+        self.neighbor_times()
+            .get(id)
+            .map(|t| t.keyspace_range)
+            .unwrap_or((0, 0))
+    }
+
+    /// Single source of truth for routing decisions.
     ///
-    /// On broadcast radio (LoRa), all neighbors within range receive the message.
-    /// The `neighbor` parameter documents routing intent for logging/debugging
-    /// and enables future directed-transmission optimizations on point-to-point transports.
+    /// Returns (NodeId, IdHash) for the next hop, or None if no route available.
+    /// Tries child/shortcut routing first. Falls back to parent only if dest is
+    /// OUTSIDE our subtree keyspace. If dest is inside our subtree but no child
+    /// covers it yet (stale keyspace info), returns None so caller can queue.
+    fn route_to(&self, dest: u32) -> Option<(NodeId, IdHash)> {
+        if let Some(id) = self.best_next_hop(dest) {
+            #[cfg(feature = "debug")]
+            if self.has_emitter() {
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::RoutingDecision {
+                        dest_addr: dest,
+                        selected: id,
+                        believed_keyspace: self.believed_keyspace(&id),
+                        is_parent_fallback: false,
+                    }
+                );
+            }
+            return Some((id, self.compute_id_hash(&id)));
+        }
+
+        // No child/shortcut covers dest. Check if dest is in our subtree keyspace.
+        // If yes, we should queue rather than bounce to parent (child hasn't pulsed yet).
+        // If no, dest is outside our subtree and we should route up to parent.
+        let (ks_lo, ks_hi) = self.keyspace_range();
+        let in_subtree = (dest as u64) >= (ks_lo as u64) && (dest as u64) < (ks_hi as u64);
+
+        if in_subtree && !self.owns_key(dest) {
+            // Dest is in our subtree but we don't own it personally, and no child
+            // has pulsed with a range covering it. Queue for retry when child pulses.
+            return None;
+        }
+
+        if let Some(id) = self.parent() {
+            #[cfg(feature = "debug")]
+            if self.has_emitter() {
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::RoutingDecision {
+                        dest_addr: dest,
+                        selected: id,
+                        believed_keyspace: self.believed_keyspace(&id),
+                        is_parent_fallback: true,
+                    }
+                );
+            }
+            return Some((id, self.compute_id_hash(&id)));
+        }
+        None
+    }
+
+    /// Record a sent message, categorizing by app vs protocol traffic.
+    fn record_routed_sent(&mut self, is_app_data: bool) {
+        if is_app_data {
+            self.record_app_sent();
+        } else {
+            self.record_protocol_sent();
+        }
+    }
+
+    /// Record a dropped message, categorizing by app vs protocol traffic.
+    fn record_routed_dropped(&mut self, is_app_data: bool) {
+        if is_app_data {
+            self.record_app_dropped();
+        } else {
+            self.record_protocol_dropped();
+        }
+    }
+
+    /// Low-level transmission with ACK tracking.
     ///
-    /// Inserts the message hash into pending_acks for retransmission if no ACK is received.
-    fn send_to_neighbor(&mut self, _neighbor: NodeId, msg: Routed, now: Timestamp) {
+    /// Takes ReadyRouted to ensure at compile time that next_hop is set.
+    /// Always tracks ACK for retransmission. Derives is_app_data from msg_type.
+    /// Returns error if message too large or queue full.
+    fn transmit_with_ack(&mut self, ready: ReadyRouted, now: Timestamp) -> Result<(), Error> {
+        let msg = ready.into_inner();
+        let is_app_data = msg.msg_type() == MSG_DATA;
+        let ack_hash = msg.ack_hash(self.crypto());
         let sent_ttl = msg.ttl;
 
-        // Compute ACK hash while we still have &msg (avoids cloning)
-        let ack_hash = msg.ack_hash(self.crypto());
-
-        // Move msg into Message (no clone needed)
         let wire_msg = Message::Routed(msg);
         let priority = wire_msg.priority();
         let encoded = wire_msg.encode_to_vec();
 
         if encoded.len() > self.transport().mtu() {
-            self.record_protocol_dropped();
-            return;
+            self.record_routed_dropped(is_app_data);
+            return Err(Error::MessageTooLarge);
         }
 
-        // Track pending ACK before sending (with TTL for implicit ACK verification)
+        // Always track ACK for retransmission
         self.insert_pending_ack(ack_hash, encoded, priority, sent_ttl, now);
 
-        // Broadcast (neighbors will hear it) - priority determined by message type
         if self.transport().outgoing().try_send(wire_msg) {
-            self.record_protocol_sent();
+            self.record_routed_sent(is_app_data);
+            Ok(())
         } else {
-            // Send failed - remove pending ACK since we never actually sent
             self.pending_acks_mut().remove(&ack_hash);
-            self.record_protocol_dropped();
+            self.record_routed_dropped(is_app_data);
+            Err(Error::QueueFull)
+        }
+    }
+
+    /// Dispatch a routed message to the appropriate handler based on msg_type.
+    ///
+    /// This is the single point of message type dispatch, used by:
+    /// - handle_routed (for delivered and opportunistic messages)
+    /// - route_message (when we now own the destination)
+    fn dispatch_routed(&mut self, msg: Routed, now: Timestamp) {
+        match msg.msg_type() {
+            MSG_PUBLISH => self.handle_publish(msg, now),
+            MSG_LOOKUP => self.handle_lookup_msg(msg, now),
+            MSG_FOUND => self.handle_found(msg, now),
+            MSG_DATA => self.handle_data(msg, now),
+            _ => {} // Unknown type, drop silently
+        }
+    }
+
+    /// Unified routing for all cases: originate, forward, delayed, retry.
+    ///
+    /// Checks ownership first (keyspace may have changed), then routes via
+    /// route_to() or queues if no route available.
+    fn route_message(&mut self, msg: Routed, now: Timestamp) -> Result<(), Error> {
+        let dest = msg.dest_addr;
+
+        // Check if we (now) own the destination
+        // Keyspace changes during tree formation, so always check
+        if self.owns_key(dest) {
+            self.dispatch_routed(msg, now);
+            return Ok(());
+        }
+
+        // Try to find a route
+        #[allow(unused_variables)] // next_hop_id only used in debug builds
+        if let Some((next_hop_id, next_hop_hash)) = self.route_to(dest) {
+            // Emit forwarding debug event
+            #[cfg(feature = "debug")]
+            {
+                let direction = if self.parent() == Some(next_hop_id) {
+                    "up"
+                } else {
+                    "down"
+                };
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::RoutedForwarded {
+                        payload_hash: msg.payload_hash(self.crypto()),
+                        msg_type: msg.msg_type(),
+                        dest_addr: dest,
+                        next_hop: next_hop_id,
+                        ttl: msg.ttl,
+                        my_keyspace: self.keyspace_range(),
+                        direction,
+                    }
+                );
+            }
+
+            let ready = ReadyRouted::new(msg, next_hop_hash);
+            self.transmit_with_ack(ready, now)
+        } else {
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::RoutedQueued {
+                    payload_hash: msg.payload_hash(self.crypto()),
+                    msg_type: msg.msg_type(),
+                    dest_addr: dest,
+                }
+            );
+            self.queue_pending_routed(msg);
+            Ok(())
         }
     }
 
@@ -538,7 +676,7 @@ where
         payload: Vec<u8>,
         _now: Timestamp,
     ) -> Result<(), Error> {
-        let dest_hash = self.compute_node_hash(&target);
+        let dest_hash = self.compute_id_hash(&target);
 
         let msg = self.build_routed(dest_addr, Some(dest_hash), MSG_DATA, payload);
         self.send_routed(msg)
@@ -548,32 +686,35 @@ where
     pub(crate) fn build_routed(
         &mut self,
         dest_addr: u32,
-        dest_hash: Option<ChildHash>,
+        dest_hash: Option<IdHash>,
         msg_type: u8,
         payload: Vec<u8>,
     ) -> Routed {
-        self.build_routed_inner(dest_addr, dest_hash, msg_type, payload, false)
+        // Include src_addr for messages expecting replies (DATA, LOOKUP)
+        self.build_routed_inner(dest_addr, dest_hash, msg_type, payload, true, false)
     }
 
-    /// Build a Routed message without dest_hash, always including pubkey (for PUBLISH).
-    /// PUBLISH messages go to potentially distant storage nodes that need our pubkey.
+    /// Build a Routed message that doesn't expect a reply (PUBLISH, FOUND).
+    /// No src_addr (saves 4 bytes). Set force_pubkey=true for PUBLISH (distant nodes need it).
     pub(crate) fn build_routed_no_reply(
         &mut self,
         dest_addr: u32,
+        dest_hash: Option<IdHash>,
         msg_type: u8,
         payload: Vec<u8>,
+        force_pubkey: bool,
     ) -> Routed {
-        // Always include pubkey for PUBLISH - storage nodes likely don't have it cached
-        self.build_routed_inner(dest_addr, None, msg_type, payload, true)
+        self.build_routed_inner(dest_addr, dest_hash, msg_type, payload, false, force_pubkey)
     }
 
     /// Internal helper to build Routed messages.
     fn build_routed_inner(
         &mut self,
         dest_addr: u32,
-        dest_hash: Option<ChildHash>,
+        dest_hash: Option<IdHash>,
         msg_type: u8,
         payload: Vec<u8>,
+        include_src_addr: bool,
         force_pubkey: bool,
     ) -> Routed {
         let include_pubkey = force_pubkey || !self.neighbors_need_pubkey().is_empty();
@@ -581,26 +722,24 @@ where
         let flags_and_type = Routed::build_flags_and_type(
             msg_type,
             dest_hash.is_some(),
-            true, // always include src_addr for replies
+            include_src_addr,
             include_pubkey,
         );
 
         // Compute initial next_hop based on routing decision
-        let next_hop = if let Some(next_hop_id) = self.best_next_hop(dest_addr) {
-            self.compute_node_hash(&next_hop_id)
-        } else if let Some(parent_id) = self.parent() {
-            self.compute_node_hash(&parent_id)
-        } else {
-            // No route - use zeros (message may be handled locally or dropped)
-            [0u8; 4]
-        };
+        // Uses route_to() which is the single source of truth
+        let next_hop = self.route_to(dest_addr).map(|(_, hash)| hash);
 
         let mut msg = Routed {
             flags_and_type,
             next_hop,
             dest_addr,
             dest_hash,
-            src_addr: Some(self.my_address()),
+            src_addr: if include_src_addr {
+                Some(self.my_address())
+            } else {
+                None
+            },
             src_node_id: *self.node_id(),
             src_pubkey: if include_pubkey {
                 Some(*self.pubkey())
@@ -608,6 +747,7 @@ where
                 None
             },
             ttl: DEFAULT_TTL,
+            hops: 0,
             payload,
             signature: Signature::default(),
         };
@@ -618,75 +758,73 @@ where
         msg
     }
 
-    /// Send a Routed message.
+    /// Send a Routed message (for originated messages).
+    ///
+    /// Thin wrapper that emits RoutedSent debug event, then delegates to route_message().
+    /// All messages now track ACK for retransmission.
     pub(crate) fn send_routed(&mut self, msg: Routed) -> Result<(), Error> {
-        let dest = msg.dest_addr;
-        let msg_type = msg.msg_type();
-        #[cfg(feature = "debug")]
-        let payload_hash = if crate::debug::HasDebugEmitter::has_emitter(self) {
-            msg.payload_hash(self.crypto())
-        } else {
-            [0; 4] // Placeholder, never used since emit_debug! also checks emitter
-        };
-
         emit_debug!(
             self,
             crate::debug::DebugEvent::RoutedSent {
-                payload_hash,
-                msg_type,
-                dest_addr: dest,
+                payload_hash: msg.payload_hash(self.crypto()),
+                msg_type: msg.msg_type(),
+                dest_addr: msg.dest_addr,
                 ttl: msg.ttl,
             }
         );
 
-        // If we own the destination, handle locally
-        if self.owns_key(dest) {
-            let wire_msg = Message::Routed(msg.clone());
-            if wire_msg.encode_to_vec().len() > self.transport().mtu() {
-                return Err(Error::MessageTooLarge);
-            }
-            // Handle locally as if we received it
-            let now = self.now();
-            match msg_type {
-                MSG_PUBLISH => self.handle_publish(msg, now),
-                MSG_LOOKUP => self.handle_lookup_msg(msg, now),
-                MSG_FOUND => self.handle_found(msg, now),
-                MSG_DATA => self.handle_data(msg, now),
-                _ => {}
-            }
-            return Ok(());
+        let now = self.now();
+        self.route_message(msg, now)
+    }
+
+    /// Queue a routed message for later retry when no route is available.
+    ///
+    /// Used by roots when a child hasn't yet pulsed with their assigned keyspace range.
+    fn queue_pending_routed(&mut self, msg: Routed) {
+        use crate::node::PendingRouted;
+
+        let now = self.now();
+
+        // Evict oldest if at capacity
+        if self.pending_routed().len() >= Cfg::MAX_PENDING_ROUTED {
+            self.pending_routed_mut().remove(0);
         }
 
-        // Build message - priority is determined automatically by msg_type
-        let wire_msg = Message::Routed(msg);
+        self.pending_routed_mut().push(PendingRouted {
+            msg,
+            queued_at: now,
+        });
+    }
 
-        if wire_msg.encode_to_vec().len() > self.transport().mtu() {
-            return Err(Error::MessageTooLarge);
-        }
+    /// Re-check pending routed messages after receiving a pulse.
+    ///
+    /// A neighbor's updated keyspace_range might now cover queued destinations.
+    /// Called from handle_pulse after updating neighbor_times.
+    pub(crate) fn retry_pending_routed(&mut self) {
+        // Take ownership of pending_routed, partition into routable vs not-yet-routable,
+        // then put non-routable ones back. This avoids double iteration.
+        let pending = core::mem::take(self.pending_routed_mut());
 
-        // Send via priority queue - priority determined by Message::priority()
-        if self.transport().outgoing().try_send(wire_msg) {
-            if msg_type == MSG_DATA {
-                self.record_app_sent();
-            } else {
-                self.record_protocol_sent();
-            }
-            Ok(())
-        } else {
+        let (routable, still_pending): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|p| self.route_to(p.msg.dest_addr).is_some());
+
+        // Put non-routable messages back
+        *self.pending_routed_mut() = still_pending;
+
+        // Re-send each routable message
+        let now = self.now();
+        for pending in routable {
             emit_debug!(
                 self,
-                crate::debug::DebugEvent::OutgoingQueueFull {
-                    payload_hash,
-                    msg_type,
-                    dest_addr: dest,
+                crate::debug::DebugEvent::RoutedRetried {
+                    payload_hash: pending.msg.payload_hash(self.crypto()),
+                    msg_type: pending.msg.msg_type(),
+                    dest_addr: pending.msg.dest_addr,
                 }
             );
-            if msg_type == MSG_DATA {
-                self.record_app_dropped();
-            } else {
-                self.record_protocol_dropped();
-            }
-            Err(Error::QueueFull)
+
+            let _ = self.route_message(pending.msg, now);
         }
     }
 
@@ -713,7 +851,7 @@ where
             let idx = self.random_mut().gen_u32() as usize % neighbors.len();
             if selected.insert(idx) {
                 let neighbor_id = neighbors[idx];
-                let hash = self.compute_node_hash(&neighbor_id);
+                let hash = self.compute_id_hash(&neighbor_id);
                 destinations.push(hash);
             }
         }
@@ -921,104 +1059,121 @@ mod tests {
         assert_ne!(addr0, other_addr);
     }
 
-    #[test]
-    fn test_best_next_hop_returns_child_in_range() {
-        let mut node = make_node();
-
-        // Add a child with keyspace range [1000, 2000)
-        let child_id: NodeId = [1u8; 16];
-        let child_hash = node.compute_node_hash(&child_id);
-        node.children_mut().insert(child_hash, child_id, 1);
-        node.children_mut().set_range(&child_id, 1000, 2000);
-
-        // Destination within child's range should return child
-        assert_eq!(node.best_next_hop(1500), Some(child_id));
-
-        // Destination outside any child range should return None
-        assert_eq!(node.best_next_hop(500), None);
-        assert_eq!(node.best_next_hop(3000), None);
+    /// Helper to insert a neighbor for routing tests.
+    /// Sets up neighbor_times entry with same root_hash as the node.
+    fn insert_neighbor_for_routing(node: &mut TestNode, id: NodeId, range: (u32, u32)) {
+        use crate::node::NeighborTiming;
+        let root_hash = *node.root_hash(); // Get before mutable borrow
+        node.neighbor_times_mut().insert(
+            id,
+            NeighborTiming {
+                last_seen: Timestamp::ZERO,
+                rssi: None,
+                root_hash, // Same tree
+                tree_size: 1,
+                keyspace_range: range,
+                children_count: 0,
+                depth: 0,
+                max_depth: 0,
+                unstable: false,
+            },
+        );
     }
 
     #[test]
-    fn test_best_next_hop_returns_shortcut_in_range() {
+    fn test_best_next_hop_returns_neighbor_in_range() {
         let mut node = make_node();
 
-        // Add a shortcut with keyspace range [5000, 6000)
-        let shortcut_id: NodeId = [2u8; 16];
-        node.shortcuts_mut().insert(shortcut_id, (5000, 6000));
+        // Add a neighbor with keyspace range [1000, 2000)
+        let neighbor_id: NodeId = [1u8; 16];
+        insert_neighbor_for_routing(&mut node, neighbor_id, (1000, 2000));
 
-        // Destination within shortcut's range should return shortcut
-        assert_eq!(node.best_next_hop(5500), Some(shortcut_id));
+        // Destination within neighbor's range should return neighbor
+        assert_eq!(node.best_next_hop(1500), Some(neighbor_id));
 
-        // Destination outside any range should return None
-        assert_eq!(node.best_next_hop(4000), None);
+        // Destination outside any neighbor range should return None
+        assert_eq!(node.best_next_hop(500), None);
+        assert_eq!(node.best_next_hop(3000), None);
     }
 
     #[test]
     fn test_best_next_hop_prefers_tighter_range() {
         let mut node = make_node();
 
-        // Add a child with wide range [0, 10000)
-        let wide_child: NodeId = [1u8; 16];
-        let wide_hash = node.compute_node_hash(&wide_child);
-        node.children_mut().insert(wide_hash, wide_child, 1);
-        node.children_mut().set_range(&wide_child, 0, 10000);
+        // Add a neighbor with wide range [0, 10000)
+        let wide_neighbor: NodeId = [1u8; 16];
+        insert_neighbor_for_routing(&mut node, wide_neighbor, (0, 10000));
 
-        // Add a shortcut with tight range [4000, 6000)
-        let tight_shortcut: NodeId = [2u8; 16];
-        node.shortcuts_mut().insert(tight_shortcut, (4000, 6000));
+        // Add a neighbor with tight range [4000, 6000)
+        let tight_neighbor: NodeId = [2u8; 16];
+        insert_neighbor_for_routing(&mut node, tight_neighbor, (4000, 6000));
 
         // Destination 5000 is in both ranges - should prefer tighter range
-        assert_eq!(node.best_next_hop(5000), Some(tight_shortcut));
+        assert_eq!(node.best_next_hop(5000), Some(tight_neighbor));
 
         // Destination 1000 is only in wide range
-        assert_eq!(node.best_next_hop(1000), Some(wide_child));
+        assert_eq!(node.best_next_hop(1000), Some(wide_neighbor));
     }
 
     #[test]
-    fn test_best_next_hop_child_tighter_than_shortcut() {
+    fn test_best_next_hop_multiple_neighbors() {
         let mut node = make_node();
 
-        // Add a shortcut with wide range [0, 20000)
-        let wide_shortcut: NodeId = [1u8; 16];
-        node.shortcuts_mut().insert(wide_shortcut, (0, 20000));
+        // Add multiple non-overlapping neighbors
+        let neighbor1: NodeId = [1u8; 16];
+        let neighbor2: NodeId = [2u8; 16];
+        let neighbor3: NodeId = [3u8; 16];
 
-        // Add a child with tight range [5000, 7000)
-        let tight_child: NodeId = [2u8; 16];
-        let tight_hash = node.compute_node_hash(&tight_child);
-        node.children_mut().insert(tight_hash, tight_child, 1);
-        node.children_mut().set_range(&tight_child, 5000, 7000);
+        insert_neighbor_for_routing(&mut node, neighbor1, (0, 1000));
+        insert_neighbor_for_routing(&mut node, neighbor2, (1000, 2000));
+        insert_neighbor_for_routing(&mut node, neighbor3, (2000, 3000));
 
-        // Destination 6000 is in both ranges - should prefer tighter child
-        assert_eq!(node.best_next_hop(6000), Some(tight_child));
-    }
-
-    #[test]
-    fn test_best_next_hop_multiple_children() {
-        let mut node = make_node();
-
-        // Add multiple non-overlapping children
-        let child1: NodeId = [1u8; 16];
-        let child2: NodeId = [2u8; 16];
-        let child3: NodeId = [3u8; 16];
-
-        let hash1 = node.compute_node_hash(&child1);
-        let hash2 = node.compute_node_hash(&child2);
-        let hash3 = node.compute_node_hash(&child3);
-
-        node.children_mut().insert(hash1, child1, 1);
-        node.children_mut().set_range(&child1, 0, 1000);
-        node.children_mut().insert(hash2, child2, 1);
-        node.children_mut().set_range(&child2, 1000, 2000);
-        node.children_mut().insert(hash3, child3, 1);
-        node.children_mut().set_range(&child3, 2000, 3000);
-
-        // Each destination should route to correct child
-        assert_eq!(node.best_next_hop(500), Some(child1));
-        assert_eq!(node.best_next_hop(1500), Some(child2));
-        assert_eq!(node.best_next_hop(2500), Some(child3));
+        // Each destination should route to correct neighbor
+        assert_eq!(node.best_next_hop(500), Some(neighbor1));
+        assert_eq!(node.best_next_hop(1500), Some(neighbor2));
+        assert_eq!(node.best_next_hop(2500), Some(neighbor3));
 
         // Outside all ranges
+        assert_eq!(node.best_next_hop(5000), None);
+    }
+
+    #[test]
+    fn test_best_next_hop_ignores_different_tree() {
+        let mut node = make_node();
+
+        // Insert neighbor with DIFFERENT root_hash (different tree)
+        let other_tree_neighbor: NodeId = [99u8; 16];
+        node.neighbor_times_mut().insert(
+            other_tree_neighbor,
+            crate::node::NeighborTiming {
+                last_seen: Timestamp::ZERO,
+                rssi: None,
+                root_hash: [0xFF, 0xFF, 0xFF, 0xFF], // Different tree
+                tree_size: 100,
+                keyspace_range: (0, 10000), // Would match dest
+                children_count: 0,
+                depth: 0,
+                max_depth: 0,
+                unstable: false,
+            },
+        );
+
+        // Should return None (no same-tree neighbor matches)
+        assert_eq!(node.best_next_hop(5000), None);
+    }
+
+    #[test]
+    fn test_best_next_hop_ignores_parent() {
+        let mut node = make_node();
+
+        // Set up a parent
+        let parent_id: NodeId = [10u8; 16];
+        node.set_parent(Some(parent_id));
+
+        // Add parent to neighbor_times with a range that contains our destination
+        insert_neighbor_for_routing(&mut node, parent_id, (0, 10000));
+
+        // Parent should be skipped (it's fallback only), so no match
         assert_eq!(node.best_next_hop(5000), None);
     }
 
@@ -1029,26 +1184,28 @@ mod tests {
 
         let msg1 = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
-            next_hop: [0u8; 4],
+            next_hop: Some([0u8; 4]),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
             src_node_id: [7u8; 16],
             src_pubkey: None,
             ttl: 255, // High TTL
+            hops: 0,
             payload: b"test payload".to_vec(),
             signature: Signature::default(),
         };
 
         let mut msg2 = msg1.clone();
         msg2.ttl = 100; // Different TTL
+        msg2.hops = 5; // Different hops
 
         let hash1 = msg1.ack_hash(node.crypto());
         let hash2 = msg2.ack_hash(node.crypto());
 
         assert_eq!(
             hash1, hash2,
-            "ACK hash should be invariant across TTL values"
+            "ACK hash should be invariant across TTL and hops values"
         );
     }
 
@@ -1059,13 +1216,14 @@ mod tests {
 
         let msg1 = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
-            next_hop: [0u8; 4],
+            next_hop: Some([0u8; 4]),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
             src_node_id: [7u8; 16],
             src_pubkey: None,
             ttl: 255,
+            hops: 0,
             payload: b"AAAA".to_vec(),
             signature: Signature::default(),
         };
@@ -1091,13 +1249,14 @@ mod tests {
         // Create a message and compute its hash
         let msg = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
-            next_hop: [0u8; 4],
+            next_hop: Some([0u8; 4]),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
             src_node_id: [7u8; 16],
             src_pubkey: None,
             ttl: 255,
+            hops: 0,
             payload: b"test".to_vec(),
             signature: Signature::default(),
         };
@@ -1139,13 +1298,14 @@ mod tests {
 
         let msg = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
-            next_hop: [0u8; 4],
+            next_hop: Some([0u8; 4]),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
             src_node_id: [7u8; 16],
             src_pubkey: None,
             ttl: 255,
+            hops: 0,
             payload: b"test".to_vec(),
             signature: Signature::default(),
         };
@@ -1155,8 +1315,8 @@ mod tests {
         // Initially not tracked
         assert!(!node.recently_forwarded().contains_key(&hash));
 
-        // Insert into recently_forwarded (with TTL)
-        node.insert_recently_forwarded(hash, 255, now);
+        // Insert into recently_forwarded (with hops)
+        node.insert_recently_forwarded(hash, 0, now);
 
         // Should now be tracked
         assert!(node.recently_forwarded().contains_key(&hash));
@@ -1263,14 +1423,14 @@ mod tests {
         // Fill pending_acks to capacity (using DefaultConfig)
         for i in 0..DefaultConfig::MAX_PENDING_ACKS {
             let hash: [u8; 4] = [i as u8; 4];
-            node.insert_pending_ack(hash, vec![i as u8], Priority::RoutedProtocol, 255, now);
+            node.insert_pending_ack(hash, vec![i as u8], Priority::RoutedPublish, 255, now);
         }
 
         assert_eq!(node.pending_acks().len(), DefaultConfig::MAX_PENDING_ACKS);
 
         // Insert one more - should evict oldest
         let new_hash: [u8; 4] = [0xFF; 4];
-        node.insert_pending_ack(new_hash, vec![0xFF], Priority::RoutedProtocol, 255, now);
+        node.insert_pending_ack(new_hash, vec![0xFF], Priority::RoutedPublish, 255, now);
 
         // Should still be at capacity (not exceed)
         assert_eq!(
@@ -1325,13 +1485,14 @@ mod tests {
 
         let msg = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
-            next_hop: [0u8; 4],
+            next_hop: Some([0u8; 4]),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
             src_node_id: [7u8; 16],
             src_pubkey: None,
             ttl: 255,
+            hops: 0,
             payload: b"test".to_vec(),
             signature: Signature::default(),
         };
@@ -1339,7 +1500,7 @@ mod tests {
         let hash = msg.ack_hash(node.crypto());
 
         // Mark as recently forwarded (simulating first forward)
-        node.insert_recently_forwarded(hash, 255, now);
+        node.insert_recently_forwarded(hash, 0, now);
 
         // Clear any messages in transport
         node.transport().take_sent();
@@ -1363,7 +1524,7 @@ mod tests {
         // Fill to capacity
         for i in 0..SmallConfig::MAX_PENDING_ACKS {
             let hash: [u8; 4] = [i as u8; 4];
-            node.insert_pending_ack(hash, vec![i as u8], Priority::RoutedProtocol, 255, now);
+            node.insert_pending_ack(hash, vec![i as u8], Priority::RoutedPublish, 255, now);
         }
 
         assert_eq!(
@@ -1374,7 +1535,7 @@ mod tests {
 
         // Insert one more - should evict oldest
         let new_hash: [u8; 4] = [0xFF; 4];
-        node.insert_pending_ack(new_hash, vec![0xFF], Priority::RoutedProtocol, 255, now);
+        node.insert_pending_ack(new_hash, vec![0xFF], Priority::RoutedPublish, 255, now);
 
         // Should still be at SmallConfig capacity
         assert_eq!(
@@ -1388,14 +1549,14 @@ mod tests {
         );
     }
 
-    /// Test case from simulation: Node 30 should route to Node 33 (child),
-    /// not Node 15 (parent in shortcuts), because Node 33 has tighter keyspace.
+    /// Test case from simulation: Node 30 should route to Node 33 (neighbor with tight range),
+    /// not Node 15 (neighbor with wide range), because Node 33 has tighter keyspace.
     ///
     /// Tree structure (from publish_test_output9.txt):
-    /// - Node 15: ks=[0x13333332,0xbffffffe) - parent, in shortcuts
+    /// - Node 15: ks=[0x13333332,0xbffffffe) - wide range neighbor
     /// - Node 30: ks=[0x19999998,0x46666664) - "us"
-    /// - Node 33: ks=[0x1ffffffe,0x3ffffffd) - child
-    /// - Node 38: ks=[0x3ffffffd,0x46666664) - child
+    /// - Node 33: ks=[0x1ffffffe,0x3ffffffd) - tight range neighbor
+    /// - Node 38: ks=[0x3ffffffd,0x46666664) - neighbor (doesn't cover dest)
     ///
     /// dest_addr = 0x37180340 (924494144) is in:
     /// - Node 15's range (but wider: 0x13333332 to 0xbffffffe)
@@ -1406,29 +1567,22 @@ mod tests {
     fn test_routing_loop_regression() {
         let mut node = make_node();
 
-        // Node 15 (parent) - added to shortcuts with wide range
+        // Node 15 - wide range neighbor
         let node_15: NodeId = [15u8; 16];
-        node.shortcuts_mut()
-            .insert(node_15, (0x13333332, 0xbffffffe));
+        insert_neighbor_for_routing(&mut node, node_15, (0x13333332, 0xbffffffe));
 
-        // Node 33 (child) - tight range covering dest
+        // Node 33 - tight range covering dest
         let node_33: NodeId = [33u8; 16];
-        let hash_33 = node.compute_node_hash(&node_33);
-        node.children_mut().insert(hash_33, node_33, 5);
-        node.children_mut()
-            .set_range(&node_33, 0x1ffffffe, 0x3ffffffd);
+        insert_neighbor_for_routing(&mut node, node_33, (0x1ffffffe, 0x3ffffffd));
 
-        // Node 38 (child) - doesn't cover dest
+        // Node 38 - doesn't cover dest
         let node_38: NodeId = [38u8; 16];
-        let hash_38 = node.compute_node_hash(&node_38);
-        node.children_mut().insert(hash_38, node_38, 1);
-        node.children_mut()
-            .set_range(&node_38, 0x3ffffffd, 0x46666664);
+        insert_neighbor_for_routing(&mut node, node_38, (0x3ffffffd, 0x46666664));
 
         // dest_addr from the simulation
         let dest: u32 = 0x37180340; // 924494144
 
-        // Verify dest is in both ranges
+        // Verify dest is in both Node 15's and Node 33's ranges
         assert!(
             (0x13333332..0xbffffffe).contains(&dest),
             "dest should be in Node 15's range"
@@ -1447,78 +1601,77 @@ mod tests {
         assert_eq!(
             next_hop,
             Some(node_33),
-            "Should route to Node 33 (child with tighter range), not Node 15 (shortcut with wider range)"
+            "Should route to Node 33 (tighter range), not Node 15 (wider range)"
         );
     }
 
-    /// Test TTL=2 edge case: message has TTL=2, gets decremented to TTL=1 on receive,
-    /// then when delayed forward fires, TTL=1 means it can still be forwarded (becomes TTL=0
-    /// at next hop). But TTL=1 on bounce-back should be dropped immediately.
+    /// Test hops-based bounce-back detection and TTL=0 edge case.
+    /// With hops-based detection, TTL can be reset to DEFAULT_TTL on bounce-back retry.
+    /// But if TTL is already 0 after decrement, the message should be dropped.
     #[test]
-    fn test_bounce_back_ttl_2_edge_case() {
+    fn test_bounce_back_hops_based() {
         let mut node = make_node();
         let now = Timestamp::from_secs(100);
 
-        // Create a message with TTL=2 (will be decremented to TTL=1 on receive)
+        // Create a message with hops=0 (will be incremented to hops=1 on receive)
         let msg = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
-            next_hop: [0u8; 4],
+            next_hop: Some([0u8; 4]),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
             src_node_id: [7u8; 16],
             src_pubkey: None,
-            ttl: 1, // Already decremented from 2 to 1
+            ttl: 10, // TTL is still valid
+            hops: 1, // Already incremented from 0 to 1
             payload: b"test".to_vec(),
             signature: Signature::default(),
         };
 
         let hash = msg.ack_hash(node.crypto());
 
-        // Simulate: we forwarded this message before with TTL=2 (original)
-        node.insert_recently_forwarded(hash, 2, now);
+        // Simulate: we forwarded this message before with hops=0 (original)
+        node.insert_recently_forwarded(hash, 0, now);
 
-        // Now it bounces back with TTL=1 (original_ttl=2, but msg.ttl=1 after their decrement)
-        // The bounce-back handler checks original_ttl (the TTL before our decrement)
-        // Since we stored TTL=2, and now see TTL=1, this is a bounce-back
+        // Now it bounces back with hops=1 (original_hops=0, but msg.hops=1 after their increment)
+        // The bounce-back handler detects this because stored_hops (0) != original_hops (1)
+        // It should schedule a delayed forward
 
-        // For TTL=1 case (original_ttl <= 1), we should drop after ACK, not schedule
-        // But here original_ttl=2, so we should schedule
-
-        // Manually call handle_bounce_back with original_ttl=2
-        node.handle_bounce_back(msg.clone(), hash, 2, now);
+        // Manually call handle_bounce_back with original_hops=1
+        node.handle_bounce_back(msg.clone(), hash, 1, now);
 
         // Should have scheduled a delayed forward
         assert_eq!(
             node.delayed_forwards().len(),
             1,
-            "Should schedule delayed forward for TTL=2"
+            "Should schedule delayed forward for bounce-back"
         );
 
-        // Now test TTL=1 case - should NOT schedule
+        // Now test TTL=0 case - should NOT schedule
         let mut node2 = make_node();
-        let msg_ttl1 = Routed {
+        let msg_ttl0 = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
-            next_hop: [0u8; 4],
+            next_hop: Some([0u8; 4]),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
             src_node_id: [8u8; 16], // Different node_id for different hash
             src_pubkey: None,
-            ttl: 0, // Already decremented from 1 to 0
+            ttl: 0, // TTL already 0 (message expired)
+            hops: 1,
             payload: b"test".to_vec(),
             signature: Signature::default(),
         };
-        let hash2 = msg_ttl1.ack_hash(node2.crypto());
-        node2.insert_recently_forwarded(hash2, 1, now);
+        let hash2 = msg_ttl0.ack_hash(node2.crypto());
+        node2.insert_recently_forwarded(hash2, 0, now);
 
-        // original_ttl=1 should cause immediate drop
-        node2.handle_bounce_back(msg_ttl1, hash2, 1, now);
+        // TTL=0 should cause immediate drop
+        node2.handle_bounce_back(msg_ttl0, hash2, 1, now);
 
         assert_eq!(
             node2.delayed_forwards().len(),
             0,
-            "Should NOT schedule delayed forward for TTL=1 (would expire immediately)"
+            "Should NOT schedule delayed forward for TTL=0 (message expired)"
         );
     }
 
@@ -1535,13 +1688,14 @@ mod tests {
         for i in 0..SmallConfig::MAX_DELAYED_FORWARDS {
             let msg = Routed {
                 flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
-                next_hop: [0u8; 4],
+                next_hop: Some([0u8; 4]),
                 dest_addr: 0x1234_5678,
                 dest_hash: None,
                 src_addr: Some(0x8765_4321),
                 src_node_id: [i as u8; 16], // Unique node_id per message
                 src_pubkey: None,
                 ttl: 10,
+                hops: 0,
                 payload: b"test".to_vec(),
                 signature: Signature::default(),
             };
@@ -1561,13 +1715,14 @@ mod tests {
         // Now try to add one with a SHORT delay (should evict the longest)
         let new_msg = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
-            next_hop: [0u8; 4],
+            next_hop: Some([0u8; 4]),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
             src_node_id: [99u8; 16], // New unique node_id
             src_pubkey: None,
             ttl: 10,
+            hops: 0,
             payload: b"new".to_vec(),
             signature: Signature::default(),
         };
@@ -1590,13 +1745,14 @@ mod tests {
         // Try to add one with a LONG delay (should be rejected)
         let long_msg = Routed {
             flags_and_type: Routed::build_flags_and_type(MSG_DATA, false, true, false),
-            next_hop: [0u8; 4],
+            next_hop: Some([0u8; 4]),
             dest_addr: 0x1234_5678,
             dest_hash: None,
             src_addr: Some(0x8765_4321),
             src_node_id: [100u8; 16], // Another unique node_id
             src_pubkey: None,
             ttl: 10,
+            hops: 0,
             payload: b"long".to_vec(),
             signature: Signature::default(),
         };

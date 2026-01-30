@@ -46,7 +46,6 @@
 //!     const MAX_LOCATION_CACHE: usize = 8;
 //!     const MAX_PENDING_LOOKUPS: usize = 4;
 //!     const MAX_DISTRUSTED: usize = 8;
-//!     const MAX_SHORTCUTS: usize = 8;
 //!     const MAX_PENDING_DATA: usize = 4;
 //!     const MAX_MSGS_PER_PENDING_PUBKEY: usize = 2;
 //!     const MAX_PENDING_PUBKEY_NODES: usize = 4;
@@ -55,6 +54,7 @@
 //!     const MAX_BACKUP_STORE: usize = 64;
 //!     const MAX_BACKUPS_PER_NEIGHBOR: usize = 16;
 //!     const MAX_DELAYED_FORWARDS: usize = 16;
+//!     const MAX_PENDING_ROUTED: usize = 16;
 //!     const OUTGOING_QUEUE_SIZE: usize = 16;
 //!     const INCOMING_QUEUE_SIZE: usize = 8;
 //!     const APP_QUEUE_SIZE: usize = 8;
@@ -88,9 +88,6 @@ pub trait NodeConfig {
     /// Maximum tracked distrusted nodes (fraud detection).
     const MAX_DISTRUSTED: usize;
 
-    /// Maximum routing shortcuts.
-    const MAX_SHORTCUTS: usize;
-
     /// Maximum pending outgoing data messages.
     const MAX_PENDING_DATA: usize;
 
@@ -117,6 +114,10 @@ pub trait NodeConfig {
     /// Maximum delayed forwards for bounce-back dampening.
     /// Messages that bounce back during tree restructuring are queued here.
     const MAX_DELAYED_FORWARDS: usize;
+
+    /// Maximum pending routed messages awaiting neighbor keyspace updates.
+    /// Only roots use this queue (non-roots have parent fallback).
+    const MAX_PENDING_ROUTED: usize;
 
     // --- Queue sizes (used by Transport implementations) ---
 
@@ -151,7 +152,6 @@ impl NodeConfig for DefaultConfig {
     const MAX_LOCATION_CACHE: usize = 64;
     const MAX_PENDING_LOOKUPS: usize = 16;
     const MAX_DISTRUSTED: usize = 64;
-    const MAX_SHORTCUTS: usize = 64;
     const MAX_PENDING_DATA: usize = 16;
     const MAX_MSGS_PER_PENDING_PUBKEY: usize = 8;
     const MAX_PENDING_PUBKEY_NODES: usize = 16;
@@ -160,6 +160,7 @@ impl NodeConfig for DefaultConfig {
     const MAX_BACKUP_STORE: usize = 256;
     const MAX_BACKUPS_PER_NEIGHBOR: usize = 64;
     const MAX_DELAYED_FORWARDS: usize = 64;
+    const MAX_PENDING_ROUTED: usize = 64;
 
     const OUTGOING_QUEUE_SIZE: usize = 32;
     const INCOMING_QUEUE_SIZE: usize = 16;
@@ -181,7 +182,6 @@ impl NodeConfig for SmallConfig {
     const MAX_LOCATION_CACHE: usize = 8;
     const MAX_PENDING_LOOKUPS: usize = 4;
     const MAX_DISTRUSTED: usize = 8;
-    const MAX_SHORTCUTS: usize = 8;
     const MAX_PENDING_DATA: usize = 4;
     const MAX_MSGS_PER_PENDING_PUBKEY: usize = 2;
     const MAX_PENDING_PUBKEY_NODES: usize = 4;
@@ -190,6 +190,7 @@ impl NodeConfig for SmallConfig {
     const MAX_BACKUP_STORE: usize = 64;
     const MAX_BACKUPS_PER_NEIGHBOR: usize = 16;
     const MAX_DELAYED_FORWARDS: usize = 16;
+    const MAX_PENDING_ROUTED: usize = 16;
 
     const OUTGOING_QUEUE_SIZE: usize = 8;
     const INCOMING_QUEUE_SIZE: usize = 8;
@@ -214,7 +215,6 @@ mod tests {
         assert_eq!(DefaultConfig::MAX_LOCATION_CACHE, 64);
         assert_eq!(DefaultConfig::MAX_PENDING_LOOKUPS, 16);
         assert_eq!(DefaultConfig::MAX_DISTRUSTED, 64);
-        assert_eq!(DefaultConfig::MAX_SHORTCUTS, 64);
         assert_eq!(DefaultConfig::MAX_PENDING_DATA, 16);
         assert_eq!(DefaultConfig::MAX_MSGS_PER_PENDING_PUBKEY, 8);
         assert_eq!(DefaultConfig::MAX_PENDING_PUBKEY_NODES, 16);
@@ -223,6 +223,7 @@ mod tests {
         assert_eq!(DefaultConfig::MAX_BACKUP_STORE, 256);
         assert_eq!(DefaultConfig::MAX_BACKUPS_PER_NEIGHBOR, 64);
         assert_eq!(DefaultConfig::MAX_DELAYED_FORWARDS, 64);
+        assert_eq!(DefaultConfig::MAX_PENDING_ROUTED, 64);
     }
 
     #[test]
@@ -233,7 +234,6 @@ mod tests {
         assert_eq!(SmallConfig::MAX_LOCATION_CACHE, 8);
         assert_eq!(SmallConfig::MAX_PENDING_LOOKUPS, 4);
         assert_eq!(SmallConfig::MAX_DISTRUSTED, 8);
-        assert_eq!(SmallConfig::MAX_SHORTCUTS, 8);
         assert_eq!(SmallConfig::MAX_PENDING_DATA, 4);
         assert_eq!(SmallConfig::MAX_MSGS_PER_PENDING_PUBKEY, 2);
         assert_eq!(SmallConfig::MAX_PENDING_PUBKEY_NODES, 4);
@@ -242,6 +242,7 @@ mod tests {
         assert_eq!(SmallConfig::MAX_BACKUP_STORE, 64);
         assert_eq!(SmallConfig::MAX_BACKUPS_PER_NEIGHBOR, 16);
         assert_eq!(SmallConfig::MAX_DELAYED_FORWARDS, 16);
+        assert_eq!(SmallConfig::MAX_PENDING_ROUTED, 16);
     }
 
     #[test]
@@ -253,7 +254,6 @@ mod tests {
         assert!(SmallConfig::MAX_LOCATION_CACHE < DefaultConfig::MAX_LOCATION_CACHE);
         assert!(SmallConfig::MAX_PENDING_LOOKUPS < DefaultConfig::MAX_PENDING_LOOKUPS);
         assert!(SmallConfig::MAX_DISTRUSTED < DefaultConfig::MAX_DISTRUSTED);
-        assert!(SmallConfig::MAX_SHORTCUTS < DefaultConfig::MAX_SHORTCUTS);
         assert!(SmallConfig::MAX_PENDING_DATA < DefaultConfig::MAX_PENDING_DATA);
         assert!(
             SmallConfig::MAX_MSGS_PER_PENDING_PUBKEY < DefaultConfig::MAX_MSGS_PER_PENDING_PUBKEY
@@ -264,6 +264,7 @@ mod tests {
         assert!(SmallConfig::MAX_BACKUP_STORE < DefaultConfig::MAX_BACKUP_STORE);
         assert!(SmallConfig::MAX_BACKUPS_PER_NEIGHBOR < DefaultConfig::MAX_BACKUPS_PER_NEIGHBOR);
         assert!(SmallConfig::MAX_DELAYED_FORWARDS < DefaultConfig::MAX_DELAYED_FORWARDS);
+        assert!(SmallConfig::MAX_PENDING_ROUTED < DefaultConfig::MAX_PENDING_ROUTED);
     }
 
     #[test]
@@ -276,7 +277,6 @@ mod tests {
         assert!(DefaultConfig::MAX_LOCATION_CACHE > 0);
         assert!(DefaultConfig::MAX_PENDING_LOOKUPS > 0);
         assert!(DefaultConfig::MAX_DISTRUSTED > 0);
-        assert!(DefaultConfig::MAX_SHORTCUTS > 0);
         assert!(DefaultConfig::MAX_PENDING_DATA > 0);
         assert!(DefaultConfig::MAX_MSGS_PER_PENDING_PUBKEY > 0);
         assert!(DefaultConfig::MAX_PENDING_PUBKEY_NODES > 0);
@@ -285,6 +285,7 @@ mod tests {
         assert!(DefaultConfig::MAX_BACKUP_STORE > 0);
         assert!(DefaultConfig::MAX_BACKUPS_PER_NEIGHBOR > 0);
         assert!(DefaultConfig::MAX_DELAYED_FORWARDS > 0);
+        assert!(DefaultConfig::MAX_PENDING_ROUTED > 0);
 
         // SmallConfig
         assert!(SmallConfig::MAX_NEIGHBORS > 0);
@@ -293,7 +294,6 @@ mod tests {
         assert!(SmallConfig::MAX_LOCATION_CACHE > 0);
         assert!(SmallConfig::MAX_PENDING_LOOKUPS > 0);
         assert!(SmallConfig::MAX_DISTRUSTED > 0);
-        assert!(SmallConfig::MAX_SHORTCUTS > 0);
         assert!(SmallConfig::MAX_PENDING_DATA > 0);
         assert!(SmallConfig::MAX_MSGS_PER_PENDING_PUBKEY > 0);
         assert!(SmallConfig::MAX_PENDING_PUBKEY_NODES > 0);
@@ -302,5 +302,6 @@ mod tests {
         assert!(SmallConfig::MAX_BACKUP_STORE > 0);
         assert!(SmallConfig::MAX_BACKUPS_PER_NEIGHBOR > 0);
         assert!(SmallConfig::MAX_DELAYED_FORWARDS > 0);
+        assert!(SmallConfig::MAX_PENDING_ROUTED > 0);
     }
 }

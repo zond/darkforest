@@ -120,7 +120,7 @@ pub use node::Node;
 pub use time::{Duration, Timestamp};
 pub use traits::{Ackable, Clock, Crypto, IncomingData, Outgoing, OutgoingData, Random, Transport};
 pub use types::{
-    ChildHash, Error, Event, Incoming, LocationEntry, NodeId, Payload, PreEncoded, Priority,
+    Error, Event, IdHash, Incoming, LocationEntry, NodeId, Payload, PreEncoded, Priority,
     PublicKey, Pulse, Routed, SecretKey, Signature,
 };
 pub use wire::{Decode, DecodeError, Encode, Message};

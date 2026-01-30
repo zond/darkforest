@@ -10,8 +10,8 @@
 //!
 //! Rather than storing children in a single map and recomputing hashes during sorting,
 //! this structure pre-computes hashes at insertion time and maintains two indexes:
-//! - `entries`: BTreeMap<ChildHash, ChildEntry> - sorted by hash for iteration
-//! - `by_node_id`: BTreeMap<NodeId, ChildHash> - for O(log n) lookup by NodeId
+//! - `entries`: BTreeMap<IdHash, ChildEntry> - sorted by hash for iteration
+//! - `by_node_id`: BTreeMap<NodeId, IdHash> - for O(log n) lookup by NodeId
 //!
 //! # Hash Collision
 //!
@@ -20,7 +20,7 @@
 
 use alloc::collections::BTreeMap;
 
-use crate::types::{ChildHash, NodeId, MAX_CHILDREN};
+use crate::types::{IdHash, NodeId, MAX_CHILDREN};
 
 /// Entry for a single child node.
 #[derive(Clone, Debug)]
@@ -42,10 +42,10 @@ pub struct ChildEntry {
 #[derive(Clone, Debug)]
 pub struct ChildrenStore {
     /// Authoritative data, keyed by hash. Naturally sorted in hash order.
-    entries: BTreeMap<ChildHash, ChildEntry>,
+    entries: BTreeMap<IdHash, ChildEntry>,
 
     /// Index: NodeId -> hash (the key into entries).
-    by_node_id: BTreeMap<NodeId, ChildHash>,
+    by_node_id: BTreeMap<NodeId, IdHash>,
 }
 
 impl Default for ChildrenStore {
@@ -73,7 +73,7 @@ impl ChildrenStore {
     ///
     /// Panics if inserting a new child would exceed MAX_CHILDREN. Callers should
     /// check capacity before inserting new children.
-    pub fn insert(&mut self, hash: ChildHash, node_id: NodeId, subtree_size: u32) -> bool {
+    pub fn insert(&mut self, hash: IdHash, node_id: NodeId, subtree_size: u32) -> bool {
         // Remove old entry if this NodeId already exists with a different hash.
         // This path is unreachable in normal operation: hash is derived from node_id
         // via crypto.hash(), so the same node_id always produces the same hash.
@@ -144,12 +144,12 @@ impl ChildrenStore {
     }
 
     /// Check if a hash already exists (for collision detection).
-    pub fn contains_hash(&self, hash: &ChildHash) -> bool {
+    pub fn contains_hash(&self, hash: &IdHash) -> bool {
         self.entries.contains_key(hash)
     }
 
     /// Get the hash for a NodeId.
-    pub fn get_hash(&self, node_id: &NodeId) -> Option<&ChildHash> {
+    pub fn get_hash(&self, node_id: &NodeId) -> Option<&IdHash> {
         self.by_node_id.get(node_id)
     }
 
@@ -166,7 +166,7 @@ impl ChildrenStore {
     /// Iterate entries in hash order (for pulse building, keyspace computation).
     ///
     /// Returns (hash, entry) pairs sorted by hash.
-    pub fn iter_by_hash(&self) -> impl Iterator<Item = (&ChildHash, &ChildEntry)> {
+    pub fn iter_by_hash(&self) -> impl Iterator<Item = (&IdHash, &ChildEntry)> {
         self.entries.iter()
     }
 
@@ -222,7 +222,7 @@ impl ChildrenStore {
     /// Note: Not currently used because `recompute_child_ranges` collects to a Vec
     /// to avoid borrow conflicts. Kept for potential future use.
     #[allow(dead_code)]
-    pub fn iter_by_hash_mut(&mut self) -> impl Iterator<Item = (&ChildHash, &mut ChildEntry)> {
+    pub fn iter_by_hash_mut(&mut self) -> impl Iterator<Item = (&IdHash, &mut ChildEntry)> {
         self.entries.iter_mut()
     }
 }
@@ -233,7 +233,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    fn make_hash(n: u8) -> ChildHash {
+    fn make_hash(n: u8) -> IdHash {
         [n, 0, 0, 0]
     }
 

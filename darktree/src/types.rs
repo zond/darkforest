@@ -64,10 +64,12 @@ pub const BCAST_PAYLOAD_BACKUP: u8 = 0x01;
 ///
 /// Priority ordering (highest to lowest):
 /// 1. Ack - Reliability; enables retransmission
-/// 2. BroadcastProtocol - DHT backup protocol (BACKUP_PUBLISH)
-/// 3. RoutedProtocol - DHT operations (PUBLISH, LOOKUP, FOUND)
-/// 4. BroadcastData - Application broadcast
-/// 5. RoutedData - Application unicast
+/// 2. BroadcastProtocol - DHT backup protocol (BACKUP_PUBLISH), Pulse
+/// 3. RoutedPublish - DHT PUBLISH operations
+/// 4. RoutedFound - DHT FOUND responses
+/// 5. RoutedLookup - DHT LOOKUP queries
+/// 6. BroadcastData - Application broadcast
+/// 7. RoutedData - Application unicast
 ///
 /// Note: Pulse uses BroadcastProtocol priority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -77,12 +79,16 @@ pub enum Priority {
     Ack = 0,
     /// Protocol-level broadcast (Pulse, BACKUP_PUBLISH).
     BroadcastProtocol = 1,
-    /// Protocol-level routed messages (PUBLISH, LOOKUP, FOUND).
-    RoutedProtocol = 2,
+    /// DHT PUBLISH operations (highest routed protocol priority).
+    RoutedPublish = 2,
+    /// DHT FOUND responses.
+    RoutedFound = 3,
+    /// DHT LOOKUP queries.
+    RoutedLookup = 4,
     /// Application-level broadcast data.
-    BroadcastData = 3,
+    BroadcastData = 5,
     /// Application-level routed data.
-    RoutedData = 4,
+    RoutedData = 6,
 }
 
 impl Priority {
@@ -93,7 +99,11 @@ impl Priority {
     pub fn is_protocol(&self) -> bool {
         matches!(
             self,
-            Priority::Ack | Priority::BroadcastProtocol | Priority::RoutedProtocol
+            Priority::Ack
+                | Priority::BroadcastProtocol
+                | Priority::RoutedPublish
+                | Priority::RoutedFound
+                | Priority::RoutedLookup
         )
     }
 }
@@ -145,11 +155,12 @@ pub type PublicKey = [u8; 32];
 /// 32-byte Ed25519 secret key (seed).
 pub type SecretKey = [u8; 32];
 
-/// 4-byte truncated hash for child identification and verification.
-pub type ChildHash = [u8; 4];
+/// 4-byte truncated hash for node identification and verification.
+/// Used for all nodes (self, parent, children, neighbors).
+pub type IdHash = [u8; 4];
 
 /// Children list in pulse messages: (4-byte hash, subtree_size).
-pub type ChildrenList = Vec<(ChildHash, u32)>;
+pub type ChildrenList = Vec<(IdHash, u32)>;
 
 /// Payload type for routed messages.
 pub type Payload = Vec<u8>;
@@ -206,9 +217,9 @@ pub struct Pulse {
     /// Packed flags byte (has_parent, need_pubkey, has_pubkey, unstable, child_count).
     pub flags: u8,
     /// Truncated hash of parent (None if root).
-    pub parent_hash: Option<ChildHash>,
+    pub parent_hash: Option<IdHash>,
     /// Truncated hash of root node.
-    pub root_hash: ChildHash,
+    pub root_hash: IdHash,
     /// Distance from root (0 = root).
     pub depth: u8,
     /// Maximum depth in subtree rooted at this node.
@@ -318,11 +329,12 @@ pub struct Routed {
     /// Combined flags and message type byte.
     pub flags_and_type: u8,
     /// Truncated hash of intended next-hop forwarder (prevents amplification attacks).
-    pub next_hop: ChildHash,
+    /// None until route is computed; always Some when encoded to wire.
+    pub next_hop: Option<IdHash>,
     /// Destination keyspace address (u32).
     pub dest_addr: u32,
     /// Optional 4-byte hash of recipient for verification.
-    pub dest_hash: Option<ChildHash>,
+    pub dest_hash: Option<IdHash>,
     /// Optional source keyspace address (for replies).
     pub src_addr: Option<u32>,
     /// Source node identifier.
@@ -331,9 +343,13 @@ pub struct Routed {
     pub src_pubkey: Option<PublicKey>,
     /// Time-to-live hop counter.
     pub ttl: u8,
+    /// Actual hop count (increments at each hop, unlike TTL which decrements).
+    /// Used for duplicate detection: same hops = retransmission, different = bounce-back.
+    /// Not signed - varies at each hop like TTL.
+    pub hops: u32,
     /// Type-specific payload.
     pub payload: Payload,
-    /// Ed25519 signature (covers all fields except ttl).
+    /// Ed25519 signature (covers all fields except ttl and hops).
     pub signature: Signature,
 }
 
@@ -383,16 +399,52 @@ impl Default for Routed {
     fn default() -> Self {
         Self {
             flags_and_type: 0,
-            next_hop: [0u8; 4],
+            next_hop: None,
             dest_addr: 0,
             dest_hash: None,
             src_addr: None,
             src_node_id: [0u8; 16],
             src_pubkey: None,
             ttl: DEFAULT_TTL,
+            hops: 0,
             payload: Vec::new(),
             signature: Signature::default(),
         }
+    }
+}
+
+/// A Routed message ready for transmission (next_hop guaranteed set).
+///
+/// This newtype provides compile-time enforcement that `next_hop` is set
+/// before a message is transmitted. Use `ReadyRouted::new()` to create.
+///
+/// # Encode Implementation Note
+///
+/// The `Encode` trait is implemented on `Routed`, not `ReadyRouted`, because:
+/// 1. The encode logic needs access to the full Routed fields
+/// 2. `Routed::encode` panics if `next_hop` is None, providing runtime safety
+/// 3. `ReadyRouted` delegates to `Routed::encode` via `into_inner()`
+///
+/// In practice, `transmit_with_ack` calls `into_inner()` before wrapping in
+/// `Message::Routed`, so the type safety is preserved at the API level.
+#[derive(Clone, Debug)]
+pub struct ReadyRouted(Routed);
+
+impl ReadyRouted {
+    /// Create a ready-to-send message by setting the next_hop.
+    pub fn new(mut msg: Routed, next_hop: IdHash) -> Self {
+        msg.next_hop = Some(next_hop);
+        Self(msg)
+    }
+
+    /// Get a reference to the inner Routed message.
+    pub fn inner(&self) -> &Routed {
+        &self.0
+    }
+
+    /// Consume and return the inner Routed message.
+    pub fn into_inner(self) -> Routed {
+        self.0
     }
 }
 
@@ -409,7 +461,7 @@ pub struct Broadcast {
     /// Source node identifier.
     pub src_node_id: NodeId,
     /// Truncated hashes of designated recipients (max 16).
-    pub destinations: Vec<ChildHash>,
+    pub destinations: Vec<IdHash>,
     /// Payload (first byte indicates type: DATA=0x00, BACKUP_PUBLISH=0x01).
     pub payload: Payload,
     /// Ed25519 signature over "BCAST:" || src_node_id || dest_count || destinations || payload.
@@ -433,6 +485,8 @@ pub struct LocationEntry {
     pub signature: Signature,
     /// Local timestamp when entry was received (for expiry).
     pub received_at: Timestamp,
+    /// Hops when received (for rebalance, not transmitted).
+    pub hops: u32,
 }
 
 /// Transport queue metrics for monitoring.
@@ -485,7 +539,7 @@ pub enum Event {
     /// Lookup failed (all replicas exhausted).
     LookupFailed { node_id: NodeId },
     /// Tree structure changed.
-    TreeChanged { new_root: ChildHash, new_size: u32 },
+    TreeChanged { new_root: IdHash, new_size: u32 },
     /// Fraud detected: parent claimed inflated tree size.
     FraudDetected {
         /// The parent node that was distrusted.

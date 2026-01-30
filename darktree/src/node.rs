@@ -57,7 +57,7 @@ use crate::time::{Duration, Timestamp};
 use crate::traits::{Clock, Crypto, DynamicChannel, IncomingData, OutgoingData, Random, Transport};
 use crate::tree::FastDivisor;
 use crate::types::{
-    ChildHash, Event, LocationEntry, NodeId, PublicKey, Routed, SecretKey, TransportMetrics,
+    Event, IdHash, LocationEntry, NodeId, PublicKey, Routed, SecretKey, TransportMetrics,
     RECENTLY_FORWARDED_TTL_MULTIPLIER,
 };
 
@@ -69,7 +69,7 @@ pub(crate) struct NeighborTiming {
     /// Last observed signal strength in dBm (if available).
     pub rssi: Option<i16>,
     /// Root hash of the neighbor's tree.
-    pub root_hash: ChildHash,
+    pub root_hash: IdHash,
     /// Size of the neighbor's tree.
     pub tree_size: u32,
     /// Neighbor's keyspace range (lo, hi).
@@ -107,8 +107,6 @@ pub(crate) struct JoinContext {
 }
 
 // Type aliases for collections
-/// Shortcuts: shortcut_id -> (keyspace_lo, keyspace_hi).
-pub(crate) type ShortcutMap = HashMap<NodeId, (u32, u32)>;
 pub(crate) type NeighborTimingMap = HashMap<NodeId, NeighborTiming>;
 /// Pubkey cache: node_id -> (pubkey, last_used).
 pub(crate) type PubkeyCache = HashMap<NodeId, (PublicKey, Timestamp)>;
@@ -151,9 +149,10 @@ pub(crate) struct PendingAck {
 pub(crate) type PendingAckMap = HashMap<AckHash, PendingAck>;
 
 /// Map of recently forwarded message hashes for duplicate detection.
-/// Stores (timestamp, ttl, seen_count) to distinguish retransmissions from alternate paths
+/// Stores (timestamp, hops, seen_count) to distinguish retransmissions from alternate paths
 /// and track bounce-back occurrences for exponential backoff.
-pub(crate) type RecentlyForwardedMap = HashMap<AckHash, (Timestamp, u8, u8)>;
+/// hops is u32 because it's a varint on the wire.
+pub(crate) type RecentlyForwardedMap = HashMap<AckHash, (Timestamp, u32, u8)>;
 
 /// Backup entry for DHT redundancy.
 ///
@@ -164,7 +163,7 @@ pub(crate) struct BackupEntry {
     /// The location entry being backed up.
     pub entry: LocationEntry,
     /// Child hash of the storage node we're backing up for.
-    pub backed_up_for: ChildHash,
+    pub backed_up_for: IdHash,
     /// When this backup was received.
     pub received_at: Timestamp,
 }
@@ -186,6 +185,18 @@ pub(crate) struct DelayedForward {
     pub seen_count: u8,
     /// When the delayed forward should fire.
     pub scheduled_time: Timestamp,
+}
+
+/// A routed message waiting for a neighbor to claim its dest_addr.
+///
+/// Used by root nodes when `best_next_hop()` returns None and there's no parent.
+/// Messages are retried when a neighbor pulses with an updated keyspace range.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingRouted {
+    /// The routed message waiting to be sent.
+    pub msg: Routed,
+    /// When the message was queued.
+    pub queued_at: Timestamp,
 }
 
 /// Map of delayed forwards keyed by ack_hash.
@@ -226,7 +237,7 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     parent: Option<NodeId>,
     pending_parent: Option<(NodeId, u8)>, // (candidate, pulses_waited)
     parent_rejection_count: u8,           // consecutive pulses from parent not including us
-    root_hash: ChildHash,
+    root_hash: IdHash,
     tree_size: u32,
     subtree_size: u32,
     keyspace_lo: u32,
@@ -236,7 +247,6 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
 
     // Neighbors
     children: ChildrenStore,
-    shortcuts: ShortcutMap,
     neighbor_times: NeighborTimingMap,
 
     // Caches
@@ -266,6 +276,9 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     recently_forwarded: RecentlyForwardedMap,
     delayed_forwards: DelayedForwardMap,
 
+    // Pending routed messages (root nodes only)
+    pending_routed: Vec<PendingRouted>,
+
     // Scheduling
     last_pulse: Option<Timestamp>,
     last_pulse_size: usize,
@@ -276,7 +289,7 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     shopping_deadline: Option<Timestamp>,
     // Shopping state - preserved parent/tree before shopping started
     old_parent: Option<NodeId>,
-    old_tree: Option<ChildHash>,
+    old_tree: Option<IdHash>,
 
     // Metrics
     metrics: TransportMetrics,
@@ -327,7 +340,7 @@ where
         secret: SecretKey,
     ) -> Self {
         // Compute root_hash from our node_id (we are initially root of our own tree)
-        let root_hash = Self::compute_node_hash_static(&crypto, &node_id);
+        let root_hash = Self::compute_id_hash_static(&crypto, &node_id);
 
         // Cache tau and FastDivisor(bw) to avoid u64 division on 32-bit MCUs at runtime.
         // Note: tau is computed once at initialization. If transport bandwidth
@@ -383,7 +396,6 @@ where
             max_depth: 0,
 
             children: ChildrenStore::new(),
-            shortcuts: HashMap::new(),
             neighbor_times: HashMap::new(),
 
             pubkey_cache: HashMap::new(),
@@ -406,6 +418,8 @@ where
             recently_forwarded: HashMap::new(),
             delayed_forwards: HashMap::new(),
 
+            pending_routed: Vec::new(),
+
             last_pulse: None,
             last_pulse_size: 0,
             next_publish: None,
@@ -427,14 +441,14 @@ where
     }
 
     /// Compute the 4-byte hash of a node_id.
-    fn compute_node_hash_static(crypto: &Cr, node_id: &NodeId) -> ChildHash {
+    fn compute_id_hash_static(crypto: &Cr, node_id: &NodeId) -> IdHash {
         let hash = crypto.hash(node_id);
         [hash[0], hash[1], hash[2], hash[3]]
     }
 
     /// Compute the 4-byte hash of a node_id.
-    pub(crate) fn compute_node_hash(&self, node_id: &NodeId) -> ChildHash {
-        Self::compute_node_hash_static(&self.crypto, node_id)
+    pub(crate) fn compute_id_hash(&self, node_id: &NodeId) -> IdHash {
+        Self::compute_id_hash_static(&self.crypto, node_id)
     }
 
     /// Get this node's identity.
@@ -492,7 +506,7 @@ where
     }
 
     /// Get the root hash.
-    pub fn root_hash(&self) -> &ChildHash {
+    pub fn root_hash(&self) -> &IdHash {
         &self.root_hash
     }
 
@@ -806,7 +820,7 @@ where
     /// verifies the signature, and dispatches based on payload type.
     fn handle_broadcast(&mut self, broadcast: crate::types::Broadcast, now: Timestamp) {
         // Step 1: Verify we are a designated recipient
-        let my_hash = self.compute_node_hash(self.node_id());
+        let my_hash = self.compute_id_hash(self.node_id());
         if !broadcast.destinations.contains(&my_hash) {
             return; // Not for us
         }
@@ -897,7 +911,7 @@ where
         }
 
         // Compute sender's child hash for tracking
-        let sender_hash = self.compute_node_hash(&broadcast.src_node_id);
+        let sender_hash = self.compute_id_hash(&broadcast.src_node_id);
 
         let key = (entry.node_id, entry.replica_index);
 
@@ -1220,14 +1234,6 @@ where
         &mut self.children
     }
 
-    pub(crate) fn shortcuts(&self) -> &ShortcutMap {
-        &self.shortcuts
-    }
-
-    pub(crate) fn shortcuts_mut(&mut self) -> &mut ShortcutMap {
-        &mut self.shortcuts
-    }
-
     pub(crate) fn neighbor_times(&self) -> &NeighborTimingMap {
         &self.neighbor_times
     }
@@ -1351,6 +1357,14 @@ where
         &mut self.delayed_forwards
     }
 
+    pub(crate) fn pending_routed(&self) -> &[PendingRouted] {
+        &self.pending_routed
+    }
+
+    pub(crate) fn pending_routed_mut(&mut self) -> &mut Vec<PendingRouted> {
+        &mut self.pending_routed
+    }
+
     pub(crate) fn fraud_detection(&self) -> &FraudDetection {
         &self.fraud_detection
     }
@@ -1395,7 +1409,7 @@ where
         self.parent_rejection_count = count;
     }
 
-    pub(crate) fn set_root_hash(&mut self, root: ChildHash) {
+    pub(crate) fn set_root_hash(&mut self, root: IdHash) {
         self.root_hash = root;
     }
 
@@ -1440,7 +1454,7 @@ where
         self.old_parent
     }
 
-    pub(crate) fn old_tree(&self) -> Option<ChildHash> {
+    pub(crate) fn old_tree(&self) -> Option<IdHash> {
         self.old_tree
     }
 
@@ -1633,29 +1647,6 @@ where
         self.distrusted.insert(node_id, timestamp);
     }
 
-    pub(crate) fn insert_shortcut(&mut self, node_id: NodeId, keyspace: (u32, u32)) {
-        if self.shortcuts.len() >= Cfg::MAX_SHORTCUTS && !self.shortcuts.contains_key(&node_id) {
-            // Shortcuts use a different eviction strategy: cross-reference with neighbor_times.
-            // Unlike other caches, shortcuts don't store timestamps. Instead, when we receive
-            // a pulse, we update neighbor_times.last_seen. So we evict the shortcut whose
-            // corresponding neighbor was heard from least recently.
-            if let Some(oldest_key) = self
-                .shortcuts
-                .keys()
-                .min_by_key(|id| {
-                    self.neighbor_times
-                        .get(*id)
-                        .map(|t| t.last_seen)
-                        .unwrap_or(crate::time::Timestamp::ZERO)
-                })
-                .copied()
-            {
-                self.shortcuts.remove(&oldest_key);
-            }
-        }
-        self.shortcuts.insert(node_id, keyspace);
-    }
-
     /// Evict the oldest entry from an AckHash-keyed map based on a timestamp extraction function.
     fn evict_oldest_ack_by<V, F>(map: &mut HashMap<AckHash, V>, get_timestamp: F) -> bool
     where
@@ -1703,15 +1694,15 @@ where
     /// Insert a recently forwarded entry with bounded eviction.
     ///
     /// Evicts the oldest entry by timestamp when at capacity.
-    /// Stores timestamp, TTL, and seen_count to distinguish retransmissions from alternate paths
+    /// Stores timestamp, hops, and seen_count to distinguish retransmissions from alternate paths
     /// and track bounce-back occurrences.
-    pub(crate) fn insert_recently_forwarded(&mut self, hash: AckHash, ttl: u8, now: Timestamp) {
+    pub(crate) fn insert_recently_forwarded(&mut self, hash: AckHash, hops: u32, now: Timestamp) {
         if self.recently_forwarded.len() >= Cfg::MAX_RECENTLY_FORWARDED
             && !self.recently_forwarded.contains_key(&hash)
         {
             Self::evict_oldest_ack_by(&mut self.recently_forwarded, |&(ts, _, _)| ts);
         }
-        self.recently_forwarded.insert(hash, (now, ttl, 1));
+        self.recently_forwarded.insert(hash, (now, hops, 1));
     }
 
     // =========================================================================

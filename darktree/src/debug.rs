@@ -16,8 +16,9 @@ pub trait HasDebugEmitter {
     /// Check if a debug emitter is set.
     /// Use this to guard expensive computations (like hashing) that are only
     /// needed for debug events.
+    /// Uses try_borrow to avoid panics if already borrowed (returns false).
     fn has_emitter(&self) -> bool {
-        self.debug_emitter().borrow().is_some()
+        self.debug_emitter().try_borrow().is_ok_and(|e| e.is_some())
     }
 }
 
@@ -88,6 +89,8 @@ pub enum DebugEvent {
         from: NodeId,
         tree_size: u32,
         root_hash: [u8; 4],
+        keyspace_lo: u32,
+        keyspace_hi: u32,
         has_pubkey: bool,
         need_pubkey: bool,
     },
@@ -139,23 +142,16 @@ pub enum DebugEvent {
         dest_addr: u32,
         ttl: u8,
     },
-    /// Routed message forwarded DOWN to a child/shortcut.
-    RoutedForwardedDown {
+    /// Routed message forwarded to next hop.
+    /// `direction` is "up" (to parent) or "down" (to child/shortcut).
+    RoutedForwarded {
         payload_hash: [u8; 4],
         msg_type: u8,
         dest_addr: u32,
         next_hop: NodeId,
         ttl: u8,
         my_keyspace: (u32, u32),
-    },
-    /// Routed message forwarded UP to parent (no child owns dest).
-    RoutedForwardedUp {
-        payload_hash: [u8; 4],
-        msg_type: u8,
-        dest_addr: u32,
-        next_hop: NodeId,
-        ttl: u8,
-        my_keyspace: (u32, u32),
+        direction: &'static str,
     },
     /// Routed message delivered locally (we own the keyspace).
     RoutedDelivered {
@@ -194,9 +190,15 @@ pub enum DebugEvent {
         payload_hash: [u8; 4],
         msg_type: u8,
         dest_addr: u32,
-        original_ttl: u8,
-        stored_ttl: u8,
+        original_hops: u32,
+        stored_hops: u32,
         action: &'static str,
+    },
+    /// Message handled opportunistically (not designated forwarder but owns keyspace).
+    RoutedOpportunistic {
+        payload_hash: [u8; 4],
+        msg_type: u8,
+        dest_addr: u32,
     },
     /// Bounce-back scheduled for delayed forward.
     BounceBackScheduled {
@@ -228,4 +230,24 @@ pub enum DebugEvent {
     },
     /// App incoming channel full, DATA message dropped.
     AppIncomingFull { from: NodeId, payload_len: usize },
+    /// Routed message queued because no route available (root with no matching child).
+    RoutedQueued {
+        payload_hash: [u8; 4],
+        msg_type: u8,
+        dest_addr: u32,
+    },
+    /// Queued routed message retried after neighbor pulse.
+    RoutedRetried {
+        payload_hash: [u8; 4],
+        msg_type: u8,
+        dest_addr: u32,
+    },
+    /// Routing decision made: shows which neighbor was selected and why.
+    /// believed_keyspace is what we think the selected neighbor owns (from their last pulse).
+    RoutingDecision {
+        dest_addr: u32,
+        selected: NodeId,
+        believed_keyspace: (u32, u32),
+        is_parent_fallback: bool,
+    },
 }
