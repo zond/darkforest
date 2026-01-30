@@ -2133,6 +2133,7 @@ struct LocationEntry {
     replica_index: u8,          // 0, 1, or 2 (for rebalancing)
     signature: Signature,       // location signature (LOC: prefix)
     received_at: Instant,       // local-only, set on receipt (not transmitted)
+    hops: u32,                  // hops when received (for rebalance, not transmitted)
 }
 
 // Location signature covers:
@@ -2214,9 +2215,15 @@ When keyspace ownership changes (e.g., a child joins/leaves), the storage node m
 **Algorithm:**
 1. Find ONE entry where `!owns_key(replica_addr(entry))`
 2. Remove it from local storage
-3. Re-publish to the correct owner via normal PUBLISH routing
+3. Re-publish to the correct owner via normal PUBLISH routing, using `hops = entry.hops + 1`
 4. If more unowned entries exist, schedule next rebalance after 2τ
 5. Repeat until no unowned entries remain
+
+**Hops increment:** The republished message uses `hops = entry.hops.saturating_add(1)` rather than `hops = 0`. This prevents intermediate nodes (which may still have `recently_forwarded` entries from the original delivery) from misdetecting the republish as a retransmission. The goal is to avoid hitting `received_hops == stored_hops` (exact equality), which would trigger retransmission detection and cause the message to be dropped. Since `entry.hops` reflects the hops at storage time, and intermediate nodes stored lower values (they're closer to the origin), the rebalanced message with `hops = entry.hops + 1 + routing_hops` will always exceed any intermediate node's `stored_hops`, triggering bounce-back handling which correctly forwards with dampening.
+
+**Hops saturation:** If `entry.hops == u32::MAX`, the saturating add produces `u32::MAX`. When the message is forwarded and hops is incremented again, it remains at `u32::MAX`, eventually causing the message to be dropped when TTL expires. This is acceptable—an entry that has been rebalanced billions of times without a fresh PUBLISH from the owner is stale anyway.
+
+**Fresh TTL:** Rebalancing creates a new Routed message with fresh TTL (not a modified version of the original). This is correct because rebalancing is a new routing cycle, not a continuation of the original delivery.
 
 **Rationale:**
 - **Bounded work per tick:** Processing one entry at a time keeps CPU and queue usage predictable
@@ -2234,7 +2241,9 @@ When keyspace ownership changes (e.g., a child joins/leaves), the storage node m
 4. Verify `payload.pubkey` binds to `payload.node_id`: `hash(pubkey)[..16] == node_id`
 5. Verify LOC: signature: `verify(pubkey, "LOC:" || node_id || keyspace_addr || seq, signature)`
 6. Verify `seq > existing_seq` for this `node_id` (replay protection)
-7. Store entry with current timestamp for expiry tracking
+7. Store entry with current timestamp for expiry tracking, and set `entry.hops` from the received message's hops value
+
+**Hops on store:** The `entry.hops` field is set on every store operation, whether from a fresh PUBLISH by the owner or a rebalance republish. When the owner sends a fresh PUBLISH (with incremented `seq`), the entry arrives with low hops (reflecting the new routing path), effectively resetting accumulated hops from previous rebalance cycles.
 
 Note: The Routed `src_node_id` may differ from `payload.node_id` during rebalancing (storage nodes forward entries they no longer own). The LOC: signature is the authoritative proof of the location claim.
 
@@ -2460,6 +2469,8 @@ impl Node {
 ```
 
 **Republish target:** Entries are republished to their original replica address. Routing delivers them to whoever now owns that keyspace.
+
+**Hops handling:** When creating the PUBLISH message for republish, use `hops = entry.hops.saturating_add(1)` (same as storage node rebalancing). This ensures intermediate nodes correctly handle the republish as a new routing cycle rather than a retransmission.
 
 **Deduplication:** When multiple backup holders detect the same departure, both schedule republishes. The first to fire may be overheard by the second:
 
