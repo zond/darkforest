@@ -792,58 +792,74 @@ where
 
         // Evict oldest if at capacity (O(1) with VecDeque)
         if self.pending_routed().len() >= Cfg::MAX_PENDING_ROUTED {
-            self.pending_routed_mut().pop_front();
+            #[allow(unused_variables)] // evicted only used in debug builds
+            if let Some(evicted) = self.pending_routed_mut().pop_front() {
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::RoutedEvicted {
+                        payload_hash: evicted.msg.payload_hash(self.crypto()),
+                        msg_type: evicted.msg.msg_type(),
+                        dest_addr: evicted.msg.dest_addr,
+                    }
+                );
+            }
         }
 
         self.pending_routed_mut().push_back(PendingRouted {
             msg,
             queued_at: now,
         });
+
+        // Schedule retry in 2τ if not already scheduled.
+        // The delay gives the child time to pulse with its keyspace range.
+        self.schedule_pending_retry(now + self.tau() * 2);
     }
 
-    /// Re-check pending routed messages after receiving a pulse.
+    /// Re-check ONE pending routed message.
     ///
-    /// A neighbor's updated keyspace_range might now cover queued destinations.
-    /// Called from handle_pulse after updating neighbor_times.
-    pub(crate) fn retry_pending_routed(&mut self) {
-        let pending = core::mem::take(self.pending_routed_mut());
-        let now = self.now();
+    /// Returns true if more messages remain to be checked.
+    /// Called incrementally with 2τ delay between calls to spread traffic.
+    pub(crate) fn retry_one_pending(&mut self, now: Timestamp) -> bool {
+        // Pop front (FIFO), or return false if empty
+        let Some(p) = self.pending_routed_mut().pop_front() else {
+            return false;
+        };
 
-        for p in pending {
-            let dest = p.msg.dest_addr;
+        let dest = p.msg.dest_addr;
 
-            // Check if we now own the destination (keyspace may have changed)
-            if self.owns_key(dest) {
-                emit_debug!(
-                    self,
-                    crate::debug::DebugEvent::RoutedRetried {
-                        payload_hash: p.msg.payload_hash(self.crypto()),
-                        msg_type: p.msg.msg_type(),
-                        dest_addr: dest,
-                    }
-                );
-                self.dispatch_routed(p.msg, now);
-                continue;
-            }
-
-            // Try to find a route (single call, use result directly)
-            if let Some((_next_hop_id, next_hop_hash)) = self.route_to(dest) {
-                emit_debug!(
-                    self,
-                    crate::debug::DebugEvent::RoutedRetried {
-                        payload_hash: p.msg.payload_hash(self.crypto()),
-                        msg_type: p.msg.msg_type(),
-                        dest_addr: dest,
-                    }
-                );
-                let mut msg = p.msg;
-                msg.next_hop = Some(next_hop_hash);
-                let _ = self.transmit_with_ack(msg, now);
-            } else {
-                // Still no route, put back in pending
-                self.pending_routed_mut().push_back(p);
-            }
+        // Check if we now own the destination (keyspace may have changed)
+        if self.owns_key(dest) {
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::RoutedRetried {
+                    payload_hash: p.msg.payload_hash(self.crypto()),
+                    msg_type: p.msg.msg_type(),
+                    dest_addr: dest,
+                }
+            );
+            self.dispatch_routed(p.msg, now);
+            return !self.pending_routed().is_empty();
         }
+
+        // Try to find a route
+        if let Some((_next_hop_id, next_hop_hash)) = self.route_to(dest) {
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::RoutedRetried {
+                    payload_hash: p.msg.payload_hash(self.crypto()),
+                    msg_type: p.msg.msg_type(),
+                    dest_addr: dest,
+                }
+            );
+            let mut msg = p.msg;
+            msg.next_hop = Some(next_hop_hash);
+            let _ = self.transmit_with_ack(msg, now);
+        } else {
+            // Still no route, put back at END of queue (round-robin fairness)
+            self.pending_routed_mut().push_back(p);
+        }
+
+        !self.pending_routed().is_empty()
     }
 
     /// Send a BACKUP_PUBLISH broadcast to random neighbors.

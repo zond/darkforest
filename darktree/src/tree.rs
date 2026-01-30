@@ -193,9 +193,10 @@ where
         };
         self.insert_neighbor_time(pulse.node_id, timing);
 
-        // Retry pending routed messages that might now have a route.
+        // Schedule pending routed retry with a short delay to let routing info propagate.
         // A neighbor's updated keyspace_range might cover queued destinations.
-        self.retry_pending_routed();
+        // Use τ delay (half of queue_pending_routed's 2τ) to be responsive but not immediate.
+        self.schedule_pending_retry(now + self.tau());
 
         // Rate limiting: skip tree operations if pulses arrive too fast.
         // Timing is already updated above, so this only affects tree processing.
@@ -1099,8 +1100,25 @@ where
                 .retain(|_, entry| entry.backed_up_for != neighbor_hash);
         }
 
-        // Expire old pending routed messages (24τ = 8 pulse periods)
-        let pending_routed_expiry = self.tau() * 24;
+        // Expire old pending routed messages (320τ, matching recently_forwarded TTL)
+        // Must survive tree restructuring where keyspace info takes many pulse cycles to propagate
+        let pending_routed_expiry = self.tau() * crate::types::RECENTLY_FORWARDED_TTL_MULTIPLIER;
+        #[cfg(feature = "debug")]
+        {
+            // Emit debug events for expired messages before removing them
+            for p in self.pending_routed().iter() {
+                if now.saturating_sub(p.queued_at) >= pending_routed_expiry {
+                    emit_debug!(
+                        self,
+                        crate::debug::DebugEvent::RoutedExpired {
+                            payload_hash: p.msg.payload_hash(self.crypto()),
+                            msg_type: p.msg.msg_type(),
+                            dest_addr: p.msg.dest_addr,
+                        }
+                    );
+                }
+            }
+        }
         self.pending_routed_mut()
             .retain(|p| now.saturating_sub(p.queued_at) < pending_routed_expiry);
 

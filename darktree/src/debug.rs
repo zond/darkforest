@@ -242,6 +242,22 @@ pub enum DebugEvent {
         msg_type: u8,
         dest_addr: u32,
     },
+    /// Message evicted from pending_routed queue (queue full).
+    RoutedEvicted {
+        payload_hash: [u8; 4],
+        msg_type: u8,
+        dest_addr: u32,
+    },
+    /// Message expired from pending_routed queue (320τ timeout).
+    RoutedExpired {
+        payload_hash: [u8; 4],
+        msg_type: u8,
+        dest_addr: u32,
+    },
+    /// Pending retry scheduled.
+    PendingRetryScheduled { time_ms: u64, queue_len: usize },
+    /// Pending retry tick fired.
+    PendingRetryTick { queue_len: usize },
     /// Routing decision made: shows which neighbor was selected and why.
     /// believed_keyspace is what we think the selected neighbor owns (from their last pulse).
     RoutingDecision {

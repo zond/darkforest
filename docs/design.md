@@ -1643,14 +1643,23 @@ fn is_in_managed_keyspace(&self, dest: u32) -> bool {
 }
 ```
 
-**Queue processing:** When ANY neighbor Pulses (updating `neighbor_times`), retry queued messages. Routing options may have changed because:
-- A child pulsed with their new keyspace range
-- Our own keyspace changed (parent assigned new range)
-- A non-child neighbor pulsed with a keyspace we can use as shortcut
+**Queue processing:** When ANY neighbor Pulses (updating `neighbor_times`), the node checks if queued messages can now be routed. To avoid overwhelming the outgoing queue when many messages are waiting, retries are performed incrementally:
 
-The retry simply calls `route()` again, which will either find a route or re-queue.
+**Incremental Retry Algorithm:**
+1. Find ONE pending message from the queue (FIFO order)
+2. Attempt to route it:
+   - If we now own the destination, deliver locally
+   - If a route exists, forward via normal routing
+   - If still no route, put it back at the end of the queue
+3. If more pending messages exist, schedule next retry after 2τ
+4. Repeat until queue is empty or all messages have been re-checked
 
-**Bounded memory:** The queue is bounded by `MAX_PENDING_ROUTED` (64 in DefaultConfig, 16 in SmallConfig), separate from the bounce-back dampening queue (`MAX_DELAYED_FORWARDS`). Oldest entries are evicted when full. Entries also expire after 24τ if no route becomes available. Applications relying on delivery must implement end-to-end acknowledgment.
+**Rationale:**
+- **Traffic spreading:** The 2τ delay between retries reduces collision probability on shared radio channels
+- **Graceful degradation:** If the node is busy with higher-priority traffic, pending retries naturally yield
+- **Consistent pattern:** Matches the incremental rebalancing approach (see "Incremental Rebalancing" in PUBLISH section)
+
+**Bounded memory:** The queue is bounded by `MAX_PENDING_ROUTED` (512 in DefaultConfig, 128 in SmallConfig), separate from the bounce-back dampening queue (`MAX_DELAYED_FORWARDS`). Oldest entries are evicted when full. Entries expire after 320τ if no route becomes available (matching `RECENTLY_FORWARDED_TTL` to survive tree restructuring). Applications relying on delivery must implement end-to-end acknowledgment.
 
 ### Originating a Routed Message
 
@@ -3166,16 +3175,20 @@ Total hops ≈ 3 × depth
 
 **Node state memory:**
 
-| Component | DefaultConfig | SmallConfig |
-|-----------|---------------|-------------|
-| Neighbor tracking | ~10 KB | ~1.3 KB |
-| Pubkey cache | ~3 KB | ~0.8 KB |
-| Location store | ~36 KB | ~4.5 KB |
-| Backup store | ~36 KB | ~9 KB |
-| Pending ACKs | ~8.5 KB | ~2 KB |
-| Recently forwarded | ~2 KB | ~0.5 KB |
-| Fraud detection | 256 B | 256 B |
-| **Total** | **~96 KB** | **~18 KB** |
+| Component | DefaultConfig | SmallConfig | Notes |
+|-----------|---------------|-------------|-------|
+| Neighbor tracking | ~10 KB | ~1.3 KB | 128/16 neighbors × 80 B |
+| Pubkey cache | ~3 KB | ~0.8 KB | 64/16 entries × 48 B |
+| Location store | ~26 KB | ~3.2 KB | 256/32 entries × 100 B |
+| Backup store | ~26 KB | ~6.4 KB | 256/64 entries × 100 B |
+| Pending ACKs | ~9.6 KB | ~2.4 KB | 32/8 entries × 300 B |
+| Recently forwarded | ~10 KB | ~2.5 KB | 512/128 entries × 20 B |
+| Pending routed | ~140 KB | ~35 KB | 512/128 entries × 280 B |
+| Delayed forwards | ~70 KB | ~18 KB | 256/64 entries × 280 B |
+| Fraud detection | 256 B | 256 B | HyperLogLog registers |
+| **Total (max)** | **~295 KB** | **~70 KB** | Peak during churn |
+
+Note: Queues like `pending_routed`, `delayed_forwards`, and `recently_forwarded` are only populated during network churn (tree restructuring, message bursts). In steady state, these are mostly empty.
 
 ### Traffic Overhead (10k network)
 

@@ -51,6 +51,7 @@ use core::marker::PhantomData;
 use hashbrown::HashMap;
 
 use crate::children::ChildrenStore;
+use crate::collections::{ShrinkingHashMap, ShrinkingVecDeque};
 use crate::config::{DefaultConfig, NodeConfig};
 use crate::fraud::{FraudDetection, HllSecretKey};
 use crate::time::{Duration, Timestamp};
@@ -152,7 +153,8 @@ pub(crate) type PendingAckMap = HashMap<AckHash, PendingAck>;
 /// Stores (timestamp, hops, seen_count) to distinguish retransmissions from alternate paths
 /// and track bounce-back occurrences for exponential backoff.
 /// hops is u32 because it's a varint on the wire.
-pub(crate) type RecentlyForwardedMap = HashMap<AckHash, (Timestamp, u32, u8)>;
+/// Uses ShrinkingHashMap to reclaim memory when traffic subsides.
+pub(crate) type RecentlyForwardedMap = ShrinkingHashMap<AckHash, (Timestamp, u32, u8)>;
 
 /// Backup entry for DHT redundancy.
 ///
@@ -201,7 +203,8 @@ pub(crate) struct PendingRouted {
 
 /// Map of delayed forwards keyed by ack_hash.
 /// At most one delayed forward per message hash (newer bounces extend the delay).
-pub(crate) type DelayedForwardMap = HashMap<AckHash, DelayedForward>;
+/// Uses ShrinkingHashMap to reclaim memory when bounce-back traffic ends.
+pub(crate) type DelayedForwardMap = ShrinkingHashMap<AckHash, DelayedForward>;
 
 /// The main protocol node.
 ///
@@ -277,13 +280,15 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     delayed_forwards: DelayedForwardMap,
 
     // Pending routed messages (root nodes only)
-    pending_routed: VecDeque<PendingRouted>,
+    // Uses ShrinkingVecDeque to reclaim memory when churn subsides.
+    pending_routed: ShrinkingVecDeque<PendingRouted>,
 
     // Scheduling
     last_pulse: Option<Timestamp>,
     last_pulse_size: usize,
     next_publish: Option<Timestamp>,
     next_rebalance: Option<Timestamp>,
+    next_pending_retry: Option<Timestamp>,
     location_seq: u32,
     proactive_pulse_pending: Option<Timestamp>,
     shopping_deadline: Option<Timestamp>,
@@ -415,15 +420,16 @@ where
             hll_secret_key,
 
             pending_acks: HashMap::new(),
-            recently_forwarded: HashMap::new(),
-            delayed_forwards: HashMap::new(),
+            recently_forwarded: ShrinkingHashMap::new(),
+            delayed_forwards: ShrinkingHashMap::new(),
 
-            pending_routed: VecDeque::new(),
+            pending_routed: ShrinkingVecDeque::new(),
 
             last_pulse: None,
             last_pulse_size: 0,
             next_publish: None,
             next_rebalance: None,
+            next_pending_retry: None,
             location_seq: 0,
             proactive_pulse_pending: None,
             shopping_deadline: None,
@@ -648,6 +654,13 @@ where
             // Include discovery deadline in timer wake
             if let Some(deadline) = self.shopping_deadline {
                 timer_wake = timer_wake.min(deadline);
+            }
+            // Include scheduled work (rebalance, pending retry)
+            if let Some(t) = self.next_rebalance {
+                timer_wake = timer_wake.min(t);
+            }
+            if let Some(t) = self.next_pending_retry {
+                timer_wake = timer_wake.min(t);
             }
 
             // Wait for: incoming message, outgoing app data, or timer
@@ -1026,6 +1039,23 @@ where
             }
         }
 
+        // Process pending routed retry (incremental, one message at a time)
+        if let Some(next_pending_retry) = self.next_pending_retry {
+            if now >= next_pending_retry {
+                self.next_pending_retry = None;
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::PendingRetryTick {
+                        queue_len: self.pending_routed.len(),
+                    }
+                );
+                if self.retry_one_pending(now) {
+                    // More messages to check, schedule next retry in 2τ
+                    self.next_pending_retry = Some(now + self.tau() * 2);
+                }
+            }
+        }
+
         // Handle various timeouts
         self.handle_timeouts(now);
         self.handle_neighbor_timeouts(now);
@@ -1357,11 +1387,11 @@ where
         &mut self.delayed_forwards
     }
 
-    pub(crate) fn pending_routed(&self) -> &VecDeque<PendingRouted> {
+    pub(crate) fn pending_routed(&self) -> &ShrinkingVecDeque<PendingRouted> {
         &self.pending_routed
     }
 
-    pub(crate) fn pending_routed_mut(&mut self) -> &mut VecDeque<PendingRouted> {
+    pub(crate) fn pending_routed_mut(&mut self) -> &mut ShrinkingVecDeque<PendingRouted> {
         &mut self.pending_routed
     }
 
@@ -1496,6 +1526,34 @@ where
 
     pub(crate) fn set_proactive_pulse_pending(&mut self, time: Option<Timestamp>) {
         self.proactive_pulse_pending = time;
+    }
+
+    /// Schedule a pending routed retry at the given time.
+    ///
+    /// If a retry is already scheduled, use the earlier of the two times.
+    /// Called when routing conditions may have changed (e.g., neighbor pulsed)
+    /// or when a message is queued.
+    pub(crate) fn schedule_pending_retry(&mut self, time: Timestamp) {
+        if self.pending_routed.is_empty() {
+            return;
+        }
+
+        // Only update if no retry is scheduled or the new time is earlier
+        let should_schedule = self
+            .next_pending_retry
+            .map_or(true, |existing| time < existing);
+        if !should_schedule {
+            return;
+        }
+
+        self.next_pending_retry = Some(time);
+        emit_debug!(
+            self,
+            crate::debug::DebugEvent::PendingRetryScheduled {
+                time_ms: time.as_millis(),
+                queue_len: self.pending_routed.len(),
+            }
+        );
     }
 
     /// Check if node is in shopping phase (first boot or merge).
@@ -1700,7 +1758,7 @@ where
         if self.recently_forwarded.len() >= Cfg::MAX_RECENTLY_FORWARDED
             && !self.recently_forwarded.contains_key(&hash)
         {
-            Self::evict_oldest_ack_by(&mut self.recently_forwarded, |&(ts, _, _)| ts);
+            self.recently_forwarded.remove_min_by_key(|&(ts, _, _)| ts);
         }
         self.recently_forwarded.insert(hash, (now, hops, 1));
     }

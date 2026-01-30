@@ -4115,6 +4115,7 @@ mod tests {
         // Create 40-node sparse mesh for realistic multi-hop routing
         let (mut sim, nodes) = ScenarioBuilder::new(40)
             .with_seed(42)
+            .with_debug_print()
             .random_geometric_adaptive()
             .build();
 

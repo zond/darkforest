@@ -7,17 +7,24 @@
 //!
 //! Approximate RAM usage per config (excluding stack and code):
 //!
-//! | Config | Bounded Collections | Suitable MCUs |
-//! |--------|--------------------:|---------------|
-//! | `DefaultConfig` | ~50-60 KB | STM32F4, nRF52840, ESP32, RP2040 |
-//! | `SmallConfig` | ~15-20 KB | STM32F1, nRF52810, ATmega2560 |
+//! | Config | Peak Memory | Idle Memory | Suitable MCUs |
+//! |--------|------------:|------------:|---------------|
+//! | `DefaultConfig` | ~300 KB | ~75 KB | STM32F4, nRF52840, ESP32 |
+//! | `SmallConfig` | ~70 KB | ~15 KB | STM32F1, nRF52810, ATmega2560 |
+//!
+//! **Reclaimable memory:** Queues used during network churn (`pending_routed`,
+//! `delayed_forwards`, `recently_forwarded`) use shrinking collections that
+//! automatically reclaim memory after 8 consecutive removals without additions.
+//! This allows generous limits without permanent memory cost.
 //!
 //! Memory formula (rough estimate):
 //! - `MAX_NEIGHBORS * 80` bytes (neighbor timing + routing info)
 //! - `MAX_PUBKEY_CACHE * 48` bytes (pubkey + metadata)
 //! - `MAX_LOCATION_STORE * 100` bytes (DHT entries)
 //! - `MAX_PENDING_ACKS * 300` bytes (retransmission buffers)
-//! - `MAX_RECENTLY_FORWARDED * 16` bytes (hash + timestamp)
+//! - `MAX_RECENTLY_FORWARDED * 20` bytes (hash + timestamp, reclaimable)
+//! - `MAX_PENDING_ROUTED * 280` bytes (routed msg, reclaimable)
+//! - `MAX_DELAYED_FORWARDS * 280` bytes (delayed msg, reclaimable)
 //!
 //! # Example
 //!
@@ -141,7 +148,7 @@ pub trait NodeConfig {
 
 /// Default configuration for 256KB+ RAM devices.
 ///
-/// Memory footprint: ~40-50KB for all bounded collections.
+/// Memory footprint: ~75KB idle, ~300KB peak (reclaimable queues shrink when idle).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DefaultConfig;
 
@@ -156,11 +163,11 @@ impl NodeConfig for DefaultConfig {
     const MAX_MSGS_PER_PENDING_PUBKEY: usize = 8;
     const MAX_PENDING_PUBKEY_NODES: usize = 16;
     const MAX_PENDING_ACKS: usize = 32;
-    const MAX_RECENTLY_FORWARDED: usize = 128;
+    const MAX_RECENTLY_FORWARDED: usize = 512;
     const MAX_BACKUP_STORE: usize = 256;
     const MAX_BACKUPS_PER_NEIGHBOR: usize = 64;
-    const MAX_DELAYED_FORWARDS: usize = 64;
-    const MAX_PENDING_ROUTED: usize = 64;
+    const MAX_DELAYED_FORWARDS: usize = 256;
+    const MAX_PENDING_ROUTED: usize = 512;
 
     const OUTGOING_QUEUE_SIZE: usize = 32;
     const INCOMING_QUEUE_SIZE: usize = 16;
@@ -170,7 +177,7 @@ impl NodeConfig for DefaultConfig {
 
 /// Small configuration for 64KB RAM devices.
 ///
-/// Memory footprint: ~15-20KB for all bounded collections.
+/// Memory footprint: ~15KB idle, ~70KB peak (reclaimable queues shrink when idle).
 /// Suitable for constrained MCUs like STM32F1, nRF52810.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SmallConfig;
@@ -186,11 +193,11 @@ impl NodeConfig for SmallConfig {
     const MAX_MSGS_PER_PENDING_PUBKEY: usize = 2;
     const MAX_PENDING_PUBKEY_NODES: usize = 4;
     const MAX_PENDING_ACKS: usize = 8;
-    const MAX_RECENTLY_FORWARDED: usize = 32;
+    const MAX_RECENTLY_FORWARDED: usize = 128;
     const MAX_BACKUP_STORE: usize = 64;
     const MAX_BACKUPS_PER_NEIGHBOR: usize = 16;
-    const MAX_DELAYED_FORWARDS: usize = 16;
-    const MAX_PENDING_ROUTED: usize = 16;
+    const MAX_DELAYED_FORWARDS: usize = 64;
+    const MAX_PENDING_ROUTED: usize = 128;
 
     const OUTGOING_QUEUE_SIZE: usize = 8;
     const INCOMING_QUEUE_SIZE: usize = 8;
@@ -219,11 +226,11 @@ mod tests {
         assert_eq!(DefaultConfig::MAX_MSGS_PER_PENDING_PUBKEY, 8);
         assert_eq!(DefaultConfig::MAX_PENDING_PUBKEY_NODES, 16);
         assert_eq!(DefaultConfig::MAX_PENDING_ACKS, 32);
-        assert_eq!(DefaultConfig::MAX_RECENTLY_FORWARDED, 128);
+        assert_eq!(DefaultConfig::MAX_RECENTLY_FORWARDED, 512);
         assert_eq!(DefaultConfig::MAX_BACKUP_STORE, 256);
         assert_eq!(DefaultConfig::MAX_BACKUPS_PER_NEIGHBOR, 64);
-        assert_eq!(DefaultConfig::MAX_DELAYED_FORWARDS, 64);
-        assert_eq!(DefaultConfig::MAX_PENDING_ROUTED, 64);
+        assert_eq!(DefaultConfig::MAX_DELAYED_FORWARDS, 256);
+        assert_eq!(DefaultConfig::MAX_PENDING_ROUTED, 512);
     }
 
     #[test]
@@ -238,11 +245,11 @@ mod tests {
         assert_eq!(SmallConfig::MAX_MSGS_PER_PENDING_PUBKEY, 2);
         assert_eq!(SmallConfig::MAX_PENDING_PUBKEY_NODES, 4);
         assert_eq!(SmallConfig::MAX_PENDING_ACKS, 8);
-        assert_eq!(SmallConfig::MAX_RECENTLY_FORWARDED, 32);
+        assert_eq!(SmallConfig::MAX_RECENTLY_FORWARDED, 128);
         assert_eq!(SmallConfig::MAX_BACKUP_STORE, 64);
         assert_eq!(SmallConfig::MAX_BACKUPS_PER_NEIGHBOR, 16);
-        assert_eq!(SmallConfig::MAX_DELAYED_FORWARDS, 16);
-        assert_eq!(SmallConfig::MAX_PENDING_ROUTED, 16);
+        assert_eq!(SmallConfig::MAX_DELAYED_FORWARDS, 64);
+        assert_eq!(SmallConfig::MAX_PENDING_ROUTED, 128);
     }
 
     #[test]

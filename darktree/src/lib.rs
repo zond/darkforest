@@ -101,6 +101,7 @@ compile_error!(
 extern crate alloc;
 
 pub mod children;
+pub mod collections;
 pub mod config;
 #[macro_use]
 pub mod debug;
