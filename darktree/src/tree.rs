@@ -978,7 +978,7 @@ where
         // Track size for bandwidth-aware scheduling
         let size = encoded.len();
 
-        // Send via priority queue (BroadcastProtocol priority)
+        // Send via priority queue (Pulse priority - highest)
         if self.transport().outgoing().try_send(msg) {
             self.record_protocol_sent();
         } else {

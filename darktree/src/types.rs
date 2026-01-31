@@ -60,32 +60,33 @@ pub const BCAST_PAYLOAD_BACKUP: u8 = 0x01;
 /// heavy application load.
 ///
 /// Priority ordering (highest to lowest):
-/// 1. Ack - Reliability; enables retransmission
-/// 2. BroadcastProtocol - DHT backup protocol (BACKUP_PUBLISH), Pulse
-/// 3. RoutedPublish - DHT PUBLISH operations
-/// 4. RoutedFound - DHT FOUND responses
-/// 5. RoutedLookup - DHT LOOKUP queries
-/// 6. BroadcastData - Application broadcast
-/// 7. RoutedData - Application unicast
-///
-/// Note: Pulse uses BroadcastProtocol priority.
+/// 1. Pulse - Tree maintenance (most critical for protocol health)
+/// 2. Ack - Link-layer reliability
+/// 3. BroadcastBackup - DHT backup protocol (BACKUP_PUBLISH)
+/// 4. RoutedPublish - DHT PUBLISH operations
+/// 5. RoutedFound - DHT FOUND responses
+/// 6. RoutedLookup - DHT LOOKUP queries
+/// 7. BroadcastData - Application broadcast
+/// 8. RoutedData - Application unicast
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum Priority {
+    /// Pulse messages for tree maintenance (highest priority).
+    Pulse = 0,
     /// Explicit ACKs for link-layer reliability.
-    Ack = 0,
-    /// Protocol-level broadcast (Pulse, BACKUP_PUBLISH).
-    BroadcastProtocol = 1,
-    /// DHT PUBLISH operations (highest routed protocol priority).
-    RoutedPublish = 2,
+    Ack = 1,
+    /// DHT backup protocol (BACKUP_PUBLISH).
+    BroadcastBackup = 2,
+    /// DHT PUBLISH operations.
+    RoutedPublish = 3,
     /// DHT FOUND responses.
-    RoutedFound = 3,
+    RoutedFound = 4,
     /// DHT LOOKUP queries.
-    RoutedLookup = 4,
+    RoutedLookup = 5,
     /// Application-level broadcast data.
-    BroadcastData = 5,
+    BroadcastData = 6,
     /// Application-level routed data.
-    RoutedData = 6,
+    RoutedData = 7,
 }
 
 impl Priority {
@@ -96,8 +97,9 @@ impl Priority {
     pub fn is_protocol(&self) -> bool {
         matches!(
             self,
-            Priority::Ack
-                | Priority::BroadcastProtocol
+            Priority::Pulse
+                | Priority::Ack
+                | Priority::BroadcastBackup
                 | Priority::RoutedPublish
                 | Priority::RoutedFound
                 | Priority::RoutedLookup
@@ -515,6 +517,18 @@ pub enum Event {
         /// Expected unique publishers based on claimed subtree size.
         expected: u32,
     },
+}
+
+impl Event {
+    /// Returns the variant name as a static string (for debug events).
+    pub const fn variant_name(&self) -> &'static str {
+        match self {
+            Event::LookupComplete { .. } => "LookupComplete",
+            Event::LookupFailed { .. } => "LookupFailed",
+            Event::TreeChanged { .. } => "TreeChanged",
+            Event::FraudDetected { .. } => "FraudDetected",
+        }
+    }
 }
 
 /// Error type for node operations.

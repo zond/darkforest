@@ -823,7 +823,7 @@ impl Outgoing for Message {
     fn priority(&self) -> Priority {
         use crate::types::{MSG_FOUND, MSG_LOOKUP, MSG_PUBLISH};
         match self {
-            Message::Pulse(_) => Priority::BroadcastProtocol,
+            Message::Pulse(_) => Priority::Pulse,
             Message::Routed(r) => match r.msg_type() {
                 MSG_PUBLISH => Priority::RoutedPublish,
                 MSG_FOUND => Priority::RoutedFound,
@@ -833,7 +833,7 @@ impl Outgoing for Message {
             Message::Ack(_) => Priority::Ack,
             Message::Broadcast(b) => {
                 if b.payload.first().copied() == Some(BCAST_PAYLOAD_BACKUP) {
-                    Priority::BroadcastProtocol
+                    Priority::BroadcastBackup
                 } else {
                     Priority::BroadcastData
                 }

@@ -10,7 +10,7 @@ use crate::config::NodeConfig;
 #[cfg(feature = "debug")]
 use crate::debug::HasDebugEmitter;
 use crate::node::{AckHash, Node};
-use crate::time::Timestamp;
+use crate::time::{Duration, Timestamp};
 use crate::traits::{Ackable, Clock, Crypto, Outgoing, Random, Transport};
 use crate::types::{
     Error, IdHash, NodeId, Routed, Signature, MSG_DATA, MSG_FOUND, MSG_LOOKUP, MSG_PUBLISH,
@@ -323,10 +323,11 @@ where
     ///
     /// For each ready entry: recompute route and forward if TTL permits.
     /// Uses `route_message()` which handles routing and queuing.
+    ///
+    /// If the outgoing queue is full, re-schedules the message for 2τ later
+    /// instead of losing it.
     pub(crate) fn handle_delayed_forwards(&mut self, now: Timestamp) {
-        // Two-phase approach to avoid cloning Routed messages (which contain Vec<u8> payload):
-        // 1. Collect just the keys of ready entries (cheap 4-byte AckHash copies)
-        // 2. Remove and process each entry, taking ownership of the message
+        // Collect ready keys (cheap 4-byte AckHash copies)
         let ready_keys: Vec<_> = self
             .delayed_forwards()
             .iter()
@@ -334,17 +335,22 @@ where
             .map(|(k, _)| *k)
             .collect();
 
+        let tau = self.tau();
+
         for ack_hash in ready_keys {
-            // Remove entry and take ownership of the message (no clone needed)
-            let Some(entry) = self.delayed_forwards_mut().remove(&ack_hash) else {
+            // Get entry info without removing yet
+            let Some(entry) = self.delayed_forwards().get(&ack_hash) else {
                 continue;
             };
-            let msg = entry.msg;
 
             // TTL was already decremented when message was received
-            if msg.ttl == 0 {
+            if entry.msg.ttl == 0 {
+                self.delayed_forwards_mut().remove(&ack_hash);
                 continue;
             }
+
+            // Clone msg for sending (entry stays in map until success)
+            let msg = entry.msg.clone();
 
             emit_debug!(
                 self,
@@ -357,7 +363,25 @@ where
                 }
             );
 
-            let _ = self.route_message(msg, now);
+            // Try to route
+            match self.route_message(msg, now) {
+                Ok(()) => {
+                    // Success - remove from map
+                    self.delayed_forwards_mut().remove(&ack_hash);
+                }
+                Err(Error::QueueFull) => {
+                    // Queue full - reschedule for τ + jitter (entry stays in map)
+                    // Jitter prevents thundering herd when multiple nodes retry together
+                    let jitter_ms = self.random_mut().gen_range(0, tau.as_millis());
+                    if let Some(entry) = self.delayed_forwards_mut().get_mut(&ack_hash) {
+                        entry.scheduled_time = now + tau + Duration::from_millis(jitter_ms);
+                    }
+                }
+                Err(_) => {
+                    // Other error (e.g., MessageTooLarge) - remove, can't recover
+                    self.delayed_forwards_mut().remove(&ack_hash);
+                }
+            }
         }
     }
 
@@ -557,6 +581,12 @@ where
         let ack_hash = msg.ack_hash(self.crypto());
         let sent_ttl = msg.ttl;
 
+        // Extract debug info before moving msg
+        let msg_type = msg.msg_type();
+        let dest_addr = msg.dest_addr;
+        #[cfg(feature = "debug")]
+        let payload_hash = msg.payload_hash(self.crypto());
+
         // Wrap once, reuse for priority, encode, and send
         let wrapped = Message::Routed(msg);
         let priority = Outgoing::priority(&wrapped);
@@ -564,6 +594,15 @@ where
 
         if encoded.len() > self.transport().mtu() {
             self.record_routed_dropped(is_app_data);
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::RoutedDropped {
+                    payload_hash,
+                    msg_type,
+                    dest_addr,
+                    error: Error::MessageTooLarge,
+                }
+            );
             return Err(Error::MessageTooLarge);
         }
 
@@ -576,6 +615,14 @@ where
         } else {
             self.pending_acks_mut().remove(&ack_hash);
             self.record_routed_dropped(is_app_data);
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::OutgoingQueueFull {
+                    payload_hash,
+                    msg_type,
+                    dest_addr,
+                }
+            );
             Err(Error::QueueFull)
         }
     }
@@ -820,13 +867,18 @@ where
     ///
     /// Returns true if more messages remain to be checked.
     /// Called incrementally with 2τ delay between calls to spread traffic.
+    ///
+    /// If the outgoing queue is full, puts the message back for later retry.
     pub(crate) fn retry_one_pending(&mut self, now: Timestamp) -> bool {
+        use crate::node::PendingRouted;
+
         // Pop front (FIFO), or return false if empty
         let Some(p) = self.pending_routed_mut().pop_front() else {
             return false;
         };
 
         let dest = p.msg.dest_addr;
+        let queued_at = p.queued_at;
 
         // Check if we now own the destination (keyspace may have changed)
         if self.owns_key(dest) {
@@ -854,7 +906,19 @@ where
             );
             let mut msg = p.msg;
             msg.next_hop = Some(next_hop_hash);
-            let _ = self.transmit_with_ack(msg, now);
+            // Clone for potential re-queue (transmit_with_ack consumes msg)
+            let msg_backup = msg.clone();
+            match self.transmit_with_ack(msg, now) {
+                Ok(()) => {} // Success
+                Err(Error::QueueFull) => {
+                    // Queue full - put back for later retry
+                    self.pending_routed_mut().push_back(PendingRouted {
+                        msg: msg_backup,
+                        queued_at,
+                    });
+                }
+                Err(_) => {} // Other error (e.g., MessageTooLarge) - drop
+            }
         } else {
             // Still no route, put back at END of queue (round-robin fairness)
             self.pending_routed_mut().push_back(p);
@@ -923,7 +987,7 @@ where
             return; // Message too large
         }
 
-        // Send via priority queue (backup is protocol traffic - BroadcastProtocol priority)
+        // Send via priority queue (backup is protocol traffic - BroadcastBackup priority)
         if self.transport().outgoing().try_send(msg) {
             self.record_protocol_sent();
         } else {

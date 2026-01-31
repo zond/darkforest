@@ -340,12 +340,15 @@ where
 
     /// Rebalance keyspace: re-publish ONE entry that we no longer own.
     ///
-    /// Returns `true` if there are more entries to rebalance.
+    /// Returns `true` if there are more entries to rebalance (including failed sends).
     /// Call this when tree position changes (after merge, parent switch, etc.)
     /// to ensure entries are moved to their new owners.
     ///
     /// To avoid overwhelming the outgoing queue, this only processes one entry
     /// per call. If more work remains, schedule another rebalance in ~2τ.
+    ///
+    /// If the send fails (queue full), the entry is NOT removed and the function
+    /// returns true to trigger a reschedule.
     pub(crate) fn rebalance_one(&mut self, _now: Timestamp) -> bool {
         // Find entries we no longer own, take up to 2 to know if more work remains
         let mut unowned_entries = self
@@ -363,19 +366,7 @@ where
         };
         let has_more = unowned_entries.next().is_some();
 
-        // Remove this entry
-        emit_debug!(
-            self,
-            crate::debug::DebugEvent::LocationRemoved {
-                owner: entry.node_id,
-                replica_index: entry.replica_index,
-                reason: "rebalance",
-            }
-        );
-        self.location_store_mut()
-            .remove(&(entry.node_id, entry.replica_index));
-
-        // Re-publish to new owner
+        // Build message BEFORE removing entry (so we can retry on failure)
         let mut payload = Writer::new();
         payload.write_node_id(&entry.node_id);
         payload.write_pubkey(&entry.pubkey);
@@ -389,9 +380,27 @@ where
         let mut msg = self.build_routed_no_reply(dest_addr, None, MSG_PUBLISH, payload_bytes, true);
         // Preserve hops for duplicate detection: hops is not signed, safe to modify after build
         msg.hops = entry.hops.saturating_add(1);
-        let _ = self.send_routed(msg);
 
-        has_more
+        // Try to send - only remove entry on success
+        // Note: send_routed returns Ok() if message was sent OR queued for later routing.
+        // It only returns Err() on transmit failures (queue full, message too large).
+        if self.send_routed(msg).is_ok() {
+            // Successfully sent or queued - remove from our store
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::LocationRemoved {
+                    owner: entry.node_id,
+                    replica_index: entry.replica_index,
+                    reason: "rebalance",
+                }
+            );
+            self.location_store_mut()
+                .remove(&(entry.node_id, entry.replica_index));
+            has_more
+        } else {
+            // Send failed - entry stays, need to reschedule
+            true
+        }
     }
 }
 

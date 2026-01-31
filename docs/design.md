@@ -162,7 +162,11 @@ Protocol messages are bounded to 1/5 of bandwidth, ensuring infrastructure never
 
 Within each budget (Protocol/Application), higher-priority messages are sent first. The Protocol budget (priorities 1-6) is capped at 1/5 of bandwidth; the Application budget (priorities 7-8) gets the remaining 4/5. Pulse is generated on-demand when its timer fires (not queued); other messages are queued and sent in priority order as bandwidth permits.
 
-**Drop policy:** When queues are full, messages are dropped rather than blocking. This is acceptable because:
+**Queue behavior:**
+- **Transport queue:** When full, the lowest-priority message is evicted to make room for higher-priority messages. If the new message is itself the lowest priority, it is rejected (try_send returns false). This ensures protocol traffic (Pulse, ACK) is never blocked by application data.
+- **Internal routing queues:** When the transport queue is full, internal queues (pending_routed, delayed_forwards) reschedule messages for retry after τ + jitter (range [τ, 2τ]). This improves delivery under transient congestion without blocking. Internal queues have capacity limits with eviction policies to prevent unbounded growth.
+
+**Drop tolerance:** When messages are ultimately dropped, the protocol remains correct because:
 - **Pulse loss is tolerable:** Neighbors timeout after 8 missed Pulses. With 50% packet loss, P(miss 8) = 0.4%.
 - **ACK loss triggers retry:** Sender will retransmit after timeout.
 - **PUBLISH has redundancy:** Published to k=3 replicas and refreshed every 8 hours.

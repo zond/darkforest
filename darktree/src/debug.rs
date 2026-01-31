@@ -164,12 +164,12 @@ pub enum DebugEvent {
         dest_addr: u32,
         from: NodeId,
     },
-    /// Routed message dropped (no route found).
+    /// Routed message dropped (send failed).
     RoutedDropped {
         payload_hash: [u8; 4],
         msg_type: u8,
         dest_addr: u32,
-        reason: &'static str,
+        error: crate::types::Error,
     },
     /// PUBLISH stored in location_store.
     PublishStored {
@@ -234,6 +234,8 @@ pub enum DebugEvent {
     },
     /// App incoming channel full, DATA message dropped.
     AppIncomingFull { from: NodeId, payload_len: usize },
+    /// Event queue full, event dropped.
+    EventQueueFull { event_type: &'static str },
     /// Routed message queued because no route available (root with no matching child).
     RoutedQueued {
         payload_hash: [u8; 4],

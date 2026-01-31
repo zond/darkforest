@@ -169,7 +169,10 @@ impl NodeConfig for DefaultConfig {
     const MAX_DELAYED_FORWARDS: usize = 256;
     const MAX_PENDING_ROUTED: usize = 512;
 
-    const OUTGOING_QUEUE_SIZE: usize = 32;
+    // Queue sizes kept small since we now handle full queues gracefully
+    // (retry/reschedule instead of dropping). Smaller queues mean fresher messages
+    // and more responsive DHT operations.
+    const OUTGOING_QUEUE_SIZE: usize = 8;
     const INCOMING_QUEUE_SIZE: usize = 16;
     const APP_QUEUE_SIZE: usize = 16;
     const EVENT_QUEUE_SIZE: usize = 32;
@@ -199,7 +202,7 @@ impl NodeConfig for SmallConfig {
     const MAX_DELAYED_FORWARDS: usize = 64;
     const MAX_PENDING_ROUTED: usize = 128;
 
-    const OUTGOING_QUEUE_SIZE: usize = 8;
+    const OUTGOING_QUEUE_SIZE: usize = 4;
     const INCOMING_QUEUE_SIZE: usize = 8;
     const APP_QUEUE_SIZE: usize = 8;
     const EVENT_QUEUE_SIZE: usize = 16;

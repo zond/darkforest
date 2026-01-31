@@ -1030,8 +1030,10 @@ where
             if now >= next_rebalance {
                 self.next_rebalance = None;
                 if self.rebalance_one(now) {
-                    // More work to do, schedule next rebalance in 2τ
-                    self.next_rebalance = Some(now + self.tau() * 2);
+                    // More work to do, schedule next rebalance with jitter to prevent sync
+                    let tau = self.tau();
+                    let jitter_ms = self.random.gen_range(0, tau.as_millis());
+                    self.next_rebalance = Some(now + tau + Duration::from_millis(jitter_ms));
                 }
             }
         }
@@ -1047,8 +1049,10 @@ where
                     }
                 );
                 if self.retry_one_pending(now) {
-                    // More messages to check, schedule next retry in 2τ
-                    self.next_pending_retry = Some(now + self.tau() * 2);
+                    // More messages to check, schedule next retry with jitter
+                    let tau = self.tau();
+                    let jitter_ms = self.random.gen_range(0, tau.as_millis());
+                    self.next_pending_retry = Some(now + tau + Duration::from_millis(jitter_ms));
                 }
             }
         }
@@ -1236,7 +1240,14 @@ where
 
     /// Push an event to the events channel.
     pub(crate) fn push_event(&mut self, event: Event) {
-        let _ = self.events.try_send(event);
+        if !self.events.try_send(event.clone()) {
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::EventQueueFull {
+                    event_type: event.variant_name()
+                }
+            );
+        }
     }
 
     /// Push incoming data to the app_incoming channel.
@@ -1497,8 +1508,10 @@ where
     /// Trigger incremental rebalance. Runs one entry now, schedules more if needed.
     pub(crate) fn trigger_rebalance(&mut self, now: Timestamp) {
         if self.rebalance_one(now) {
-            // More work to do, schedule next rebalance in 2τ
-            self.next_rebalance = Some(now + self.tau() * 2);
+            // More work to do, schedule next rebalance with jitter to prevent sync
+            let tau = self.tau();
+            let jitter_ms = self.random.gen_range(0, tau.as_millis());
+            self.next_rebalance = Some(now + tau + Duration::from_millis(jitter_ms));
         }
     }
 

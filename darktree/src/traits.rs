@@ -357,13 +357,14 @@ impl PriorityQueue {
 /// # Priority Model
 ///
 /// The outgoing priority queue automatically orders messages by priority:
-/// 1. Ack (highest) - Link-layer reliability
-/// 2. BroadcastProtocol - DHT backup (BACKUP_PUBLISH)
-/// 3. RoutedProtocol - DHT operations (PUBLISH, LOOKUP, FOUND)
-/// 4. BroadcastData - Application broadcast
-/// 5. RoutedData (lowest) - Application unicast
-///
-/// Pulse messages are sent directly (timer-driven) and bypass the queue.
+/// 1. Pulse (highest) - Tree maintenance
+/// 2. Ack - Link-layer reliability
+/// 3. BroadcastBackup - DHT backup (BACKUP_PUBLISH)
+/// 4. RoutedPublish - DHT PUBLISH operations
+/// 5. RoutedFound - DHT FOUND responses
+/// 6. RoutedLookup - DHT LOOKUP queries
+/// 7. BroadcastData - Application broadcast
+/// 8. RoutedData (lowest) - Application unicast
 ///
 /// # Usage Pattern
 ///
