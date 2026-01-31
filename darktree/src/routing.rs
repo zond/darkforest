@@ -13,8 +13,7 @@ use crate::node::{AckHash, Node};
 use crate::time::Timestamp;
 use crate::traits::{Ackable, Clock, Crypto, Outgoing, Random, Transport};
 use crate::types::{
-    Error, IdHash, NodeId, Routed, Signature, DEFAULT_TTL, MSG_DATA, MSG_FOUND, MSG_LOOKUP,
-    MSG_PUBLISH,
+    Error, IdHash, NodeId, Routed, Signature, MSG_DATA, MSG_FOUND, MSG_LOOKUP, MSG_PUBLISH,
 };
 use crate::wire::{routed_sign_data, Ack};
 
@@ -64,7 +63,7 @@ where
             if self.recently_forwarded().contains_key(&ack_hash) {
                 return; // Already handled
             }
-            self.insert_recently_forwarded(ack_hash, original_hops, now);
+            self.insert_recently_forwarded(ack_hash, original_hops, msg.ttl, now);
 
             emit_debug!(
                 self,
@@ -110,7 +109,9 @@ where
 
         // Duplicate detection: check if we've recently forwarded this message
         // Note: ack_hash excludes TTL/hops so it's the same at any hop
-        if let Some(&(_stored_time, stored_hops, _)) = self.recently_forwarded().get(&ack_hash) {
+        if let Some(&(_stored_time, stored_hops, _, _stored_ttl)) =
+            self.recently_forwarded().get(&ack_hash)
+        {
             if stored_hops == original_hops {
                 // Same hops = retransmission from sender who didn't hear our forward
                 // Send explicit ACK to confirm we received and forwarded it
@@ -145,8 +146,8 @@ where
             return;
         }
 
-        // Not a duplicate - forward and track with hops
-        self.insert_recently_forwarded(ack_hash, original_hops, now);
+        // Not a duplicate - forward and track with hops and TTL
+        self.insert_recently_forwarded(ack_hash, original_hops, msg.ttl, now);
         let _ = self.route_message(msg, now);
     }
 
@@ -193,7 +194,7 @@ where
         incoming_hops: u32,
         now: Timestamp,
     ) {
-        use crate::types::{DEFAULT_TTL, MAX_RETRIES, RECENTLY_FORWARDED_TTL_MULTIPLIER};
+        use crate::types::{MAX_RETRIES, RECENTLY_FORWARDED_TTL_MULTIPLIER};
 
         // Always ACK upstream so they don't retry while we delay (or drop)
         self.send_explicit_ack(ack_hash);
@@ -208,17 +209,18 @@ where
         self.pending_acks_mut().remove(&ack_hash);
 
         // Update recently_forwarded entry: increment seen_count and refresh expiration.
-        // Keep the stored_hops unchanged - it's the value from our first forward.
-        let (seen_count, stored_hops) =
+        // Keep the stored_hops and stored_ttl unchanged - they're from our first forward.
+        let (seen_count, stored_hops, stored_ttl) =
             if let Some(entry) = self.recently_forwarded_mut().get_mut(&ack_hash) {
                 entry.0 = now; // Refresh timestamp
                 let hops_on_first_forward = entry.1; // Preserve for duplicate detection
                 entry.2 = entry.2.saturating_add(1); // Increment seen_count
-                (entry.2, hops_on_first_forward)
+                let ttl_on_first_forward = entry.3; // Preserve for TTL restoration
+                (entry.2, hops_on_first_forward, ttl_on_first_forward)
             } else {
-                // Entry was evicted - recreate with current hops as best guess
-                self.insert_recently_forwarded(ack_hash, incoming_hops, now);
-                (1, incoming_hops)
+                // Entry was evicted - recreate with current values as best guess
+                self.insert_recently_forwarded(ack_hash, incoming_hops, msg.ttl, now);
+                (1, incoming_hops, msg.ttl)
             };
 
         // Give up after MAX_RETRIES, same as ACK timeout behavior
@@ -226,12 +228,11 @@ where
             return;
         }
 
-        // Reset TTL to DEFAULT_TTL for bounce-back retry.
-        // With hops-based detection, we can refresh TTL without losing duplicate detection.
-        // This allows the message more hops to find its destination during tree restructuring.
-        msg.ttl = DEFAULT_TTL;
-        // Restore hops to stored value so duplicate detection works correctly on retry
+        // Restore hops and TTL to stored values so duplicate detection works correctly on retry.
+        // TTL is restored to the value when we first forwarded - bounce-backs are retransmission
+        // attempts, not forward progress, so TTL only decrements for actual routing advancement.
         msg.hops = stored_hops;
+        msg.ttl = stored_ttl;
 
         // Schedule delayed forward with exponential backoff
         // Backoff: 1τ, 2τ, 4τ, 8τ, ..., capped at 128τ (same as ACK retransmit timing)
@@ -751,7 +752,10 @@ where
             } else {
                 None
             },
-            ttl: DEFAULT_TTL,
+            // TTL = max_depth * 3 allows messages to traverse the tree and return.
+            // Minimum of 255 (old u8 max) ensures messages can route during tree formation
+            // when max_depth may not yet reflect the true network depth.
+            ttl: self.max_depth().saturating_mul(3).max(255),
             hops: 0,
             payload,
             signature: Signature::default(),
@@ -1352,8 +1356,8 @@ mod tests {
         // Initially not tracked
         assert!(!node.recently_forwarded().contains_key(&hash));
 
-        // Insert into recently_forwarded (with hops)
-        node.insert_recently_forwarded(hash, 0, now);
+        // Insert into recently_forwarded (with hops and TTL)
+        node.insert_recently_forwarded(hash, 0, 100, now);
 
         // Should now be tracked
         assert!(node.recently_forwarded().contains_key(&hash));
@@ -1428,9 +1432,9 @@ mod tests {
         let hash1: [u8; 4] = [1; 4];
         let hash2: [u8; 4] = [2; 4];
 
-        // Insert two entries at different times (with dummy TTL values)
-        node.insert_recently_forwarded(hash1, 255, now);
-        node.insert_recently_forwarded(hash2, 255, now + Duration::from_secs(10));
+        // Insert two entries at different times (with dummy hops and TTL values)
+        node.insert_recently_forwarded(hash1, 255, 100, now);
+        node.insert_recently_forwarded(hash2, 255, 100, now + Duration::from_secs(10));
 
         // Both should exist
         assert!(node.recently_forwarded().contains_key(&hash1));
@@ -1490,7 +1494,7 @@ mod tests {
             let mut hash: [u8; 4] = [0; 4];
             hash[0] = (i >> 8) as u8;
             hash[1] = (i & 0xFF) as u8;
-            node.insert_recently_forwarded(hash, 255, now);
+            node.insert_recently_forwarded(hash, 255, 100, now);
         }
 
         assert_eq!(
@@ -1500,7 +1504,7 @@ mod tests {
 
         // Insert one more - should evict oldest
         let new_hash: [u8; 4] = [0xFF; 4];
-        node.insert_recently_forwarded(new_hash, 255, now);
+        node.insert_recently_forwarded(new_hash, 255, 100, now);
 
         // Should still be at capacity (not exceed)
         assert_eq!(
@@ -1535,8 +1539,8 @@ mod tests {
 
         let hash = msg.ack_hash(node.crypto());
 
-        // Mark as recently forwarded (simulating first forward)
-        node.insert_recently_forwarded(hash, 0, now);
+        // Mark as recently forwarded (simulating first forward with TTL=255)
+        node.insert_recently_forwarded(hash, 0, 255, now);
 
         // Clear any messages in transport
         node.transport().take_sent();
@@ -1666,8 +1670,8 @@ mod tests {
 
         let hash = msg.ack_hash(node.crypto());
 
-        // Simulate: we forwarded this message before with hops=0 (original)
-        node.insert_recently_forwarded(hash, 0, now);
+        // Simulate: we forwarded this message before with hops=0 and TTL=255
+        node.insert_recently_forwarded(hash, 0, 255, now);
 
         // Now it bounces back with hops=1 (original_hops=0, but msg.hops=1 after their increment)
         // The bounce-back handler detects this because stored_hops (0) != original_hops (1)
@@ -1699,7 +1703,7 @@ mod tests {
             signature: Signature::default(),
         };
         let hash2 = msg_ttl0.ack_hash(node2.crypto());
-        node2.insert_recently_forwarded(hash2, 0, now);
+        node2.insert_recently_forwarded(hash2, 0, 0, now);
 
         // TTL=0 should cause immediate drop
         node2.handle_bounce_back(msg_ttl0, hash2, 1, now);

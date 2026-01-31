@@ -144,7 +144,7 @@ pub enum DebugEvent {
         payload_hash: [u8; 4],
         msg_type: u8,
         dest_addr: u32,
-        ttl: u8,
+        ttl: u32,
     },
     /// Routed message forwarded to next hop.
     /// `direction` is "up" (to parent) or "down" (to child/shortcut).
@@ -153,7 +153,7 @@ pub enum DebugEvent {
         msg_type: u8,
         dest_addr: u32,
         next_hop: NodeId,
-        ttl: u8,
+        ttl: u32,
         my_keyspace: (u32, u32),
         direction: &'static str,
     },
@@ -217,7 +217,7 @@ pub enum DebugEvent {
         payload_hash: [u8; 4],
         msg_type: u8,
         dest_addr: u32,
-        ttl: u8,
+        ttl: u32,
         has_route: bool,
     },
     /// Outgoing queue rejected a routed message (queue full).

@@ -55,10 +55,15 @@ These constants define protocol limits and memory bounds. Implementations MUST r
 | Constant | Value | Rationale |
 |----------|-------|-----------|
 | MAX_CHILDREN | 12 | Ensures worst-case Pulse fits in 252 bytes |
-| MAX_TREE_DEPTH | 127 | TTL/2 ensures round-trip messages can complete |
 | K_REPLICAS | 3 | Location directory replication factor |
-| DEFAULT_TTL | 255 | Maximum hop count for Routed messages |
 | MISSED_PULSES_TIMEOUT | 8 | Pulses before declaring neighbor dead |
+
+**Tree depth:** There is no protocol limit on tree depth. In practice, depth is bounded by:
+- Fan-out: With MAX_CHILDREN=12, depth ≈ log₁₂(N) for network size N
+- TTL: Messages cannot complete round-trip if depth > TTL/2
+- Latency: Each hop adds ~τ delay; deep trees have high latency
+
+**TTL calculation:** When creating Routed messages, TTL is computed as `max(255, max_depth * 3)`. This ensures messages can traverse the tree and return, with a floor of 255 to handle tree formation when max_depth is not yet known.
 
 ### Timing Constants
 
@@ -66,7 +71,7 @@ These constants define protocol limits and memory bounds. Implementations MUST r
 |----------|-------|-----------|
 | MIN_TAU_MS | 100 | Floor for unlimited-bandwidth links |
 | RECENTLY_FORWARDED_TTL | 320τ | Must exceed worst-case retry (~280τ) |
-| LOOKUP_TIMEOUT | 3τ + 3τ × max_tree_depth | Per-replica; scales with tree depth |
+| LOOKUP_TIMEOUT | 3τ + 3τ × max_depth | Per-replica; scales with observed tree depth |
 | DISTRUST_TTL | 24 hours | How long to avoid fraudulent nodes |
 
 ### Memory Bounds
@@ -194,8 +199,8 @@ struct Pulse {
     flags: u8,                          // 1 byte (see layout below)
     parent_hash: Option<[u8; 4]>,       // 0 or 4 bytes (truncated hash of parent node_id)
     root_hash: [u8; 4],                 // 4 bytes (truncated hash of root node_id)
-    depth: u8,                          // 1 byte (distance from root, 0 = root)
-    max_depth: u8,                      // 1 byte (max depth in subtree below)
+    depth: varint,                      // 1-5 bytes (distance from root, 0 = root)
+    max_depth: varint,                  // 1-5 bytes (max depth in subtree below)
     subtree_size: varint,               // 1-3 bytes
     tree_size: varint,                  // 1-3 bytes
     keyspace_lo: u32,                   // 4 bytes (start of owned keyspace range)
@@ -313,7 +318,7 @@ Pulses have no sequence number. This is a deliberate tradeoff:
 
 **Size formula:** `96 + has_parent×4 + has_pubkey×32 + children×(4+varint) + varint_overhead`
 
-Base: 16 (node_id) + 1 (flags) + 4 (root_hash) + 1 (depth) + 1 (max_depth) + 2 (subtree_size) + 2 (tree_size) + 4 (keyspace_lo) + 4 (keyspace_hi) + 65 (signature) = 100 bytes. Subtract 4 for no parent ≈ 96 bytes minimum.
+Base: 16 (node_id) + 1 (flags) + 4 (root_hash) + 1-5 (depth varint) + 1-5 (max_depth varint) + 1-5 (subtree_size varint) + 1-5 (tree_size varint) + 4 (keyspace_lo) + 4 (keyspace_hi) + 65 (signature) ≈ 96-108 bytes minimum. Typical shallow trees use 1 byte each for depth/max_depth.
 
 **MTU constraints:** MAX_CHILDREN is set to 12 to guarantee worst-case Pulse (with pubkey and maximum varints) fits within 252 bytes, leaving headroom for any transport framing.
 
@@ -1304,7 +1309,7 @@ struct Routed {
     src_addr: Option<u32>,          // sender's keyspace address for replies
     src_node_id: NodeId,            // sender identity
     src_pubkey: Option<PublicKey>,  // sender's public key (optional, for signature verification)
-    ttl: u8,                        // hop limit, reset on bounce-back
+    ttl: varint,                    // hop limit (computed from max(255, max_depth * 3))
     hops: varint,                   // actual hop count, always increments (for duplicate detection)
     payload: Vec<u8>,               // type-specific content
     signature: Signature,           // Ed25519 signature (see below)
@@ -1353,7 +1358,7 @@ Include src_pubkey when: LOOKUP (so storage node can verify and respond).
 Omit src_pubkey when: PUBLISH/FOUND (LOC: signature in payload has pubkey), DATA (receiver has cached pubkey).
 If receiver lacks pubkey and message has none, drop message (sender retries with pubkey).
 
-**ttl** is the hop limit, decremented at each forward. Reset to DEFAULT_TTL on bounce-back to prevent TTL exhaustion in routing loops.
+**ttl** is the hop limit, decremented at each forward. Computed as `max(255, max_depth * 3)` when creating messages—the floor of 255 ensures messages can route during tree formation when max_depth may not yet be known. On bounce-back, TTL is restored to the value when first forwarded (not reset), because bounce-backs are retransmission attempts, not forward progress.
 
 **hops** counts actual forwards (see "Duplicate Detection and Bounce-Back" in Message Reliability section):
 - Originator sends with `hops=0`
@@ -1361,7 +1366,7 @@ If receiver lacks pubkey and message has none, drop message (sender retries with
 - Retransmissions do NOT increment hops (same value as original send)
 - Saturates at maximum varint value (no wrap-around)
 
-**Saturation vs TTL:** Since TTL is a u8 (max 255) and messages expire when TTL reaches 0, hops can never exceed 255 in normal operation—TTL exhaustion occurs first. Varint saturation (at ~2^63) is therefore not a practical concern.
+**TTL and hops:** Both TTL and hops use varint encoding (u32 internally). TTL decrements at each hop; hops increments. Messages expire when TTL reaches 0.
 
 ### Typical Flag Combinations
 
@@ -1426,9 +1431,8 @@ This section describes how messages are forwarded through the tree.
 Messages route toward `dest_addr` using keyspace ranges. Each hop forwards to the neighbor with the tightest range containing the destination, or upward to parent. The `next_hop` field ensures only the intended forwarder processes each hop, preventing message amplification in dense networks.
 
 ```rust
-const DEFAULT_TTL: u8 = 255;  // max hops
-
 impl Node {
+    // TTL computed as max(255, max_depth * 3) when creating messages
     fn route(&mut self, mut msg: Routed) {
         // TTL check - prevent routing loops
         if msg.ttl == 0 {
@@ -1662,7 +1666,7 @@ impl Node {
             src_addr,
             src_node_id: self.node_id,
             src_pubkey: ...,  // include if needed
-            ttl: DEFAULT_TTL,
+            ttl: max(255, self.max_depth * 3),  // dynamic TTL
             payload,
             signature: self.sign(&routed_sign_data(...)),
         };
@@ -1867,7 +1871,7 @@ fn handle_bounce_back(&mut self, msg: Routed, ack_hash: [u8; 4]) {
 
 #### TTL=1 Behavior
 
-When a message arrives with TTL=1, the forwarder cannot continue routing (TTL=0 means expired). If `dest_addr` is within the forwarder's keyspace, the message is delivered locally. Otherwise, the message expires silently — the sender will retry and eventually give up. Senders should use sufficient TTL for the expected hop count (DEFAULT_TTL=255 provides ample headroom).
+When a message arrives with TTL=1, the forwarder cannot continue routing (TTL=0 means expired). If `dest_addr` is within the forwarder's keyspace, the message is delivered locally. Otherwise, the message expires silently — the sender will retry and eventually give up. The dynamic TTL calculation (`max(255, max_depth * 3)`) provides ample headroom for most networks.
 
 #### Example Flows
 
@@ -2482,7 +2486,7 @@ Lookups find a node's current keyspace address by querying replicas.
 // For UDP (τ=0.1s) with 10-deep tree: ~33τ ≈ 3.3 seconds per replica
 //
 // max_tree_depth source: use the root's max_depth from its Pulse if known,
-// otherwise use MAX_TREE_DEPTH (127) as a safe upper bound.
+// otherwise use a conservative estimate based on expected network size.
 fn lookup_timeout(&self) -> Duration {
     self.tau() * (3 + 3 * self.max_tree_depth as u32)
 }
@@ -2708,9 +2712,9 @@ Future version 1 Pulse = 0x09 (version 1, type 1) — (1 << 3) | 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                         root_hash (4 bytes)                   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|     depth     |   max_depth   |  subtree_size (varint 1-3)   ...
+| depth (varint 1-5) | max_depth (varint 1-5) | subtree_size ...
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-...  |   tree_size (varint 1-3)   |
+... (varint 1-5)  |   tree_size (varint 1-5)   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                       keyspace_lo (4 bytes)                   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -2732,10 +2736,10 @@ Future version 1 Pulse = 0x09 (version 1, type 1) — (1 << 3) | 1
 - bits 4-7: child_count (0-12)
 
 **Depth fields:**
-- `depth` (u8): Distance from root. Root has depth=0. Max value 255.
-- `max_depth` (u8): Maximum depth in this node's subtree. Leaf has max_depth=depth.
+- `depth` (varint): Distance from root. Root has depth=0. No protocol limit; bounded by physics.
+- `max_depth` (varint): Maximum depth in this node's subtree. Leaf has max_depth=depth.
 
-Pulses with `max_depth < depth` MUST be rejected during parsing (invalid by construction).
+Pulses with `max_depth < depth` MUST be rejected during parsing (invalid by construction). Typical shallow trees use 1 byte per field (values < 128).
 
 **Note:** The `subtree_size` and `tree_size` fields are varints with variable length (1-3 bytes each). Fields after these varints have variable byte offsets. The diagram shows typical placement; actual offsets depend on varint lengths.
 
@@ -2760,7 +2764,7 @@ Pulses with `max_depth < depth` MUST be rejected during parsing (invalid by cons
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                   src_pubkey (0 or 32 bytes)                  |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|      ttl      | hops (varint) |      payload (variable)       |
+| ttl (varint)  | hops (varint) |      payload (variable)       |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 | alg=1 |                  signature (64 bytes)                 |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -2773,7 +2777,9 @@ Pulses with `max_depth < depth` MUST be rejected during parsing (invalid by cons
 - bit 6: has_src_pubkey
 - bit 7: reserved (must be 0)
 
-**hops** is a varint (typically 1 byte) that counts actual forwards. Unlike ttl which resets on bounce-back, hops always increments.
+**ttl** is a varint (typically 1-2 bytes) computed as `max(255, max_depth * 3)`. On bounce-back, TTL is restored to the value when first forwarded (not reset), because bounce-backs are retransmission attempts, not forward progress.
+
+**hops** is a varint (typically 1 byte) that counts actual forwards. hops always increments at each hop.
 
 ### ACK Layout
 
@@ -3065,9 +3071,10 @@ This section describes the conventions used in this document. Future edits shoul
 This document specifies constants that affect protocol behavior or interoperability. Implementation-only constants belong in code documentation.
 
 **Document in design.md:**
-- Protocol-visible behavior (MAX_CHILDREN, K_REPLICAS, DEFAULT_TTL, MAX_TREE_DEPTH)
+- Protocol-visible behavior (MAX_CHILDREN, K_REPLICAS)
 - Correctness constraints with mathematical rationale (RECENTLY_FORWARDED_TTL, LOOKUP_TIMEOUT, MAX_RETRIES)
 - Security policies (DISTRUST_TTL, MISSED_PULSES_TIMEOUT)
+- Dynamic calculations (TTL = max(255, max_depth * 3))
 - Memory bounds that affect node capacity (in the Memory Analysis table)
 
 **Implementation-only (code docs):**

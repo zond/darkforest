@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! node_id (16) || flags (1) || [parent_hash (4)] || root_hash (4)
-//! || depth (1) || max_depth (1) || subtree_size (varint) || tree_size (varint)
+//! || depth (varint) || max_depth (varint) || subtree_size (varint) || tree_size (varint)
 //! || keyspace_lo (4) || keyspace_hi (4)
 //! || [pubkey (32)] || children (N × (hash(4) + subtree_size(varint)))
 //! || signature (65)
@@ -25,7 +25,7 @@
 //!
 //! ```text
 //! flags_and_type (1) || next_hop (4) || dest_addr (4) || [dest_hash (4)] || [src_addr (4)]
-//! || src_node_id (16) || [src_pubkey (32)] || ttl (1) || hops (varint) || payload || signature (65)
+//! || src_node_id (16) || [src_pubkey (32)] || ttl (varint) || hops (varint) || payload || signature (65)
 //!
 //! flags_and_type byte:
 //! - bits 0-3: msg_type
@@ -484,8 +484,8 @@ impl Encode for Pulse {
         }
 
         w.write_id_hash(&self.root_hash);
-        w.write_u8(self.depth);
-        w.write_u8(self.max_depth);
+        w.write_varint(self.depth);
+        w.write_varint(self.max_depth);
         w.write_varint(self.subtree_size);
         w.write_varint(self.tree_size);
         w.write_u32_be(self.keyspace_lo);
@@ -526,8 +526,8 @@ impl Decode for Pulse {
         };
 
         let root_hash = r.read_id_hash()?;
-        let depth = r.read_u8()?;
-        let max_depth = r.read_u8()?;
+        let depth = r.read_varint()?;
+        let max_depth = r.read_varint()?;
         let subtree_size = r.read_varint()?;
         let tree_size = r.read_varint()?;
         let keyspace_lo = r.read_u32_be()?;
@@ -632,7 +632,7 @@ impl Encode for Routed {
             }
         }
 
-        w.write_u8(self.ttl);
+        w.write_varint(self.ttl);
         w.write_varint(self.hops);
         // Payload length is implicit (remaining bytes before signature)
         w.write_bytes(&self.payload);
@@ -684,7 +684,7 @@ impl Decode for Routed {
             None
         };
 
-        let ttl = r.read_u8()?;
+        let ttl = r.read_varint()?;
         let hops = r.read_varint()?;
 
         // Payload length is implicit: remaining bytes minus signature (65 bytes)
@@ -957,8 +957,8 @@ pub(crate) fn pulse_sign_data(pulse: &Pulse) -> Writer {
     }
 
     w.write_id_hash(&pulse.root_hash);
-    w.write_u8(pulse.depth);
-    w.write_u8(pulse.max_depth);
+    w.write_varint(pulse.depth);
+    w.write_varint(pulse.max_depth);
     w.write_varint(pulse.subtree_size);
     w.write_varint(pulse.tree_size);
     w.write_u32_be(pulse.keyspace_lo);
@@ -1485,8 +1485,8 @@ mod tests {
             children.dedup_by(|a, b| a.0 == b.0);
 
             let sig: [u8; 64] = u.arbitrary()?;
-            let depth: u8 = u.arbitrary()?;
-            let max_depth: u8 = u.int_in_range(depth..=255)?;
+            let depth: u32 = u.arbitrary()?;
+            let max_depth: u32 = u.int_in_range(depth..=u32::MAX)?;
             let unstable: bool = u.arbitrary()?;
             let pulse = Pulse {
                 node_id,
@@ -1549,7 +1549,7 @@ mod tests {
             } else {
                 None
             };
-            let ttl: u8 = u.arbitrary()?;
+            let ttl: u32 = u.arbitrary()?;
 
             // Limit payload size
             let payload_len: usize = u.int_in_range(0..=100)?;

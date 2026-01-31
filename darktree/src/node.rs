@@ -77,10 +77,10 @@ pub(crate) struct NeighborTiming {
     pub keyspace_range: (u32, u32),
     /// Number of children the neighbor has.
     pub children_count: u8,
-    /// Neighbor's depth in tree (0 = root).
-    pub depth: u8,
-    /// Maximum depth in neighbor's subtree.
-    pub max_depth: u8,
+    /// Neighbor's depth in tree (0 = root). No protocol limit.
+    pub depth: u32,
+    /// Maximum depth in neighbor's subtree. No protocol limit.
+    pub max_depth: u32,
     /// Whether neighbor is shopping for parent.
     pub unstable: bool,
 }
@@ -145,18 +145,18 @@ pub(crate) struct PendingAck {
     /// Timestamp when next retry should occur.
     pub next_retry_at: Timestamp,
     /// TTL value when message was sent (for implicit ACK verification).
-    pub sent_ttl: u8,
+    pub sent_ttl: u32,
 }
 
 /// Map of pending ACKs keyed by message hash.
 pub(crate) type PendingAckMap = ShrinkingHashMap<AckHash, PendingAck>;
 
 /// Map of recently forwarded message hashes for duplicate detection.
-/// Stores (timestamp, hops, seen_count) to distinguish retransmissions from alternate paths
-/// and track bounce-back occurrences for exponential backoff.
-/// hops is u32 because it's a varint on the wire.
+/// Stores (timestamp, hops, seen_count, ttl) to distinguish retransmissions from alternate paths,
+/// track bounce-back occurrences for exponential backoff, and restore TTL on bounce-back.
+/// hops and ttl are u32 because they're varints on the wire.
 /// Uses ShrinkingHashMap to reclaim memory when traffic subsides.
-pub(crate) type RecentlyForwardedMap = ShrinkingHashMap<AckHash, (Timestamp, u32, u8)>;
+pub(crate) type RecentlyForwardedMap = ShrinkingHashMap<AckHash, (Timestamp, u32, u8, u32)>;
 
 /// Backup entry for DHT redundancy.
 ///
@@ -247,8 +247,8 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     subtree_size: u32,
     keyspace_lo: u32,
     keyspace_hi: u32,
-    depth: u8,     // Distance from root (0 = root)
-    max_depth: u8, // Max depth in subtree rooted at this node
+    depth: u32,     // Distance from root (0 = root). No protocol limit.
+    max_depth: u32, // Max depth in subtree rooted at this node. No protocol limit.
 
     // Neighbors
     children: ChildrenStore,
@@ -1154,7 +1154,7 @@ where
     pub(crate) fn cleanup_recently_forwarded(&mut self, now: Timestamp) {
         let expiry = self.tau() * RECENTLY_FORWARDED_TTL_MULTIPLIER;
         self.recently_forwarded
-            .retain(|_, &mut (timestamp, _, _)| now.saturating_sub(timestamp) < expiry);
+            .retain(|_, &mut (timestamp, _, _, _)| now.saturating_sub(timestamp) < expiry);
     }
 
     /// Calculate retry backoff duration with exponential growth and jitter.
@@ -1464,19 +1464,19 @@ where
         self.keyspace_hi = hi;
     }
 
-    pub(crate) fn depth(&self) -> u8 {
+    pub(crate) fn depth(&self) -> u32 {
         self.depth
     }
 
-    pub(crate) fn set_depth(&mut self, depth: u8) {
+    pub(crate) fn set_depth(&mut self, depth: u32) {
         self.depth = depth;
     }
 
-    pub(crate) fn max_depth(&self) -> u8 {
+    pub(crate) fn max_depth(&self) -> u32 {
         self.max_depth
     }
 
-    pub(crate) fn set_max_depth(&mut self, max_depth: u8) {
+    pub(crate) fn set_max_depth(&mut self, max_depth: u32) {
         self.max_depth = max_depth;
     }
 
@@ -1696,7 +1696,7 @@ where
         hash: AckHash,
         original_bytes: Vec<u8>,
         priority: crate::types::Priority,
-        sent_ttl: u8,
+        sent_ttl: u32,
         now: Timestamp,
     ) {
         if self.pending_acks.len() >= Cfg::MAX_PENDING_ACKS
@@ -1718,15 +1718,22 @@ where
     /// Insert a recently forwarded entry with bounded eviction.
     ///
     /// Evicts the oldest entry by timestamp when at capacity.
-    /// Stores timestamp, hops, and seen_count to distinguish retransmissions from alternate paths
-    /// and track bounce-back occurrences.
-    pub(crate) fn insert_recently_forwarded(&mut self, hash: AckHash, hops: u32, now: Timestamp) {
+    /// Stores timestamp, hops, seen_count, and ttl to distinguish retransmissions from alternate paths,
+    /// track bounce-back occurrences, and restore TTL on bounce-back.
+    pub(crate) fn insert_recently_forwarded(
+        &mut self,
+        hash: AckHash,
+        hops: u32,
+        ttl: u32,
+        now: Timestamp,
+    ) {
         if self.recently_forwarded.len() >= Cfg::MAX_RECENTLY_FORWARDED
             && !self.recently_forwarded.contains_key(&hash)
         {
-            self.recently_forwarded.remove_min_by_key(|&(ts, _, _)| ts);
+            self.recently_forwarded
+                .remove_min_by_key(|&(ts, _, _, _)| ts);
         }
-        self.recently_forwarded.insert(hash, (now, hops, 1));
+        self.recently_forwarded.insert(hash, (now, hops, 1, ttl));
     }
 
     // =========================================================================

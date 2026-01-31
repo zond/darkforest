@@ -6,8 +6,6 @@ use core::fmt;
 use crate::time::{Duration, Timestamp};
 
 // Protocol limits (not configurable via NodeConfig)
-#[allow(dead_code)] // Reserved for future depth validation
-pub(crate) const MAX_TREE_DEPTH: usize = 127; // TTL 255 / 2 for round-trip
 pub const MAX_CHILDREN: usize = 12; // Guarantees worst-case Pulse fits in 252 bytes
 pub const MAX_PACKET_SIZE: usize = 255;
 /// Recently forwarded entries expire after 320τ to allow for slow multi-hop ACKs.
@@ -16,7 +14,6 @@ pub(crate) const RECENTLY_FORWARDED_TTL_MULTIPLIER: u64 = 320;
 
 // Protocol constants
 pub const K_REPLICAS: usize = 3;
-pub const DEFAULT_TTL: u8 = 255; // Max hops
 
 // Timing constants
 /// Maximum retransmission attempts before giving up. With exponential backoff
@@ -220,10 +217,10 @@ pub struct Pulse {
     pub parent_hash: Option<IdHash>,
     /// Truncated hash of root node.
     pub root_hash: IdHash,
-    /// Distance from root (0 = root).
-    pub depth: u8,
-    /// Maximum depth in subtree rooted at this node.
-    pub max_depth: u8,
+    /// Distance from root (0 = root). No protocol limit; bounded by TTL and physics.
+    pub depth: u32,
+    /// Maximum depth in subtree rooted at this node. No protocol limit.
+    pub max_depth: u32,
     /// Size of subtree rooted at this node.
     pub subtree_size: u32,
     /// Total size of the tree.
@@ -341,8 +338,8 @@ pub struct Routed {
     pub src_node_id: NodeId,
     /// Optional source public key.
     pub src_pubkey: Option<PublicKey>,
-    /// Time-to-live hop counter.
-    pub ttl: u8,
+    /// Time-to-live hop counter. Uses varint encoding on wire.
+    pub ttl: u32,
     /// Actual hop count (increments at each hop, unlike TTL which decrements).
     /// Used for duplicate detection: same hops = retransmission, different = bounce-back.
     /// Not signed - varies at each hop like TTL.
@@ -395,6 +392,8 @@ impl Routed {
     }
 }
 
+// Manual impl to document that TTL=0 is intentional (real messages use create_routed())
+#[allow(clippy::derivable_impls)]
 impl Default for Routed {
     fn default() -> Self {
         Self {
@@ -405,7 +404,9 @@ impl Default for Routed {
             src_addr: None,
             src_node_id: [0u8; 16],
             src_pubkey: None,
-            ttl: DEFAULT_TTL,
+            // TTL is computed dynamically from max(255, max_depth * 3) when creating messages.
+            // Default to 0; real messages set TTL via create_routed().
+            ttl: 0,
             hops: 0,
             payload: Vec::new(),
             signature: Signature::default(),
