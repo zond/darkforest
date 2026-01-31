@@ -294,9 +294,6 @@ pub struct Node<T, Cr, R, Clk, Cfg: NodeConfig = DefaultConfig> {
     location_seq: u32,
     proactive_pulse_pending: Option<Timestamp>,
     shopping_deadline: Option<Timestamp>,
-    // Shopping state - preserved parent/tree before shopping started
-    old_parent: Option<NodeId>,
-    old_tree: Option<IdHash>,
 
     // Metrics
     metrics: TransportMetrics,
@@ -435,8 +432,6 @@ where
             location_seq: 0,
             proactive_pulse_pending: None,
             shopping_deadline: None,
-            old_parent: None,
-            old_tree: None,
 
             metrics: TransportMetrics::new(),
 
@@ -1485,19 +1480,9 @@ where
         self.max_depth = max_depth;
     }
 
-    pub(crate) fn old_parent(&self) -> Option<NodeId> {
-        self.old_parent
-    }
-
-    pub(crate) fn old_tree(&self) -> Option<IdHash> {
-        self.old_tree
-    }
-
     /// Clear shopping state after parent selection is complete.
     pub(crate) fn clear_shopping(&mut self) {
         self.shopping_deadline = None;
-        self.old_parent = None;
-        self.old_tree = None;
     }
 
     pub(crate) fn next_location_seq(&mut self) -> u32 {
@@ -1570,11 +1555,10 @@ where
     ///
     /// Duration: 3τ + 2τ × levels_below_me, where levels_below = max_depth - depth.
     /// This allows deeper subtrees more time to stabilize during parent selection.
+    ///
+    /// During shopping, current state (parent, root_hash, depth) is preserved and used
+    /// for candidate filtering. We only become root if shopping finds no valid candidates.
     pub(crate) fn start_shopping(&mut self, now: Timestamp) {
-        // Preserve current parent and tree for preference ordering
-        self.old_parent = self.parent;
-        self.old_tree = Some(self.root_hash);
-
         // Scaled duration: 3τ + 2τ × levels_below_me
         let levels_below = self.max_depth.saturating_sub(self.depth);
         let shopping_duration = self.tau() * (3 + 2 * levels_below as u64);

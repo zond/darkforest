@@ -1295,7 +1295,7 @@ mod tests {
         use crate::topology::Link;
 
         // Create simulator
-        let mut sim = Simulator::new(42);
+        let mut sim = Simulator::new(42).with_debug_print();
 
         // Create Tree A: 10 nodes fully connected (will be the larger tree)
         let mut tree_a = Vec::with_capacity(10);
@@ -1322,7 +1322,9 @@ mod tests {
         // No links between trees initially
 
         // Run to let each group form its own tree
-        sim.run_for(Duration::from_secs(10));
+        // With new shopping logic (no become_root before shopping), tree formation
+        // takes longer due to cascading delays
+        sim.run_for(Duration::from_secs(20));
 
         // Verify two separate trees formed
         sim.take_snapshot();

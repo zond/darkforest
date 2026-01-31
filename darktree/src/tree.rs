@@ -320,8 +320,20 @@ where
                 self.recalculate_max_depth();
             }
 
-            // Clear pending state since we're acknowledged
-            self.set_pending_parent(None);
+            // Only clear pending_parent if it points to our current parent.
+            // If pending_parent points to a different node, we're trying to switch
+            // parents and shouldn't clear it just because our current parent acked us.
+            if let Some((pending_id, _)) = self.pending_parent() {
+                if pending_id == pulse.node_id {
+                    emit_debug!(
+                        self,
+                        crate::debug::DebugEvent::PendingParentCleared {
+                            reason: "acknowledged_by_current_parent",
+                        }
+                    );
+                    self.set_pending_parent(None);
+                }
+            }
             self.set_parent_rejection_count(0);
 
             // If keyspace or depth changed, schedule republish and rebalance
@@ -485,6 +497,14 @@ where
         if let Some(my_idx) = self.find_child_index(pulse, &my_hash) {
             // We're acknowledged! Complete the parent switch
             let parent_id = pulse.node_id;
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::ParentAcknowledged {
+                    parent_id,
+                    new_root_hash: pulse.root_hash,
+                    new_tree_size: pulse.tree_size,
+                }
+            );
             self.set_parent(Some(parent_id));
             self.set_pending_parent(None);
 
@@ -521,8 +541,22 @@ where
             let new_count = current_count + 1;
             if new_count >= PARENT_ACK_PULSES {
                 // Give up on this parent, try another
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::PendingParentTimeout {
+                        parent_id: pulse.node_id,
+                        attempts: new_count,
+                    }
+                );
                 self.set_pending_parent(None);
             } else {
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::PendingParentPulseCount {
+                        parent_id: pulse.node_id,
+                        count: new_count,
+                    }
+                );
                 self.set_pending_parent(Some((pulse.node_id, new_count)));
             }
         }
@@ -610,18 +644,10 @@ where
             }
         );
 
-        // TREE INVERSION: Leave our current tree position
-        // When joining a bigger tree, we first become root of our own subtree.
-        // Our children stay with us (they'll update their root_hash from our pulses).
-        // Our former parent (if any) will see we're gone and may join later.
-        // This local rule converges to a properly inverted tree.
-        self.become_root();
-
-        // Rebalance keyspace after position change
-        self.trigger_rebalance(now);
-
-        // Start shopping phase (3τ) to collect candidates from dominating tree
-        // When shopping ends, select_best_parent picks the shallowest position
+        // Start shopping phase to collect candidates from dominating tree.
+        // We do NOT become root - we keep our current state (parent, depth, root_hash).
+        // Tree inversion happens naturally: when we join the dominating tree, our
+        // old parent sees we left (different root_hash in our pulse) and may also join.
         self.start_shopping(now);
 
         // Schedule proactive pulse to announce we're looking for a parent
@@ -638,17 +664,18 @@ where
     /// Select the best parent from discovered neighbors.
     ///
     /// Called when shopping phase ends. Implements unified parent selection:
-    /// 1. Filter: not full, not distrusted, not unstable (except old_parent)
+    /// 1. Filter: not full, not distrusted, not unstable (except current parent)
     /// 2. Preference order:
     ///    a. Dominating tree candidates - pick shallowest by depth
-    ///    b. Old parent still valid?
-    ///    c. Current tree candidates - pick shallowest by depth
+    ///    b. Current parent still valid?
+    ///    c. Same tree candidates (depth < ours) - pick shallowest by depth
     ///    d. Become root
     pub(crate) fn select_best_parent(&mut self, now: Timestamp) {
-        let old_parent = self.old_parent();
-        let old_tree = self.old_tree();
+        let current_parent = self.parent();
+        let current_root = *self.root_hash();
+        let current_depth = self.depth();
 
-        // Collect valid candidates: not full, not distrusted, not unstable (except old_parent)
+        // Collect valid candidates: not full, not distrusted, not unstable (except current parent)
         // Also filter by transport's RSSI threshold to avoid unreliable links
         let candidates: Vec<([u8; 16], &crate::node::NeighborTiming)> = self
             .neighbor_times()
@@ -656,14 +683,14 @@ where
             .filter(|(id, timing)| {
                 timing.children_count < MAX_CHILDREN as u8
                     && !self.is_distrusted(id, now)
-                    && (!timing.unstable || Some(**id) == old_parent)
+                    && (!timing.unstable || Some(**id) == current_parent)
                     && self.transport().is_acceptable_rssi(timing.rssi)
             })
             .map(|(id, timing)| (*id, timing))
             .collect();
 
         if candidates.is_empty() {
-            // No valid candidates - stay as root
+            // No valid candidates - become root
             self.become_root();
             self.clear_shopping();
             self.schedule_location_publish(now);
@@ -698,6 +725,10 @@ where
                 .collect();
 
             if let Some(best) = Self::pick_shallowest(&dominating) {
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::PendingParentSet { parent_id: best }
+                );
                 self.set_pending_parent(Some((best, 0)));
                 self.clear_shopping();
                 self.schedule_proactive_pulse(now);
@@ -705,30 +736,38 @@ where
             }
         }
 
-        // 5b. Old parent still valid?
-        if let Some(old_p) = old_parent {
-            let old_p_valid = candidates.iter().any(|(id, _)| *id == old_p);
-            if old_p_valid {
-                self.set_pending_parent(Some((old_p, 0)));
+        // 5b. Current parent still valid?
+        if let Some(parent) = current_parent {
+            let parent_valid = candidates.iter().any(|(id, _)| *id == parent);
+            if parent_valid {
+                emit_debug!(
+                    self,
+                    crate::debug::DebugEvent::PendingParentSet { parent_id: parent }
+                );
+                self.set_pending_parent(Some((parent, 0)));
                 self.clear_shopping();
                 self.schedule_proactive_pulse(now);
                 return;
             }
         }
 
-        // 5c. Current tree candidates - pick shallowest from same tree
-        if let Some(old_root) = old_tree {
-            let same_tree: Vec<_> = candidates
-                .iter()
-                .filter(|(_, t)| t.root_hash == old_root)
-                .collect();
+        // 5c. Same tree candidates - pick shallowest, but only from nodes shallower than us.
+        // Filtering by depth < current_depth prevents selecting descendants as parents,
+        // which would create cycles in the tree.
+        let same_tree: Vec<_> = candidates
+            .iter()
+            .filter(|(_, t)| t.root_hash == current_root && t.depth < current_depth)
+            .collect();
 
-            if let Some(best) = Self::pick_shallowest(&same_tree) {
-                self.set_pending_parent(Some((best, 0)));
-                self.clear_shopping();
-                self.schedule_proactive_pulse(now);
-                return;
-            }
+        if let Some(best) = Self::pick_shallowest(&same_tree) {
+            emit_debug!(
+                self,
+                crate::debug::DebugEvent::PendingParentSet { parent_id: best }
+            );
+            self.set_pending_parent(Some((best, 0)));
+            self.clear_shopping();
+            self.schedule_proactive_pulse(now);
+            return;
         }
 
         // 5d. Become root
@@ -979,11 +1018,13 @@ where
             .map(|(hash, entry)| (*hash, entry.subtree_size))
             .collect();
 
-        // Determine flags - include pending_parent as "has parent" so prospective
-        // parent can see we want to join them
+        // Determine flags - prefer pending_parent over current parent so prospective
+        // parent can see we want to join them and add us as a child.
+        // If we're switching parents, we need to advertise the new parent.
         let effective_parent = self
-            .parent()
-            .or_else(|| self.pending_parent().map(|(id, _)| id));
+            .pending_parent()
+            .map(|(id, _)| id)
+            .or(self.parent());
         let has_parent = effective_parent.is_some();
         let we_need_pubkeys = !self.need_pubkey().is_empty();
         let neighbors_need_ours = !self.neighbors_need_pubkey().is_empty();
@@ -1078,13 +1119,12 @@ where
             // Remove from neighbor times
             self.neighbor_times_mut().remove(&id);
 
-            // If parent, become root
-            if self.parent() == Some(id) {
-                self.become_root();
-                self.push_event(Event::TreeChanged {
-                    new_root: *self.root_hash(),
-                    new_size: self.subtree_size(),
-                });
+            // If parent timed out, start shopping (don't become root yet).
+            // We keep self.parent so that if the parent comes back during shopping
+            // (by pulsing again), step 5b of select_best_parent can re-select them.
+            if self.parent() == Some(id) && !self.is_shopping() {
+                self.start_shopping(now);
+                self.schedule_proactive_pulse(now);
             }
 
             // If child, remove
@@ -1182,13 +1222,14 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_neighbor_timeouts_parent() {
+    fn test_handle_neighbor_timeouts_parent_starts_shopping() {
         let mut node = make_node();
         let now = Timestamp::from_secs(1000);
 
         // Set up a parent
         let parent_id: NodeId = [1u8; 16];
         node.set_parent(Some(parent_id));
+        node.set_depth(1);
 
         // Add neighbor timing for parent (last seen long ago)
         let old_time = Timestamp::from_secs(100);
@@ -1209,11 +1250,24 @@ mod tests {
 
         // Verify parent is set
         assert_eq!(node.parent(), Some(parent_id));
+        assert!(!node.is_shopping());
 
-        // Handle timeouts - parent should timeout and node becomes root
+        // Handle timeouts - parent times out, node starts shopping
         node.handle_neighbor_timeouts(now);
 
-        // Parent should be None (we became root)
+        // Node should be shopping, but parent is still set (preserved for step 5b)
+        assert!(node.is_shopping(), "Should start shopping when parent times out");
+        assert_eq!(
+            node.parent(),
+            Some(parent_id),
+            "Parent should be preserved during shopping"
+        );
+
+        // After shopping completes with no candidates, node becomes root
+        let after_shopping = now + node.tau() * 4;
+        node.select_best_parent(after_shopping);
+
+        assert!(node.is_root(), "Should become root after shopping with no candidates");
         assert_eq!(node.parent(), None);
     }
 
@@ -1796,6 +1850,150 @@ mod tests {
             node.children().get(&child_id).unwrap().subtree_size,
             10,
             "Subtree size should be updated to 10"
+        );
+    }
+
+    #[test]
+    fn test_select_best_parent_filters_descendants_by_depth() {
+        // Test that descendants (nodes with depth >= our depth) are filtered out
+        // when selecting a parent from the same tree. This prevents cycles.
+        let mut node = make_node();
+        let now = Timestamp::from_secs(1000);
+
+        // Set up node at depth 5 with a parent (not root)
+        let parent_id: NodeId = [1u8; 16];
+        let root_hash: IdHash = [0xAA; 4];
+        node.set_parent(Some(parent_id));
+        node.set_depth(5);
+        node.set_root_hash(root_hash);
+        node.set_tree_size(100);
+        node.set_subtree_size(10);
+
+        // Add a "grandchild" neighbor at depth 7 (same tree, but deeper than us)
+        // This simulates a descendant that we should NOT select as parent
+        let grandchild_id: NodeId = [2u8; 16];
+        node.insert_neighbor_time(
+            grandchild_id,
+            NeighborTiming {
+                last_seen: now,
+                rssi: Some(-70),
+                root_hash,      // Same tree
+                tree_size: 100, // Same tree size
+                keyspace_range: (1000, 2000),
+                children_count: 0,
+                depth: 7, // Deeper than us (5) - should be filtered
+                max_depth: 7,
+                unstable: false,
+            },
+        );
+
+        // Add another descendant at depth 5 (same depth as us - also filtered)
+        let sibling_depth_id: NodeId = [3u8; 16];
+        node.insert_neighbor_time(
+            sibling_depth_id,
+            NeighborTiming {
+                last_seen: now,
+                rssi: Some(-70),
+                root_hash,
+                tree_size: 100,
+                keyspace_range: (2000, 3000),
+                children_count: 0,
+                depth: 5, // Same depth as us - should be filtered
+                max_depth: 5,
+                unstable: false,
+            },
+        );
+
+        // Start shopping (simulating parent loss)
+        node.start_shopping(now);
+        assert!(node.is_shopping());
+
+        // Manually trigger parent selection
+        let after_shopping = now + node.tau() * 4; // After shopping duration
+        node.select_best_parent(after_shopping);
+
+        // Since all same-tree candidates have depth >= our depth (5),
+        // they should all be filtered out, and we should become root
+        assert!(
+            node.is_root(),
+            "Should become root when all same-tree candidates are descendants"
+        );
+        assert!(
+            node.pending_parent().is_none(),
+            "Should not have pending_parent"
+        );
+    }
+
+    #[test]
+    fn test_select_best_parent_accepts_shallower_same_tree() {
+        // Test that shallower nodes (depth < our depth) ARE accepted as parent candidates
+        let mut node = make_node();
+        let now = Timestamp::from_secs(1000);
+
+        // Set up node at depth 5 with a parent (not root)
+        let parent_id: NodeId = [1u8; 16];
+        let root_hash: IdHash = [0xAA; 4];
+        node.set_parent(Some(parent_id));
+        node.set_depth(5);
+        node.set_root_hash(root_hash);
+        node.set_tree_size(100);
+        node.set_subtree_size(10);
+
+        // Add a shallower neighbor at depth 3 (same tree, shallower than us)
+        // This is a valid parent candidate
+        let ancestor_id: NodeId = [4u8; 16];
+        node.insert_neighbor_time(
+            ancestor_id,
+            NeighborTiming {
+                last_seen: now,
+                rssi: Some(-70),
+                root_hash,      // Same tree
+                tree_size: 100, // Same tree size
+                keyspace_range: (0, 5000),
+                children_count: 2,
+                depth: 3, // Shallower than us (5) - should be accepted
+                max_depth: 6,
+                unstable: false,
+            },
+        );
+
+        // Also add a descendant that should be filtered
+        let grandchild_id: NodeId = [2u8; 16];
+        node.insert_neighbor_time(
+            grandchild_id,
+            NeighborTiming {
+                last_seen: now,
+                rssi: Some(-70),
+                root_hash,
+                tree_size: 100,
+                keyspace_range: (1000, 2000),
+                children_count: 0,
+                depth: 7, // Deeper - should be filtered
+                max_depth: 7,
+                unstable: false,
+            },
+        );
+
+        // Start shopping (simulating parent loss)
+        node.start_shopping(now);
+
+        // Manually trigger parent selection
+        let after_shopping = now + node.tau() * 4;
+        node.select_best_parent(after_shopping);
+
+        // Should select the shallower ancestor, not become root
+        assert!(
+            !node.is_root(),
+            "Should NOT become root when shallower candidate exists"
+        );
+        assert!(
+            node.pending_parent().is_some(),
+            "Should have pending_parent"
+        );
+        let (pending_id, _) = node.pending_parent().unwrap();
+        assert_eq!(
+            pending_id, ancestor_id,
+            "Should select the shallower ancestor"
         );
     }
 }

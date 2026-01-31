@@ -83,6 +83,10 @@ pub enum DebugEvent {
     },
     /// Pending parent gave up after too many attempts.
     PendingParentTimeout { parent_id: NodeId, attempts: u8 },
+    /// Pending parent cleared (reason describes why).
+    PendingParentCleared { reason: &'static str },
+    /// Pending parent pulse count incremented.
+    PendingParentPulseCount { parent_id: NodeId, count: u8 },
     /// Received pulse from a node.
     PulseReceived {
         timestamp: Timestamp,

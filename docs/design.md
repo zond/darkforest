@@ -55,7 +55,7 @@ These constants define protocol limits and memory bounds. Implementations MUST r
 | Constant | Value | Rationale |
 |----------|-------|-----------|
 | MAX_CHILDREN | 12 | Ensures worst-case Pulse fits in 252 bytes |
-| MAX_TREE_DEPTH | 255 | Allows long chains in sparse networks |
+| MAX_TREE_DEPTH | 127 | TTL/2 ensures round-trip messages can complete |
 | K_REPLICAS | 3 | Location directory replication factor |
 | DEFAULT_TTL | 255 | Maximum hop count for Routed messages |
 | MISSED_PULSES_TIMEOUT | 8 | Pulses before declaring neighbor dead |
@@ -2514,7 +2514,7 @@ Lookups find a node's current keyspace address by querying replicas.
 // For UDP (τ=0.1s) with 10-deep tree: ~33τ ≈ 3.3 seconds per replica
 //
 // max_tree_depth source: use the root's max_depth from its Pulse if known,
-// otherwise use MAX_TREE_DEPTH (255) as a safe upper bound.
+// otherwise use MAX_TREE_DEPTH (127) as a safe upper bound.
 fn lookup_timeout(&self) -> Duration {
     self.tau() * (3 + 3 * self.max_tree_depth as u32)
 }
