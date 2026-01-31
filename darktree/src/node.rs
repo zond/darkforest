@@ -1551,18 +1551,12 @@ where
         self.shopping_deadline.is_some()
     }
 
-    /// Start shopping phase with scaled duration.
-    ///
-    /// Duration: 3τ + 2τ × levels_below_me, where levels_below = max_depth - depth.
-    /// This allows deeper subtrees more time to stabilize during parent selection.
+    /// Start shopping phase with fixed duration of 3τ.
     ///
     /// During shopping, current state (parent, root_hash, depth) is preserved and used
     /// for candidate filtering. We only become root if shopping finds no valid candidates.
     pub(crate) fn start_shopping(&mut self, now: Timestamp) {
-        // Scaled duration: 3τ + 2τ × levels_below_me
-        let levels_below = self.max_depth.saturating_sub(self.depth);
-        let shopping_duration = self.tau() * (3 + 2 * levels_below as u64);
-        let deadline = now + shopping_duration;
+        let deadline = now + self.tau() * 3;
         self.shopping_deadline = Some(deadline);
 
         emit_debug!(

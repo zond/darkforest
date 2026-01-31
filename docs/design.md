@@ -404,8 +404,7 @@ The effective Pulse interval is approximately 3τ under normal conditions (based
 |----------|---------------|----------------|
 | Join (get keyspace range) | 6-9τ | 2-4τ |
 | Merge detection | 0-3τ | 1-2τ |
-| Shopping (leaf) | 3τ | 3τ |
-| Shopping (5 levels below) | 13τ | 13τ |
+| Shopping | 3τ | 3τ |
 | State propagation | 0-3τ | 1-2τ |
 | Pubkey exchange | 3-6τ | 2-4τ |
 
@@ -589,7 +588,7 @@ When shopping is triggered:
 
 1. **Remember `old_parent` and `old_tree`** (current root_hash, may be None for first boot)
 2. **Set `unstable = true`** — signals to neighbors not to join this node during shopping
-3. **Start shopping timer** with scaled duration: `3τ + 2τ × levels_below_me`
+3. **Start shopping timer** for `3τ`
 4. **Collect Pulses from ALL neighbors** — the trigger started shopping, but we might find an even better option during the window
 5. **When timer fires, select parent using preference order:**
    a. If candidates exist in a dominating tree → pick best, switch to that tree
@@ -598,7 +597,7 @@ When shopping is triggered:
    d. Else → become root (or stay root for first boot)
 6. **Clear `unstable`** after shopping completes
 
-The scaled duration gives subtrees time to propagate changes upward before the node decides. A leaf shops for 3τ. A node with 5 levels below it shops for 13τ.
+The 3τ duration allows time to collect neighbor Pulses before deciding.
 
 **Why this preference order works:**
 
@@ -646,7 +645,7 @@ A neighbor is **skipped** during candidate evaluation if:
 - It has `unstable = true` in its Pulse flags — **except `old_parent`**, since we're already their child
 - **Same tree AND depth >= our depth** (would create cycle — see below)
 
-**Racing shopping:** If `old_parent` is also shopping when we choose to stay with them (step 5b), they might switch trees before we finish. This is safe: the scaled shopping duration (`3τ + 2τ × levels_below_me`) means nodes with more descendants shop longer, so children typically finish before parents. If `old_parent` does switch trees, they won't include us in their children list (wrong root_hash), triggering implicit rejection and new shopping.
+**Racing shopping:** If `old_parent` is also shopping when we choose to stay with them (step 5b), they might switch trees before we finish. This is safe: if `old_parent` switches trees, they won't include us in their children list (wrong root_hash), triggering implicit rejection and new shopping.
 
 **Why depth check prevents cycles:** In the same tree, a node can only join a shallower node (smaller depth). This forms a DAG that converges to a tree. Joining a node at equal or greater depth could create a cycle where A→B→...→A.
 
@@ -805,13 +804,13 @@ Link A-C breaks. After 8 missed Pulses:
 C (no Pulse from parent A):
   - C starts shopping (parent lost trigger, see Parent Selection)
   - C sets unstable=true in Pulse flags
-  - Shopping duration: 3τ + 2τ × (5-2) = 9τ
+  - Shopping duration: 3τ
 
 During C's shopping period:
   - C's children see unstable=true, don't try to switch parents
   - Other nodes won't try to join C as children
 
-After C's shopping timer (9τ):
+After C's shopping timer (3τ):
   - If A's Pulse received: C stays with A, clears unstable
   - If no valid parent: C becomes root, C.tree_size = 30, clears unstable
 
@@ -898,7 +897,7 @@ impl Node {
 
 ### Depth Propagation
 
-The `depth` and `max_depth` fields enable cycle prevention and scaled shopping durations.
+The `depth` and `max_depth` fields enable cycle prevention.
 
 **Depth computation:**
 - Root has `depth = 0`
@@ -930,37 +929,6 @@ When D joins as C's child:
 5. R sees A's max_depth=3, updates `max_depth = max(3, 1) = 3`
 
 **Why depth matters for cycle prevention:** When switching parents within the same tree, a node can only join a node with smaller depth. This ensures the parent relationship forms a DAG that converges to a tree. Without depth checking, two nodes could potentially claim each other as parent.
-
-**Why max_depth matters for shopping duration:** A node's shopping duration scales with `levels_below_me = max_depth - depth`. This gives subtrees time to propagate state changes before the ancestor makes decisions. See Shopping Duration Scaling below.
-
-### Shopping Duration Scaling
-
-Shopping duration scales with tree depth to prevent cascading instability:
-
-```
-shopping_duration = 3τ + 2τ × levels_below_me
-
-Where: levels_below_me = max_depth - depth
-```
-
-**Examples:**
-- Leaf (depth=5, max_depth=5): `3τ + 2τ × 0 = 3τ`
-- Node with 3 levels below (depth=2, max_depth=5): `3τ + 2τ × 3 = 9τ`
-- Root with 10-deep tree (depth=0, max_depth=10): `3τ + 2τ × 10 = 23τ`
-
-**Why scaling is needed:** When a node starts shopping, its subtree is affected. Children see state changes and may react. By giving nodes with larger subtrees more shopping time:
-1. Leaves decide quickly (3τ) — they have no dependents
-2. Interior nodes wait longer — giving children time to propagate changes upward
-3. State changes bubble up before ancestors make decisions
-
-**For LoRa (τ≈6.7s):**
-- Leaf: ~20 seconds
-- 5 levels below: ~87 seconds
-- 10 levels below: ~154 seconds
-
-This ensures that even in deep trees, state converges before parent decisions are made.
-
-**Note:** Shopping duration is calculated once when shopping starts, using the then-current `max_depth`. If the subtree changes during shopping (nodes join or leave), the duration is not recalculated.
 
 ### Tree Size Verification
 
@@ -3145,8 +3113,7 @@ min_interval = max(2τ, airtime / pulse_budget)
 |----------|----------------------|
 | Join (get keyspace range) | 2-4τ (~13-27s) |
 | Merge detection | 1-2τ (~7-13s) |
-| Shopping (leaf) | 3τ (~20s) |
-| Shopping (5 levels below) | 13τ (~87s) |
+| Shopping | 3τ (~20s) |
 | State propagation | 1-2τ (~7-13s) |
 | Pubkey exchange | 2-4τ (~13-27s) |
 | Parent timeout | 24τ (~160s) |
