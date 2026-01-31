@@ -1666,7 +1666,8 @@ where
         if self.location_cache.len() >= Cfg::MAX_LOCATION_CACHE
             && !self.location_cache.contains_key(&node_id)
         {
-            self.location_cache.remove_min_by_key(|(_, last_used)| *last_used);
+            self.location_cache
+                .remove_min_by_key(|(_, last_used)| *last_used);
         }
         self.location_cache.insert(node_id, (addr, now));
     }

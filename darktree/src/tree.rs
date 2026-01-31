@@ -1021,10 +1021,7 @@ where
         // Determine flags - prefer pending_parent over current parent so prospective
         // parent can see we want to join them and add us as a child.
         // If we're switching parents, we need to advertise the new parent.
-        let effective_parent = self
-            .pending_parent()
-            .map(|(id, _)| id)
-            .or(self.parent());
+        let effective_parent = self.pending_parent().map(|(id, _)| id).or(self.parent());
         let has_parent = effective_parent.is_some();
         let we_need_pubkeys = !self.need_pubkey().is_empty();
         let neighbors_need_ours = !self.neighbors_need_pubkey().is_empty();
@@ -1256,7 +1253,10 @@ mod tests {
         node.handle_neighbor_timeouts(now);
 
         // Node should be shopping, but parent is still set (preserved for step 5b)
-        assert!(node.is_shopping(), "Should start shopping when parent times out");
+        assert!(
+            node.is_shopping(),
+            "Should start shopping when parent times out"
+        );
         assert_eq!(
             node.parent(),
             Some(parent_id),
@@ -1267,7 +1267,10 @@ mod tests {
         let after_shopping = now + node.tau() * 4;
         node.select_best_parent(after_shopping);
 
-        assert!(node.is_root(), "Should become root after shopping with no candidates");
+        assert!(
+            node.is_root(),
+            "Should become root after shopping with no candidates"
+        );
         assert_eq!(node.parent(), None);
     }
 

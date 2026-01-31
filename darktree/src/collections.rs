@@ -102,7 +102,6 @@ impl<T> ShrinkingVecDeque<T> {
     }
 }
 
-
 /// A HashMap that shrinks after consecutive removals without additions.
 ///
 /// Useful for caches with bursty usage patterns (e.g., recently-forwarded
@@ -226,7 +225,11 @@ where
         B: Ord,
         F: FnMut(&V) -> B,
     {
-        let key = self.inner.iter().min_by_key(|(_, v)| f(v)).map(|(k, _)| *k)?;
+        let key = self
+            .inner
+            .iter()
+            .min_by_key(|(_, v)| f(v))
+            .map(|(k, _)| *k)?;
         let value = self.inner.remove(&key)?;
         self.removals_since_add = self.removals_since_add.saturating_add(1);
         self.maybe_shrink();
