@@ -14,8 +14,8 @@
 //!
 //! **Reclaimable memory:** Queues used during network churn (`pending_routed`,
 //! `delayed_forwards`, `recently_forwarded`) use shrinking collections that
-//! automatically reclaim memory after 8 consecutive removals without additions.
-//! This allows generous limits without permanent memory cost.
+//! automatically reclaim memory after 1/16 × max_capacity consecutive removals
+//! without additions. This allows generous limits without permanent memory cost.
 //!
 //! Memory formula (rough estimate):
 //! - `MAX_NEIGHBORS * 80` bytes (neighbor timing + routing info)

@@ -108,8 +108,10 @@ pub(crate) struct JoinContext {
 }
 
 // Type aliases for collections
-pub(crate) type NeighborTimingMap = HashMap<NodeId, NeighborTiming>;
+// Uses ShrinkingHashMap for collections that drain during normal operation.
+pub(crate) type NeighborTimingMap = ShrinkingHashMap<NodeId, NeighborTiming>;
 /// Pubkey cache: node_id -> (pubkey, last_used).
+/// Not shrinking - entries only evicted when full, not naturally removed.
 pub(crate) type PubkeyCache = HashMap<NodeId, (PublicKey, Timestamp)>;
 pub(crate) type NeedPubkeySet = BTreeSet<NodeId>;
 pub(crate) type NeighborsNeedPubkeySet = BTreeSet<NodeId>;
@@ -117,14 +119,14 @@ pub(crate) type NeighborsNeedPubkeySet = BTreeSet<NodeId>;
 /// Keyed by both node_id AND replica_index to allow storing multiple replicas
 /// for the same publisher when a node temporarily owns multiple replica addresses
 /// during tree formation.
-pub(crate) type LocationStore = HashMap<(NodeId, u8), LocationEntry>;
+pub(crate) type LocationStore = ShrinkingHashMap<(NodeId, u8), LocationEntry>;
 /// Location cache: node_id -> (keyspace_addr, last_used).
-pub(crate) type LocationCache = HashMap<NodeId, (u32, Timestamp)>;
-pub(crate) type PendingLookupMap = HashMap<NodeId, PendingLookup>;
-pub(crate) type PendingDataMap = HashMap<NodeId, Vec<u8>>;
-pub(crate) type DistrustedMap = HashMap<NodeId, Timestamp>;
+pub(crate) type LocationCache = ShrinkingHashMap<NodeId, (u32, Timestamp)>;
+pub(crate) type PendingLookupMap = ShrinkingHashMap<NodeId, PendingLookup>;
+pub(crate) type PendingDataMap = ShrinkingHashMap<NodeId, Vec<u8>>;
+pub(crate) type DistrustedMap = ShrinkingHashMap<NodeId, Timestamp>;
 /// Messages awaiting pubkey for a specific node_id (keyed by the node whose pubkey is needed).
-pub(crate) type PendingPubkeyMap = HashMap<NodeId, VecDeque<Routed>>;
+pub(crate) type PendingPubkeyMap = ShrinkingHashMap<NodeId, VecDeque<Routed>>;
 
 /// 4-byte hash used for ACK identification.
 pub(crate) type AckHash = [u8; 4];
@@ -147,7 +149,7 @@ pub(crate) struct PendingAck {
 }
 
 /// Map of pending ACKs keyed by message hash.
-pub(crate) type PendingAckMap = HashMap<AckHash, PendingAck>;
+pub(crate) type PendingAckMap = ShrinkingHashMap<AckHash, PendingAck>;
 
 /// Map of recently forwarded message hashes for duplicate detection.
 /// Stores (timestamp, hops, seen_count) to distinguish retransmissions from alternate paths
@@ -172,7 +174,7 @@ pub(crate) struct BackupEntry {
 
 /// Backup store: (node_id, replica_index) -> BackupEntry.
 /// Keyed the same as LocationStore to allow efficient lookup and deduplication.
-pub(crate) type BackupStore = HashMap<(NodeId, u8), BackupEntry>;
+pub(crate) type BackupStore = ShrinkingHashMap<(NodeId, u8), BackupEntry>;
 
 /// Delayed forward entry for bounce-back dampening.
 ///
@@ -401,29 +403,29 @@ where
             max_depth: 0,
 
             children: ChildrenStore::new(),
-            neighbor_times: HashMap::new(),
+            neighbor_times: ShrinkingHashMap::with_max_capacity(Cfg::MAX_NEIGHBORS),
 
             pubkey_cache: HashMap::new(),
             need_pubkey: BTreeSet::new(),
             neighbors_need_pubkey: BTreeSet::new(),
-            location_store: HashMap::new(),
-            location_cache: HashMap::new(),
-            backup_store: HashMap::new(),
+            location_store: ShrinkingHashMap::with_max_capacity(Cfg::MAX_LOCATION_STORE),
+            location_cache: ShrinkingHashMap::with_max_capacity(Cfg::MAX_LOCATION_CACHE),
+            backup_store: ShrinkingHashMap::with_max_capacity(Cfg::MAX_BACKUP_STORE),
 
-            pending_lookups: HashMap::new(),
-            pending_data: HashMap::new(),
-            pending_pubkey: HashMap::new(),
+            pending_lookups: ShrinkingHashMap::with_max_capacity(Cfg::MAX_PENDING_LOOKUPS),
+            pending_data: ShrinkingHashMap::with_max_capacity(Cfg::MAX_PENDING_DATA),
+            pending_pubkey: ShrinkingHashMap::with_max_capacity(Cfg::MAX_PENDING_PUBKEY_NODES),
 
             join_context: None,
-            distrusted: HashMap::new(),
+            distrusted: ShrinkingHashMap::with_max_capacity(Cfg::MAX_DISTRUSTED),
             fraud_detection: FraudDetection::new(),
             hll_secret_key,
 
-            pending_acks: HashMap::new(),
-            recently_forwarded: ShrinkingHashMap::new(),
-            delayed_forwards: ShrinkingHashMap::new(),
+            pending_acks: ShrinkingHashMap::with_max_capacity(Cfg::MAX_PENDING_ACKS),
+            recently_forwarded: ShrinkingHashMap::with_max_capacity(Cfg::MAX_RECENTLY_FORWARDED),
+            delayed_forwards: ShrinkingHashMap::with_max_capacity(Cfg::MAX_DELAYED_FORWARDS),
 
-            pending_routed: ShrinkingVecDeque::new(),
+            pending_routed: ShrinkingVecDeque::with_max_capacity(Cfg::MAX_PENDING_ROUTED),
 
             last_pulse: None,
             last_pulse_size: 0,
@@ -1347,7 +1349,10 @@ where
             }
         }
 
-        let queue = self.pending_pubkey.entry(needed_node_id).or_default();
+        if !self.pending_pubkey.contains_key(&needed_node_id) {
+            self.pending_pubkey.insert(needed_node_id, VecDeque::new());
+        }
+        let queue = self.pending_pubkey.get_mut(&needed_node_id).unwrap();
         if queue.len() >= Cfg::MAX_MSGS_PER_PENDING_PUBKEY {
             queue.pop_front();
         }
@@ -1665,8 +1670,7 @@ where
             && !self.location_store.contains_key(&key)
         {
             // Evict oldest entry and emit debug event
-            let _evicted =
-                Self::evict_oldest_by(&mut self.location_store, |e: &LocationEntry| e.received_at);
+            let _evicted = self.location_store.remove_min_by_key(|e| e.received_at);
             emit_debug!(self, {
                 let (evicted_key, _) =
                     _evicted.expect("eviction should succeed when over capacity");
@@ -1684,7 +1688,7 @@ where
         if self.location_cache.len() >= Cfg::MAX_LOCATION_CACHE
             && !self.location_cache.contains_key(&node_id)
         {
-            Self::evict_oldest_by(&mut self.location_cache, |(_, last_used)| *last_used);
+            self.location_cache.remove_min_by_key(|(_, last_used)| *last_used);
         }
         self.location_cache.insert(node_id, (addr, now));
     }
@@ -1693,33 +1697,16 @@ where
         if self.neighbor_times.len() >= Cfg::MAX_NEIGHBORS
             && !self.neighbor_times.contains_key(&node_id)
         {
-            Self::evict_oldest_by(&mut self.neighbor_times, |t| t.last_seen);
+            self.neighbor_times.remove_min_by_key(|t| t.last_seen);
         }
         self.neighbor_times.insert(node_id, timing);
     }
 
     pub(crate) fn insert_distrusted(&mut self, node_id: NodeId, timestamp: Timestamp) {
         if self.distrusted.len() >= Cfg::MAX_DISTRUSTED && !self.distrusted.contains_key(&node_id) {
-            Self::evict_oldest_by(&mut self.distrusted, |&ts| ts);
+            self.distrusted.remove_min_by_key(|&ts| ts);
         }
         self.distrusted.insert(node_id, timestamp);
-    }
-
-    /// Evict the oldest entry from an AckHash-keyed map based on a timestamp extraction function.
-    fn evict_oldest_ack_by<V, F>(map: &mut HashMap<AckHash, V>, get_timestamp: F) -> bool
-    where
-        F: Fn(&V) -> Timestamp,
-    {
-        if let Some(oldest_key) = map
-            .iter()
-            .min_by_key(|(_, v)| get_timestamp(v))
-            .map(|(k, _)| *k)
-        {
-            map.remove(&oldest_key);
-            true
-        } else {
-            false
-        }
     }
 
     /// Insert a pending ACK entry with bounded eviction.
@@ -1736,7 +1723,7 @@ where
         if self.pending_acks.len() >= Cfg::MAX_PENDING_ACKS
             && !self.pending_acks.contains_key(&hash)
         {
-            Self::evict_oldest_ack_by(&mut self.pending_acks, |pa| pa.next_retry_at);
+            self.pending_acks.remove_min_by_key(|pa| pa.next_retry_at);
         }
 
         let pending = PendingAck {

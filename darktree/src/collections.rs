@@ -1,15 +1,24 @@
 //! Memory-efficient collections that shrink when underutilized.
 //!
 //! These wrappers track removals since the last addition. After a threshold
-//! of consecutive removals (default 8), the underlying collection is shrunk
-//! to reclaim memory. This is useful for queues and caches that see bursty
-//! usage patterns - they grow during bursts, then shrink back when idle.
+//! of consecutive removals (1/16 of max capacity), the underlying collection
+//! is shrunk to reclaim memory. This is useful for queues and caches that see
+//! bursty usage patterns - they grow during bursts, then shrink back when idle.
 
 use alloc::collections::VecDeque;
 use hashbrown::HashMap;
 
-/// Threshold of removals before shrinking.
-const SHRINK_THRESHOLD: u8 = 8;
+/// Calculate shrink threshold from max capacity (1/16, minimum 1).
+const fn shrink_threshold(max_capacity: usize) -> u8 {
+    let threshold = max_capacity / 16;
+    if threshold == 0 {
+        1
+    } else if threshold > u8::MAX as usize {
+        u8::MAX
+    } else {
+        threshold as u8
+    }
+}
 
 /// A VecDeque that shrinks after consecutive removals without additions.
 ///
@@ -18,14 +27,18 @@ const SHRINK_THRESHOLD: u8 = 8;
 pub struct ShrinkingVecDeque<T> {
     inner: VecDeque<T>,
     removals_since_add: u8,
+    shrink_threshold: u8,
 }
 
 impl<T> ShrinkingVecDeque<T> {
-    /// Create a new empty deque.
-    pub fn new() -> Self {
+    /// Create a new empty deque with specified max capacity.
+    ///
+    /// The shrink threshold is set to 1/16 of max capacity.
+    pub fn with_max_capacity(max_capacity: usize) -> Self {
         Self {
             inner: VecDeque::new(),
             removals_since_add: 0,
+            shrink_threshold: shrink_threshold(max_capacity),
         }
     }
 
@@ -51,7 +64,7 @@ impl<T> ShrinkingVecDeque<T> {
 
     /// Check if shrink threshold reached and shrink if so.
     fn maybe_shrink(&mut self) {
-        if self.removals_since_add >= SHRINK_THRESHOLD {
+        if self.removals_since_add >= self.shrink_threshold {
             self.inner.shrink_to_fit();
             self.removals_since_add = 0;
         }
@@ -89,11 +102,6 @@ impl<T> ShrinkingVecDeque<T> {
     }
 }
 
-impl<T> Default for ShrinkingVecDeque<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// A HashMap that shrinks after consecutive removals without additions.
 ///
@@ -102,14 +110,18 @@ impl<T> Default for ShrinkingVecDeque<T> {
 pub struct ShrinkingHashMap<K, V, S = hashbrown::DefaultHashBuilder> {
     inner: HashMap<K, V, S>,
     removals_since_add: u8,
+    shrink_threshold: u8,
 }
 
 impl<K, V> ShrinkingHashMap<K, V, hashbrown::DefaultHashBuilder> {
-    /// Create a new empty map.
-    pub fn new() -> Self {
+    /// Create a new empty map with specified max capacity.
+    ///
+    /// The shrink threshold is set to 1/16 of max capacity.
+    pub fn with_max_capacity(max_capacity: usize) -> Self {
         Self {
             inner: HashMap::new(),
             removals_since_add: 0,
+            shrink_threshold: shrink_threshold(max_capacity),
         }
     }
 }
@@ -137,7 +149,7 @@ where
 
     /// Check if shrink threshold reached and shrink if so.
     fn maybe_shrink(&mut self) {
-        if self.removals_since_add >= SHRINK_THRESHOLD {
+        if self.removals_since_add >= self.shrink_threshold {
             self.inner.shrink_to_fit();
             self.removals_since_add = 0;
         }
@@ -169,17 +181,17 @@ where
     }
 
     /// Iterate over key-value pairs.
-    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+    pub fn iter(&self) -> hashbrown::hash_map::Iter<'_, K, V> {
         self.inner.iter()
     }
 
     /// Iterate over keys.
-    pub fn keys(&self) -> impl Iterator<Item = &K> {
+    pub fn keys(&self) -> hashbrown::hash_map::Keys<'_, K, V> {
         self.inner.keys()
     }
 
     /// Iterate over values.
-    pub fn values(&self) -> impl Iterator<Item = &V> {
+    pub fn values(&self) -> hashbrown::hash_map::Values<'_, K, V> {
         self.inner.values()
     }
 
@@ -208,26 +220,30 @@ where
     /// Remove the entry with the minimum value according to a key function.
     ///
     /// Useful for evicting the oldest entry when at capacity.
-    /// Returns true if an entry was removed.
-    pub fn remove_min_by_key<B, F>(&mut self, mut f: F) -> bool
+    /// Returns the removed key-value pair, or None if the map was empty.
+    pub fn remove_min_by_key<B, F>(&mut self, mut f: F) -> Option<(K, V)>
     where
         B: Ord,
         F: FnMut(&V) -> B,
     {
-        if let Some(key) = self.inner.iter().min_by_key(|(_, v)| f(v)).map(|(k, _)| *k) {
-            self.inner.remove(&key);
-            self.removals_since_add = self.removals_since_add.saturating_add(1);
-            self.maybe_shrink();
-            true
-        } else {
-            false
-        }
+        let key = self.inner.iter().min_by_key(|(_, v)| f(v)).map(|(k, _)| *k)?;
+        let value = self.inner.remove(&key)?;
+        self.removals_since_add = self.removals_since_add.saturating_add(1);
+        self.maybe_shrink();
+        Some((key, value))
     }
 }
 
-impl<K, V> Default for ShrinkingHashMap<K, V, hashbrown::DefaultHashBuilder> {
-    fn default() -> Self {
-        Self::new()
+impl<'a, K, V, S> IntoIterator for &'a ShrinkingHashMap<K, V, S>
+where
+    K: Eq + core::hash::Hash,
+    S: core::hash::BuildHasher,
+{
+    type Item = (&'a K, &'a V);
+    type IntoIter = hashbrown::hash_map::Iter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.iter()
     }
 }
 
@@ -237,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_shrinking_vecdeque_shrinks_after_removals() {
-        let mut q = ShrinkingVecDeque::new();
+        let mut q = ShrinkingVecDeque::with_max_capacity(128);
 
         // Add many items to grow capacity
         for i in 0..100 {
@@ -255,7 +271,7 @@ mod tests {
 
     #[test]
     fn test_shrinking_hashmap_shrinks_after_removals() {
-        let mut m = ShrinkingHashMap::new();
+        let mut m = ShrinkingHashMap::with_max_capacity(128);
 
         // Add many items
         for i in 0..100 {
@@ -272,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_addition_resets_counter() {
-        let mut q = ShrinkingVecDeque::new();
+        let mut q = ShrinkingVecDeque::with_max_capacity(128);
 
         // Add items
         for i in 0..10 {

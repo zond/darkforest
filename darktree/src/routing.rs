@@ -809,10 +809,7 @@ where
             msg,
             queued_at: now,
         });
-
-        // Schedule retry in 2τ if not already scheduled.
-        // The delay gives the child time to pulse with its keyspace range.
-        self.schedule_pending_retry(now + self.tau() * 2);
+        // Retry is scheduled when neighbors pulse (see handle_pulse -> schedule_pending_retry).
     }
 
     /// Re-check ONE pending routed message.

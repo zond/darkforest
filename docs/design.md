@@ -76,19 +76,17 @@ These constants define protocol limits and memory bounds. Implementations MUST r
 | MAX_NEIGHBORS | 128 | 16 | Neighbor tracking |
 | MAX_PUBKEY_CACHE | 64 | 16 | LRU pubkey cache |
 | MAX_LOCATION_STORE | 256 | 32 | Primary DHT entries |
-| MAX_BACKUP_STORE | 256 | 64 | Backup DHT entries |
+| MAX_BACKUP_STORE | 256 | 64 | Backup DHT entries (2× location store) |
 | MAX_BACKUPS_PER_NEIGHBOR | 64 | 16 | Per-neighbor backup limit |
 | MAX_PENDING_ACKS | 32 | 8 | Messages awaiting ACK |
-| MAX_RECENTLY_FORWARDED | 128 | 32 | Duplicate detection |
-| MAX_DELAYED_FORWARDS | 64 | 16 | Bounce-back dampening queue |
-| MAX_PENDING_ROUTED | 64 | 16 | Messages awaiting route availability |
+| MAX_RECENTLY_FORWARDED | 512 | 128 | Duplicate detection (reclaimable) |
+| MAX_DELAYED_FORWARDS | 256 | 64 | Bounce-back dampening (reclaimable) |
+| MAX_PENDING_ROUTED | 512 | 128 | Messages awaiting route (reclaimable) |
 | MAX_PENDING_LOOKUPS | 16 | 4 | Concurrent DHT lookups |
 | MAX_DISTRUSTED | 64 | 8 | Fraud detection blacklist |
 | HLL_REGISTERS | 256 | 256 | HyperLogLog registers (hardcoded) |
-| OUTGOING_QUEUE_SIZE | 32 | 8 | Transport outgoing queue |
-| INCOMING_QUEUE_SIZE | 16 | 8 | Transport incoming queue |
-| APP_QUEUE_SIZE | 16 | 8 | Application data queues |
-| EVENT_QUEUE_SIZE | 32 | 16 | Node event queue |
+
+**Reclaimable queues:** Collections marked "reclaimable" use shrinking data structures that automatically reclaim memory after sustained inactivity. This allows generous limits during network churn without permanent memory cost.
 
 ---
 
@@ -1643,7 +1641,7 @@ fn is_in_managed_keyspace(&self, dest: u32) -> bool {
 }
 ```
 
-**Queue processing:** When ANY neighbor Pulses (updating `neighbor_times`), the node checks if queued messages can now be routed. To avoid overwhelming the outgoing queue when many messages are waiting, retries are performed incrementally:
+**Queue processing:** When ANY neighbor Pulses (updating `neighbor_times`), the node schedules a retry after τ delay (allowing routing info to propagate). To avoid overwhelming the outgoing queue when many messages are waiting, retries are performed incrementally:
 
 **Incremental Retry Algorithm:**
 1. Find ONE pending message from the queue (FIFO order)
@@ -1654,8 +1652,12 @@ fn is_in_managed_keyspace(&self, dest: u32) -> bool {
 3. If more pending messages exist, schedule next retry after 2τ
 4. Repeat until queue is empty or all messages have been re-checked
 
+**Scheduling delays:**
+- **On neighbor pulse:** τ delay before retry (routing info may have changed)
+- **Between retries:** 2τ delay (spread traffic, avoid collisions)
+
 **Rationale:**
-- **Traffic spreading:** The 2τ delay between retries reduces collision probability on shared radio channels
+- **Traffic spreading:** The delays between retries reduce collision probability on shared radio channels
 - **Graceful degradation:** If the node is busy with higher-priority traffic, pending retries naturally yield
 - **Consistent pattern:** Matches the incremental rebalancing approach (see "Incremental Rebalancing" in PUBLISH section)
 
@@ -1888,7 +1890,7 @@ fn handle_bounce_back(&mut self, msg: Routed, ack_hash: [u8; 4]) {
 
 #### Delayed Forward Queue
 
-- Bounded by `MAX_DELAYED_FORWARDS` (64 in DefaultConfig, 16 in SmallConfig)
+- Bounded by `MAX_DELAYED_FORWARDS` (256 in DefaultConfig, 64 in SmallConfig)
 - Each entry stores: message, ack_hash, seen_count, scheduled time
 - **seen_count storage:** The entry stores its own `seen_count` so backoff state survives even if the `recently_forwarded` entry is evicted under LRU pressure
 - **Deduplication:** At most one delayed forward per `ack_hash`. If a new bounce arrives for a hash already in the queue, double the remaining delay
@@ -1961,7 +1963,7 @@ fn retry_backoff(&self, retries: u8) -> Duration {
 
 ```rust
 const MAX_PENDING_ACKS: usize = 32;          // messages awaiting ACK
-const MAX_RECENTLY_FORWARDED: usize = 128;   // for duplicate detection (DefaultConfig)
+const MAX_RECENTLY_FORWARDED: usize = 512;   // for duplicate detection (DefaultConfig, reclaimable)
 const ACK_HASH_SIZE: usize = 4;              // truncated hash bytes
 
 // RECENTLY_FORWARDED_TTL = 320τ (must exceed worst-case retry sequence of ~280τ with jitter)
@@ -1975,16 +1977,17 @@ fn recently_forwarded_ttl(&self) -> Duration {
 **Memory usage (DefaultConfig):**
 - `pending_acks`: 32 entries × ~16 bytes (hash + metadata) = ~512 bytes
   - Plus original messages for retransmission (bounded by MTU × 32 ≈ 8KB worst case)
-- `recently_forwarded`: 128 entries × ~14 bytes (hash + timestamp + ttl + seen_count) = ~1.8KB
-- `delayed_forwards`: 64 entries × ~13 bytes (hash + seen_count + timestamp) = ~832 bytes
-  - Plus messages awaiting forward (bounded by MTU × 64 ≈ 16KB worst case)
-- Total: ~3.5KB metadata + up to 24KB message storage
+- `recently_forwarded`: 512 entries × ~20 bytes (hash + timestamp + hops + seen_count) = ~10KB (reclaimable)
+- `delayed_forwards`: 256 entries × ~280 bytes (hash + message + metadata) = ~70KB (reclaimable)
+- `pending_routed`: 512 entries × ~280 bytes (message + timestamp) = ~140KB (reclaimable)
+- Total metadata: ~10KB, message storage: ~210KB peak (reclaimable when idle)
 
 **Why these values:**
 - `RECENTLY_FORWARDED_TTL = 320τ`: Must exceed worst-case retry sequence (~280τ with jitter). Provides ~14% margin.
-- `MAX_RECENTLY_FORWARDED = 128` (DefaultConfig) / `32` (SmallConfig): Forwarding rate scales inversely with τ (slow links forward slowly), so the product (TTL × rate) stays roughly constant. For LoRa at 33 min TTL but ~0.05 msg/s: ~99 entries needed. For UDP at 30s TTL but ~0.5 msg/s: ~15 entries needed. 128 provides headroom for both.
+- `MAX_RECENTLY_FORWARDED = 512` (DefaultConfig) / `128` (SmallConfig): Forwarding rate scales inversely with τ (slow links forward slowly), so the product (TTL × rate) stays roughly constant. Generous limit is acceptable because these are reclaimable.
 - `MAX_PENDING_ACKS = 32`: Limits concurrent outbound messages awaiting ACK. With worst-case ~280τ per message, throughput floor is ~32/280τ messages per τ under heavy loss.
-- `MAX_DELAYED_FORWARDS = 64` (DefaultConfig) / `16` (SmallConfig): Sized to handle burst bounce-backs during tree restructuring. When multiple messages encounter an unstable routing path simultaneously (e.g., during a merge), they may all bounce back within a short window. The queue must be large enough to absorb these bursts without dropping protocol-critical messages. Set to 2× MAX_PENDING_ACKS to provide headroom.
+- `MAX_DELAYED_FORWARDS = 256` (DefaultConfig) / `64` (SmallConfig): Sized to handle burst bounce-backs during tree restructuring. Reclaimable, so generous limit is acceptable.
+- `MAX_PENDING_ROUTED = 512` (DefaultConfig) / `128` (SmallConfig): Messages queued when no route available. Reclaimable.
 
 When collections are full, entries are evicted:
 - Evicted pending_ack (LRU): give up on that message (application can retry)
@@ -3089,6 +3092,21 @@ This section describes the conventions used in this document. Future edits shoul
 - Keep Appendix: Performance marked as informational — numbers may change with implementation.
 - Maintain Protocol Invariants when changing tree or DHT behavior.
 
+### Constants
+
+This document specifies constants that affect protocol behavior or interoperability. Implementation-only constants belong in code documentation.
+
+**Document in design.md:**
+- Protocol-visible behavior (MAX_CHILDREN, K_REPLICAS, DEFAULT_TTL, MAX_TREE_DEPTH)
+- Correctness constraints with mathematical rationale (RECENTLY_FORWARDED_TTL, LOOKUP_TIMEOUT, MAX_RETRIES)
+- Security policies (DISTRUST_TTL, MISSED_PULSES_TIMEOUT)
+- Memory bounds that affect node capacity (in the Memory Analysis table)
+
+**Implementation-only (code docs):**
+- Internal async channel sizes (OUTGOING_QUEUE_SIZE, etc.)
+- Optimization caches (MAX_LOCATION_CACHE)
+- Secondary flow control (MAX_PENDING_DATA, MAX_PENDING_PUBKEY_NODES)
+
 ---
 
 ## Appendix: Performance Analysis
@@ -3182,13 +3200,14 @@ Total hops ≈ 3 × depth
 | Location store | ~26 KB | ~3.2 KB | 256/32 entries × 100 B |
 | Backup store | ~26 KB | ~6.4 KB | 256/64 entries × 100 B |
 | Pending ACKs | ~9.6 KB | ~2.4 KB | 32/8 entries × 300 B |
-| Recently forwarded | ~10 KB | ~2.5 KB | 512/128 entries × 20 B |
-| Pending routed | ~140 KB | ~35 KB | 512/128 entries × 280 B |
-| Delayed forwards | ~70 KB | ~18 KB | 256/64 entries × 280 B |
+| Recently forwarded | ~10 KB | ~2.5 KB | 512/128 entries × 20 B (reclaimable) |
+| Pending routed | ~140 KB | ~35 KB | 512/128 entries × 280 B (reclaimable) |
+| Delayed forwards | ~70 KB | ~18 KB | 256/64 entries × 280 B (reclaimable) |
 | Fraud detection | 256 B | 256 B | HyperLogLog registers |
-| **Total (max)** | **~295 KB** | **~70 KB** | Peak during churn |
+| **Peak (churn)** | **~295 KB** | **~70 KB** | All queues full |
+| **Idle (stable)** | **~75 KB** | **~15 KB** | Reclaimable queues empty |
 
-Note: Queues like `pending_routed`, `delayed_forwards`, and `recently_forwarded` are only populated during network churn (tree restructuring, message bursts). In steady state, these are mostly empty.
+**Reclaimable memory:** Collections marked "reclaimable" use shrinking data structures that automatically release memory after 1/16 × capacity consecutive removals without additions. During network churn (tree restructuring, message bursts), these queues may fill. Once traffic subsides, memory is reclaimed. This allows generous limits without permanent memory cost.
 
 ### Traffic Overhead (10k network)
 
